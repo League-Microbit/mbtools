@@ -80,11 +80,18 @@ class FakeSerial:
 
     Scripts exactly one of three outcomes:
 
-    - ``announcement="..."`` — the first ``readline()`` after ``open()``
-      returns this line (newline-terminated, utf-8 encoded), exactly as
-      either announcement dialect would arrive; every ``readline()``
-      after that returns ``b""`` (silence), matching a real port that has
-      said its one line and gone quiet.
+    - ``announcement="..."`` — once at least ``announcement_after_writes``
+      ``write()`` calls have been made (default ``0``, i.e. no ``write()``
+      required — matches the pre-ticket-004 behavior of answering on the
+      very first ``readline()``), the next ``readline()`` returns this
+      line (newline-terminated, utf-8 encoded), exactly as either
+      announcement dialect would arrive; every ``readline()`` after that
+      returns ``b""`` (silence), matching a real port that has said its
+      one line and gone quiet. Passing ``announcement_after_writes=2``
+      scripts a board that stays silent through an earlier ``write()``
+      (e.g. a first ``HELLO``) and only answers a later one — used by
+      ``identity``'s ticket 004 bounded-retry tests to prove a second
+      ``HELLO`` was actually sent before the board answers.
     - neither ``announcement`` nor ``busy`` given — silence: every
       ``readline()`` call returns ``b""``, simulating a real ``Serial``
       timing out with nothing to read (a probe should treat this as "no
@@ -98,6 +105,7 @@ class FakeSerial:
         *,
         announcement: str | None = None,
         busy: bool = False,
+        announcement_after_writes: int = 0,
         **serial_kwargs: object,
     ) -> None:
         if announcement is not None and busy:
@@ -106,6 +114,7 @@ class FakeSerial:
             )
         self._announcement = announcement
         self._busy = busy
+        self._announcement_after_writes = announcement_after_writes
         self._announcement_sent = False
 
         # Recorded, pyserial-shaped state.
@@ -157,7 +166,11 @@ class FakeSerial:
         pass
 
     def readline(self) -> bytes:
-        if self._announcement is not None and not self._announcement_sent:
+        if (
+            self._announcement is not None
+            and not self._announcement_sent
+            and len(self.written) >= self._announcement_after_writes
+        ):
             self._announcement_sent = True
             line = self._announcement
             if not line.endswith("\n"):

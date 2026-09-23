@@ -328,10 +328,33 @@ class RegistryAPIServer:
         self._stop_event.wait()
 
     def stop(self) -> None:
-        """Stop accepting new connections and the sweep timer; remove the
-        socket file. Already-open connections are not forcibly closed --
-        they wind down on their own next read/EOF, same as a client
-        disconnecting.
+        """Stop accepting new connections and the sweep timer, and join
+        every connection-handler thread that is still alive, before
+        returning; remove the socket file.
+
+        Already-open connections are not forcibly closed -- they wind
+        down on their own next read/EOF, same as a client disconnecting
+        (unchanged from before this join was added: a connection a
+        client is deliberately keeping open across a ``stop()`` call is
+        still left to wind down on its own, and its
+        ``join(timeout=2.0)`` below simply times out without blocking
+        shutdown). What changed is that a connection which *has* already
+        seen EOF, or sees it within the timeout, is now waited for
+        instead of left to finish on its own after this method returns.
+
+        This join matters because every connection-handler thread
+        (``_handle_connection``) calls back into ``store``/``locks``
+        (``_op_list``, ``_op_find``, ...); a caller that tears down
+        ``store`` (``store.close()``) immediately after ``stop()``
+        returns -- every production and test caller does exactly this --
+        would otherwise race a not-yet-finished handler thread against
+        the now-closed sqlite connection. Found via a flaky
+        ``IndexError`` in ``store._row_to_record`` traced to exactly this
+        race: a connection-handler thread from a just-finished client
+        request was still mid-``_op_list`` when the test's ``finally``
+        block called ``store.close()`` right after ``stop()`` returned,
+        because ``stop()`` joined the accept and sweep threads but never
+        the per-connection ones ``_accept_loop`` spawns.
         """
         self._stop_event.set()
         if self._sock is not None:
@@ -343,6 +366,8 @@ class RegistryAPIServer:
             self._accept_thread.join(timeout=2.0)
         if self._sweep_thread is not None:
             self._sweep_thread.join(timeout=2.0)
+        for thread in self._conn_threads:
+            thread.join(timeout=2.0)
         try:
             self.socket_path.unlink()
         except FileNotFoundError:

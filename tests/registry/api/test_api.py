@@ -235,6 +235,30 @@ def test_start_makes_the_socket_connectable_by_non_owning_users(make_server):
     assert mode & 0o777 == 0o666
 
 
+def test_stop_joins_connection_handler_threads_before_returning(make_server):
+    """Regression test for a flaky ``IndexError`` in
+    ``store._row_to_record`` traced to a shutdown-ordering race: ``stop()``
+    used to join the accept and sweep threads but never the
+    per-connection handler threads ``_accept_loop`` spawns, so a caller
+    that closed ``store`` right after ``stop()`` returned (every
+    production and test caller does exactly this) could race a
+    still-finishing handler thread against the now-closed sqlite
+    connection. A client that has already closed its connection before
+    ``stop()`` is called must have its handler thread fully joined
+    (not merely alive-and-winding-down) by the time ``stop()`` returns.
+    """
+    srv = make_server()
+    client = _Client(srv.socket_path)
+    resp = client.request({"op": "list"})
+    assert resp["ok"] is True
+    client.close()
+
+    srv.stop()
+
+    assert srv._conn_threads, "expected at least one connection-handler thread"
+    assert all(not t.is_alive() for t in srv._conn_threads)
+
+
 # ---------------------------------------------------------------------------
 # list / get / find
 # ---------------------------------------------------------------------------

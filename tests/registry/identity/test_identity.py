@@ -151,6 +151,110 @@ def test_probe_short_dialect_line_is_malformed_not_a_crash():
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# probe() — bounded extra HELLO retry (ticket 004)
+# ---------------------------------------------------------------------------
+
+
+def test_probe_retries_hello_once_after_silent_first_window():
+    # Silent through the first window, then answers only once a *second*
+    # HELLO has actually been written -- proves the retry fires and isn't
+    # just re-reading the same window.
+    line = "device NEZHA2 robot vevov 1198504156"
+    fakes: list[FakeSerial] = []
+
+    def capturing_factory(**kwargs):
+        ser = FakeSerial(announcement=line, announcement_after_writes=2, **kwargs)
+        fakes.append(ser)
+        return ser
+
+    result = identity.probe(
+        "/dev/ttyACM0",
+        timeout_s=0.02,
+        serial_factory=capturing_factory,
+        settle_s=0,
+    )
+    assert len(fakes) == 1
+    assert fakes[0].written == [b"HELLO\n", b"HELLO\n"]
+    assert result == identity.ProbeResult(
+        role="NEZHA2",
+        common_name="robot",
+        device_name="vevov",
+        serial="1198504156",
+        raw=line,
+    )
+
+
+def test_probe_still_times_out_after_both_windows_silent():
+    # Never answers at all: the retry must fire exactly once (not loop
+    # forever) and the outcome must stay the pre-ticket-004 "no firmware"
+    # None, not something new.
+    fakes: list[FakeSerial] = []
+
+    def capturing_factory(**kwargs):
+        ser = FakeSerial(**kwargs)
+        fakes.append(ser)
+        return ser
+
+    result = identity.probe(
+        "/dev/ttyACM0",
+        timeout_s=0.02,
+        serial_factory=capturing_factory,
+        settle_s=0,
+    )
+    assert result is None
+    assert len(fakes) == 1
+    assert fakes[0].written == [b"HELLO\n", b"HELLO\n"]
+
+
+def test_probe_malformed_first_window_retries_and_keeps_malformed_outcome():
+    # First window captures an unparseable line (not silence); the second
+    # window then comes up empty. The retry still fires exactly once, and
+    # the malformed outcome captured in the first window is preserved
+    # rather than being discarded because the second window found nothing.
+    line = "garbage not matching either dialect"
+    fakes: list[FakeSerial] = []
+
+    def capturing_factory(**kwargs):
+        ser = FakeSerial(announcement=line, announcement_after_writes=0, **kwargs)
+        fakes.append(ser)
+        return ser
+
+    result = identity.probe(
+        "/dev/ttyACM0",
+        timeout_s=0.02,
+        serial_factory=capturing_factory,
+        settle_s=0,
+    )
+    assert fakes[0].written == [b"HELLO\n", b"HELLO\n"]
+    assert result is not None
+    assert result.role == ""
+    assert result.raw == line
+
+
+def test_probe_first_window_success_sends_only_one_hello():
+    # Regression-safety (this sprint's Architecture explicitly claims it):
+    # a board that answers within the first window is untouched -- no
+    # second HELLO, same shape as before ticket 004.
+    line = "device NEZHA2 robot vevov 1198504156"
+    fakes: list[FakeSerial] = []
+
+    def capturing_factory(**kwargs):
+        ser = FakeSerial(announcement=line, **kwargs)
+        fakes.append(ser)
+        return ser
+
+    result = identity.probe(
+        "/dev/ttyACM0",
+        timeout_s=0.05,
+        serial_factory=capturing_factory,
+        settle_s=0,
+    )
+    assert fakes[0].written == [b"HELLO\n"]
+    assert result is not None
+    assert result.role == "NEZHA2"
+
+
 def test_probe_busy_port_returns_none_never_raises(monkeypatch, caplog):
     monkeypatch.setattr(identity, "port_holder", lambda port: "flashtool (pid 4242)")
     with caplog.at_level(logging.WARNING, logger=identity.logger.name):
