@@ -1,8 +1,9 @@
 ---
 id: '003'
 title: 'registry.flashlogic: extract shared flash-with-recovery logic from deploy.flash'
-status: open
-use-cases: [SUC-003]
+status: done
+use-cases:
+- SUC-003
 depends-on: []
 github-issue: ''
 issue: mbdeploy-flash-by-name-remote.md
@@ -30,22 +31,22 @@ only where the code lives, not what it does.
 
 ## Acceptance Criteria
 
-- [ ] `mbtools/registry/flashlogic.py` exists, containing
+- [x] `mbtools/registry/flashlogic.py` exists, containing
       `flash_hex`, `_validate_hex`, `_looks_transient`/
       `_TRANSIENT_SIGNATURES`, `_looks_locked`/`_LOCKED_SIGNATURES`,
       `_run_streamed`, and `_log` — moved verbatim (no logic change) from
       `mbtools/deploy/flash.py`. `DEFAULT_MCU` continues to be imported
       from `mbtools.registry.flash` (unchanged — sprint 1's constant,
       still owned there).
-- [ ] `mbtools/deploy/flash.py` re-exports `flash_hex` and `DEFAULT_MCU`
+- [x] `mbtools/deploy/flash.py` re-exports `flash_hex` and `DEFAULT_MCU`
       from `mbtools.registry.flashlogic` (`from
       mbtools.registry.flashlogic import DEFAULT_MCU, flash_hex`,
       `__all__` unchanged) — every existing `from mbtools.deploy.flash
       import flash_hex` call site (`deploy.cli`) needs zero changes.
-- [ ] `mbtools.registry.flash.FlashOp` (the sprint-1 deliberately-minimal
+- [x] `mbtools.registry.flash.FlashOp` (the sprint-1 deliberately-minimal
       wire-protocol op) is untouched — this ticket does not merge it with
       the new module or change its behavior in any way.
-- [ ] Module docstrings on both the new `flashlogic.py` and the shim
+- [x] Module docstrings on both the new `flashlogic.py` and the shim
       `deploy/flash.py` explain the split (the shim's docstring points to
       `flashlogic` as the real implementation; `flashlogic`'s docstring
       notes it is called from both `deploy.cli` locally and
