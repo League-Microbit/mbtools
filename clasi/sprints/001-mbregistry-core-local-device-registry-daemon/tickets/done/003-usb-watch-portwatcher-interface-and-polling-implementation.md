@@ -1,7 +1,7 @@
 ---
 id: '003'
 title: 'USB watch: PortWatcher interface and polling implementation'
-status: in-progress
+status: done
 use-cases:
 - SUC-001
 - SUC-002
