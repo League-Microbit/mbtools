@@ -15,6 +15,16 @@ needs will live here too, once that sprint needs them.
 before opening a port, and ticket 003's ``mbtools.registry.usbwatch`` needs
 it to filter ``comports()`` — two modules, one literal, so they can't drift
 apart the way a copy in each would.
+
+Ticket 008 (``mbtools.registry.api``) adds the registry wire-protocol's
+stable exit codes and error codes here rather than in ``api`` itself, per
+that ticket's own acceptance criterion ("defined in one place ... for
+sprint 002 to reuse") and this module's own stated purpose above ("the
+registry wire-protocol DTOs sprint 002 needs will live here too, once
+that sprint needs them"). Ticket 009's CLI is the first consumer inside
+this sprint; sprint 002's client tools (``mbdeploy``, ``mbserial``) are
+the reason these live here instead of buried in ``api.py`` where only
+that module's own tests would see them.
 """
 
 from __future__ import annotations
@@ -25,6 +35,34 @@ from dataclasses import dataclass
 #: interface enumerates as this pair, on both macOS and Linux (ported from
 #: mbdeploy's ``devices.py`` ``_DAPLINK_VID_PID``).
 DAPLINK_VID_PID = (0x0D28, 0x0204)
+
+# -- registry wire-protocol constants (ticket 008) --------------------------
+#
+# Stable process exit codes for mbregistry clients (the CLI, ticket 009,
+# and sprint 002+'s mbdeploy/mbserial). Ported from
+# microbit-radio-relay/server/src/mbrelay/errors.py's precedent -- HIL
+# tests and Ansible branch on stable exit codes, so this shape ("stable,
+# documented, small integer per failure category") is kept and these
+# values must never be renumbered once released.
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_USAGE = 2
+EXIT_NO_DAEMON = 3  # api socket not present/unreachable -- UC-004's error flow
+EXIT_NO_DEVICE = 4  # CODE_NOT_FOUND -- "no such device"
+EXIT_LOCKED = 5  # CODE_LOCKED -- device already locked by someone else
+EXIT_HARDWARE = 6  # a flash op ran and failed
+
+#: Protocol-level error codes carried on every ``{"ok": false, "code":
+#: ..., "error": ...}`` response from :mod:`mbtools.registry.api`. A
+#: client switches on ``code`` (stable, small set); ``error`` is a
+#: free-text message for humans, per UC-006's "distinct 'no such device'
+#: error from 'locked'" requirement -- two different codes, not one
+#: generic failure.
+CODE_NOT_FOUND = "not_found"
+CODE_LOCKED = "locked"
+CODE_NOT_LOCKED = "not_locked"
+CODE_INVALID_REQUEST = "invalid_request"
+CODE_INTERNAL_ERROR = "internal_error"
 
 
 @dataclass(frozen=True)

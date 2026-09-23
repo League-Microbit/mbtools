@@ -189,7 +189,17 @@ class Store:
         self.db_path = Path(db_path) if db_path is not None else DEFAULT_DB_PATH
         self._now = now_fn if now_fn is not None else time.time
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.db_path))
+        # check_same_thread=False: ticket 008's api module calls into this
+        # same Store instance from its connection-handler threads, which
+        # are never the thread that constructed it. Safe under the
+        # Design Rationale's already-accepted "no design here for
+        # multi-writer contention beyond SQLite's own file locking (WAL
+        # mode)" -- each method here is one atomic execute+commit, and
+        # sqlite3's default (serialized) build-time threading mode
+        # already protects the underlying connection handle. No
+        # additional Python-level locking is added here; api.py
+        # serializes the check-then-act sequences that need it.
+        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute(_SCHEMA)
