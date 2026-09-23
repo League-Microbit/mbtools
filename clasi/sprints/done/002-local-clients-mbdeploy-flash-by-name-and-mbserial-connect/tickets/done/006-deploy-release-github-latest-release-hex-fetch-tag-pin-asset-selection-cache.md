@@ -2,8 +2,9 @@
 id: '006'
 title: 'deploy.release: GitHub latest-release hex fetch, tag pin, asset selection,
   cache'
-status: open
-use-cases: [SUC-002]
+status: done
+use-cases:
+- SUC-002
 depends-on: []
 github-issue: ''
 issue: mbdeploy-install-latest-release-hex-from-a-github-repo.md
@@ -55,26 +56,26 @@ registry or flash dependency.
 
 ## Acceptance Criteria
 
-- [ ] `OWNER/REPO` (no `@tag`) resolves via `releases/latest`, never a
+- [x] `OWNER/REPO` (no `@tag`) resolves via `releases/latest`, never a
       tag literally named `latest`.
-- [ ] `OWNER/REPO@TAG` resolves via `releases/tags/<TAG>`.
-- [ ] Asset selection prefers `MICROBIT.hex`; falls back to a single
+- [x] `OWNER/REPO@TAG` resolves via `releases/tags/<TAG>`.
+- [x] Asset selection prefers `MICROBIT.hex`; falls back to a single
       other `*.hex` asset; errors (does not guess) when more than one
       `*.hex` exists and none is `MICROBIT.hex`; `--asset NAME` overrides
       the automatic choice and is used verbatim.
-- [ ] A downloaded asset is cached under `~/.cache/mbtools/hex/<owner>/
+- [x] A downloaded asset is cached under `~/.cache/mbtools/hex/<owner>/
       <repo>/<tag>/`; a second call for the same `repo@tag` makes no
       network request and returns the cached path.
-- [ ] The selected release tag and asset name are surfaced to the caller
+- [x] The selected release tag and asset name are surfaced to the caller
       (return value, not just a printed line) so `mbdeploy deploy`
       (ticket 007) can report them to the user.
-- [ ] `GITHUB_TOKEN`, when set in the environment, is sent as a bearer
+- [x] `GITHUB_TOKEN`, when set in the environment, is sent as a bearer
       auth header; its absence does not prevent anonymous access working
       for a public repo.
-- [ ] A repo/tag not found, or a rate-limit response, raises a clear,
+- [x] A repo/tag not found, or a rate-limit response, raises a clear,
       distinct error — never silently falls through to "no hex file
       found" or a generic exception a caller can't act on.
-- [ ] No new runtime dependency is added to `pyproject.toml` — uses
+- [x] No new runtime dependency is added to `pyproject.toml` — uses
       `urllib.request`.
 
 ## Testing

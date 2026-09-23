@@ -7,6 +7,7 @@ use-cases: []
 issues:
 - mbrelay-relay-protocol-client-over-mbregistry.md
 - mbregistry-windows-platform-support.md
+- non-root-usb-access-and-pyocd-permission-hang.md
 ---
 <!-- CLASI: Before changing code or making plans, review the SE process in CLAUDE.md -->
 

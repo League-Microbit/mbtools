@@ -35,6 +35,7 @@ Every request is a JSON object with an `"op"` field:
 | `lock` | `uid`, `kind` | acquire an exclusive lock of `kind` (`serial`/`relay`/`flash`/`debug`) on the device, tied to this connection's peer PID |
 | `unlock` | `uid` | release this connection's own lock on the device (a no-op, not an error, if this connection doesn't hold it) |
 | `flash` | `uid`, `hex_path` | flash `hex_path` to the device — requires a `flash`-kind lock already held by this same connection (call `lock` first) |
+| `mark_flashed` | `uid` | bookkeeping only: record that `uid` was flashed *outside* this op (sprint 002's `mbdeploy`, which flashes locally by running pyocd directly rather than through `flash`) — same `flash`-kind-lock-held-by-this-connection precondition as `flash`, no pyocd invocation |
 
 `uid` accepts any of uid / short_uid / device_name for every op that takes
 one, since all of them resolve through `store.find`.
@@ -54,7 +55,7 @@ Every non-streaming response is one of:
 |---|---|
 | `not_found` | no device matches the given uid/short_uid/device_name |
 | `locked` | `lock` failed — device already held by someone else. The response also carries `"holder": {"kind": ..., "pid": ...}` |
-| `not_locked` | `flash` was requested without this connection already holding a `flash`-kind lock on that device |
+| `not_locked` | `flash` or `mark_flashed` was requested without this connection already holding a `flash`-kind lock on that device |
 | `invalid_request` | malformed JSON, missing/bad fields, or an unknown `op` |
 | `internal_error` | reserved for an unexpected server-side failure (not raised by normal dispatch paths as of this ticket) |
 
@@ -148,6 +149,36 @@ API releases it here, unconditionally, once the attempt concludes (pyocd
 success, pyocd failure, or a hex-validation error) — this release is exactly
 what `mbtools.registry.daemon.Daemon`'s flash-triggered re-probe hook is
 watching for, so a client never needs a separate `unlock` call after `flash`.
+
+### `mark_flashed`
+
+```jsonc
+// request
+{"op": "mark_flashed", "uid": "..."}
+// response
+{"ok": true}
+// or, no flash-kind lock held by this connection:
+{"ok": false, "code": "not_locked", "error": "..."}
+// or:
+{"ok": false, "code": "not_found", "error": "..."}
+```
+
+Bookkeeping-only op (ticket 003) for a flash that ran *outside* this server's
+own `flash` op — sprint 002's `mbdeploy` flashes locally by running pyocd
+directly (ticket 007) rather than through `flash`, per sprint.md's Design
+Rationale ("a new `mark_flashed` wire-protocol op, rather than reusing
+`unlock` or extending `flash`"). Without this op, nothing calls
+`store.increment_flash_count` for that path.
+
+Same precondition as `flash`: a `flash`-kind lock already held by *this
+connection's own* PID (checked via `LockManager.status`, same check
+`_op_flash` makes) — a lock held by a different connection, or no lock at
+all, is `not_locked`, same as `flash`. On success, `store.flash_count` for
+`uid` is incremented by exactly one. Unlike `flash`, this op never invokes
+pyocd and — because it does not touch the lock at all — never releases it,
+so it triggers no re-probe of its own; the existing lock-release hook
+(`LockManager`'s `flash_release_callback`, fired on any `flash`-kind release
+regardless of what ran before it) is what does that, unaffected by this op.
 
 ## Locking and connection lifetime
 

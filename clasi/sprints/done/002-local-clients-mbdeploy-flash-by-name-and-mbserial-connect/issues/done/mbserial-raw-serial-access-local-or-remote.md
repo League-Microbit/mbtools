@@ -1,5 +1,5 @@
 ---
-status: in-progress
+status: done
 split_into:
 - mbserial-raw-serial-access-remote.md
 sprint: '002'

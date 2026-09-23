@@ -193,10 +193,23 @@ def probe(
 
     Opens with ``dsrdtr=False, rtscts=False`` and DTR/RTS held low (per
     brief §3.2 step 4 / spec cross-cutting §4), waits :data:`_SETTLE_DELAY_S`
-    for a spontaneous announcement, resets the input buffer, writes
-    ``HELLO\\n``, then reads lines until one parses against either
-    dialect or ``timeout_s`` elapses. The port is always closed before
-    returning.
+    for a spontaneous announcement, resets the input buffer once, then
+    writes ``HELLO\\n`` and reads lines for up to ``timeout_s`` (one "read
+    window"), returning as soon as a line parses against either dialect.
+
+    If that first window ends with nothing usable -- silence, or only a
+    line that doesn't parse against either dialect -- ``HELLO`` is sent
+    exactly one more time and a second, equally bounded window is read
+    before giving up. This is the same "exactly one retry" house style
+    used elsewhere in this project (mbdeploy's transient-probe retry),
+    applied here per sprint 002's Design Rationale to mitigate a real,
+    not-root-caused timing sensitivity a hardware acceptance pass
+    surfaced (docs/acceptance/001-hardware.md's magni finding): a board
+    that stays silent or sends something unparseable in the first window
+    sometimes answers a second ``HELLO``. A board that answers within the
+    first window is completely untouched by this -- no second ``HELLO``
+    is ever sent, and its probe timing is unchanged. The retry never
+    loops more than once, win or lose.
 
     Returns:
     - A :class:`ProbeResult` with all fields populated, on a matching
@@ -245,29 +258,39 @@ def probe(
         if settle:
             time.sleep(settle)
         ser.reset_input_buffer()
-        ser.write(b"HELLO\n")
-        ser.flush()
 
         malformed_raw: str | None = None
-        deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
-            raw = ser.readline()
-            if not raw:
-                continue
-            text = raw.decode("utf-8", "ignore").strip()
-            if not text:
-                continue
-            fields = _parse_announcement(text)
-            if fields is not None:
-                role, common_name, device_name, serial_no = fields
-                return ProbeResult(
-                    role=role,
-                    common_name=common_name,
-                    device_name=device_name,
-                    serial=serial_no,
-                    raw=text,
+        # Exactly one bounded retry: two attempts total, never open-ended.
+        # A first-window success returns immediately from inside the loop
+        # below, so a board that answers promptly never sees a second
+        # HELLO -- this is what keeps the already-passing case untouched.
+        for attempt in range(2):
+            ser.write(b"HELLO\n")
+            ser.flush()
+            deadline = time.monotonic() + timeout_s
+            while time.monotonic() < deadline:
+                raw = ser.readline()
+                if not raw:
+                    continue
+                text = raw.decode("utf-8", "ignore").strip()
+                if not text:
+                    continue
+                fields = _parse_announcement(text)
+                if fields is not None:
+                    role, common_name, device_name, serial_no = fields
+                    return ProbeResult(
+                        role=role,
+                        common_name=common_name,
+                        device_name=device_name,
+                        serial=serial_no,
+                        raw=text,
+                    )
+                malformed_raw = text
+            if attempt == 0:
+                logger.debug(
+                    "identity.probe: %s first window unusable, sending HELLO once more",
+                    port,
                 )
-            malformed_raw = text
         if malformed_raw is not None:
             return ProbeResult(
                 role="", common_name="", device_name="", serial="", raw=malformed_raw

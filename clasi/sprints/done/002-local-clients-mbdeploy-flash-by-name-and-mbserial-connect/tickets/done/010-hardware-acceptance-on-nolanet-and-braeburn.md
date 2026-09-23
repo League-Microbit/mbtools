@@ -1,9 +1,18 @@
 ---
 id: '010'
 title: Hardware acceptance on Nolanet and braeburn
-status: open
-use-cases: [SUC-001, SUC-002, SUC-003, SUC-004, SUC-005, SUC-006]
-depends-on: ['007', '008', '009']
+status: done
+use-cases:
+- SUC-001
+- SUC-002
+- SUC-003
+- SUC-004
+- SUC-005
+- SUC-006
+depends-on:
+- '007'
+- 008
+- 009
 github-issue: ''
 issue:
 - mbdeploy-flash-by-name-via-mbregistry.md
@@ -69,30 +78,34 @@ already running firmware to observe.
 
 ## Acceptance Criteria
 
-- [ ] `scripts/deploy-test-host.sh` deploys this sprint's code to all
+- [x] `scripts/deploy-test-host.sh` deploys this sprint's code to all
       five hosts.
-- [ ] `mbdeploy deploy --repo` flashes successfully via a real GitHub
+- [x] `mbdeploy deploy --repo` flashes successfully via a real GitHub
       release fetch (not a local `--hex` file) at least once, using at
       least one of the three named firmware repos, with the flash
       streamed live, verified, and the new announcement reported.
-- [ ] `mbdeploy list` and `mbregistry list` output are compared side by
+- [x] `mbdeploy list` and `mbregistry list` output are compared side by
       side on real data and confirmed to match (SUC-003).
-- [ ] `mbserial <name>` is confirmed, on real hardware, not to reboot a
+- [x] `mbserial <name>` is confirmed, on real hardware, not to reboot a
       running robot by default, and a `--reset` connect is confirmed to
       actually reset one.
-- [ ] Busy-lock fail-fast (holder kind + PID) is exercised on at least
+- [x] Busy-lock fail-fast (holder kind + PID) is exercised on at least
       one host for at least one lock kind.
-- [ ] `mbdeploy debug` is exercised at least once.
-- [ ] Magni's nezha-firmware post-flash timing finding is specifically
+- [x] `mbdeploy debug` is exercised at least once.
+- [x] Magni's nezha-firmware post-flash timing finding is specifically
       re-tested and the result (closed / still flaky / inconclusive) is
       recorded, not skipped.
-- [ ] Every result is recorded in `docs/acceptance/002-hardware.md`,
+- [x] Every result is recorded in `docs/acceptance/002-hardware.md`,
       PASS/FAIL/MANUAL per host, with any manual substitute explicitly
       labeled as such (not silently folded into PASS) — same rigor as
       `docs/acceptance/001-hardware.md`.
-- [ ] Any code fix made during this pass (as sprint 001's ticket 010
+- [x] Any code fix made during this pass (as sprint 001's ticket 010
       found two real bugs) is committed with a regression test, not left
-      as a manual-only fix.
+      as a manual-only fix. (No code fix was needed this pass — the one
+      finding, local pyOCD/serial access needing `sudo` on the Nolanet
+      nodes, is host provisioning, documented in
+      `docs/acceptance/002-hardware.md` and `CLAUDE.md`, not a code
+      change.)
 
 ## Testing
 

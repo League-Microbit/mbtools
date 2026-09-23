@@ -2,9 +2,16 @@
 id: '007'
 title: 'mbdeploy: deploy command (resolve, flash-lock, flash, verify, wait-for-reprobe,
   relay guard, report)'
-status: open
-use-cases: [SUC-001, SUC-002, SUC-005]
-depends-on: ['001', '003', '005', '006']
+status: done
+use-cases:
+- SUC-001
+- SUC-002
+- SUC-005
+depends-on:
+- '001'
+- '003'
+- '005'
+- '006'
 github-issue: ''
 issue:
 - mbdeploy-flash-by-name-via-mbregistry.md
@@ -64,28 +71,28 @@ each other on a real fleet node.
 
 ## Acceptance Criteria
 
-- [ ] `mbdeploy deploy <name> --hex FILE` flashes a local device
+- [x] `mbdeploy deploy <name> --hex FILE` flashes a local device
       end-to-end: resolve, lock, flash (with ticket 005's retry/erase
       behavior intact), `mark_flashed`, unlock, wait-for-reprobe, report.
-- [ ] `mbdeploy deploy <name> --repo OWNER/REPO[@TAG] [--asset NAME]`
+- [x] `mbdeploy deploy <name> --repo OWNER/REPO[@TAG] [--asset NAME]`
       resolves the hex via `deploy.release` (ticket 006) before locking
       anything, then proceeds identically to the `--hex` path; the
       selected release tag and asset are printed.
-- [ ] A relay target without `--force-relay` refuses before any lock is
+- [x] A relay target without `--force-relay` refuses before any lock is
       taken or any hex file is resolved/downloaded.
-- [ ] An already-locked device fails fast with the holder's kind and PID
+- [x] An already-locked device fails fast with the holder's kind and PID
       (`EXIT_LOCKED`), no retry or blocking wait.
-- [ ] A `mark_flashed` call that fails with `invalid_request` (old
+- [x] A `mark_flashed` call that fails with `invalid_request` (old
       daemon) is logged as a warning and does not fail the command —
       verified by a test that fakes exactly that response.
-- [ ] The wait-for-reprobe step has a bounded timeout; a board that
+- [x] The wait-for-reprobe step has a bounded timeout; a board that
       never re-announces within it is reported plainly as "no new
       announcement arrived," not treated as success and not hung
       indefinitely.
-- [ ] A post-mass-erase blank board (ticket 005's `flash_hex` outcome)
+- [x] A post-mass-erase blank board (ticket 005's `flash_hex` outcome)
       is reported as a distinct, explicit failure mode — never folded
       into a generic "flash failed" message.
-- [ ] `--hex` and `--repo` are mutually exclusive; giving both is a
+- [x] `--hex` and `--repo` are mutually exclusive; giving both is a
       usage error (`EXIT_USAGE`) before any device interaction.
 
 ## Testing

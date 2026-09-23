@@ -109,6 +109,29 @@ class TestFakeSerial:
         assert ser.close_calls == 1
         assert not ser.is_open
 
+    def test_announcement_after_writes_gates_on_write_count(self):
+        # ticket 004's bounded-retry scenario: silent until a second
+        # write() has actually happened, then answers.
+        ser = FakeSerial(
+            announcement="device NEZHA2 robot vevov 1198504156",
+            announcement_after_writes=2,
+        )
+        ser.open()
+        assert ser.readline() == b""  # no write() yet
+        ser.write(b"HELLO\n")
+        assert ser.readline() == b""  # only one write() so far
+        ser.write(b"HELLO\n")
+        assert ser.readline() == b"device NEZHA2 robot vevov 1198504156\n"
+        # Only one scripted line -- subsequent reads are silence again.
+        assert ser.readline() == b""
+
+    def test_announcement_after_writes_defaults_to_immediate(self):
+        # Default (0) preserves the original FakeSerial contract: no
+        # write() is required before the first readline() answers.
+        ser = FakeSerial(announcement="device NEZHA2 robot vevov 1198504156")
+        ser.open()
+        assert ser.readline() == b"device NEZHA2 robot vevov 1198504156\n"
+
     def test_accepts_pyserial_style_constructor_kwargs(self):
         ser = FakeSerial(
             announcement="device NEZHA2 robot vevov 1198504156",

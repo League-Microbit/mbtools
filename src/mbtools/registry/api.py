@@ -15,7 +15,7 @@ down here since it becomes sprint 002's de facto contract; see also
 ``docs/design/registry-api.md``): newline-delimited JSON over the Unix
 socket, one connection per client session. Each request line is a JSON
 object with an ``"op"`` field (``list``/``get``/``find``/``lock``/
-``unlock``/``flash``); each non-streaming op writes exactly one JSON
+``unlock``/``flash``/``mark_flashed``); each non-streaming op writes exactly one JSON
 response line. ``flash`` is the one streaming op: zero or more
 ``{"type": "log", "line": ...}`` lines (relayed from
 :meth:`~mbtools.registry.flash.FlashOp.flash_hex`'s log callback as they
@@ -328,10 +328,33 @@ class RegistryAPIServer:
         self._stop_event.wait()
 
     def stop(self) -> None:
-        """Stop accepting new connections and the sweep timer; remove the
-        socket file. Already-open connections are not forcibly closed --
-        they wind down on their own next read/EOF, same as a client
-        disconnecting.
+        """Stop accepting new connections and the sweep timer, and join
+        every connection-handler thread that is still alive, before
+        returning; remove the socket file.
+
+        Already-open connections are not forcibly closed -- they wind
+        down on their own next read/EOF, same as a client disconnecting
+        (unchanged from before this join was added: a connection a
+        client is deliberately keeping open across a ``stop()`` call is
+        still left to wind down on its own, and its
+        ``join(timeout=2.0)`` below simply times out without blocking
+        shutdown). What changed is that a connection which *has* already
+        seen EOF, or sees it within the timeout, is now waited for
+        instead of left to finish on its own after this method returns.
+
+        This join matters because every connection-handler thread
+        (``_handle_connection``) calls back into ``store``/``locks``
+        (``_op_list``, ``_op_find``, ...); a caller that tears down
+        ``store`` (``store.close()``) immediately after ``stop()``
+        returns -- every production and test caller does exactly this --
+        would otherwise race a not-yet-finished handler thread against
+        the now-closed sqlite connection. Found via a flaky
+        ``IndexError`` in ``store._row_to_record`` traced to exactly this
+        race: a connection-handler thread from a just-finished client
+        request was still mid-``_op_list`` when the test's ``finally``
+        block called ``store.close()`` right after ``stop()`` returned,
+        because ``stop()`` joined the accept and sweep threads but never
+        the per-connection ones ``_accept_loop`` spawns.
         """
         self._stop_event.set()
         if self._sock is not None:
@@ -343,6 +366,8 @@ class RegistryAPIServer:
             self._accept_thread.join(timeout=2.0)
         if self._sweep_thread is not None:
             self._sweep_thread.join(timeout=2.0)
+        for thread in self._conn_threads:
+            thread.join(timeout=2.0)
         try:
             self.socket_path.unlink()
         except FileNotFoundError:
@@ -447,6 +472,8 @@ class RegistryAPIServer:
             resp = self._op_unlock(req, pid, acquired_uids)
         elif op == "flash":
             resp = self._op_flash(req, pid, acquired_uids, wfile)
+        elif op == "mark_flashed":
+            resp = self._op_mark_flashed(req, pid)
         else:
             resp = _error(CODE_INVALID_REQUEST, f"unknown op {op!r}")
         self._write(wfile, resp)
@@ -628,3 +655,41 @@ class RegistryAPIServer:
             "exit_code": result.exit_code,
             "error": result.error,
         }
+
+    def _op_mark_flashed(self, req: dict[str, Any], pid: int) -> dict[str, Any]:
+        """``mark_flashed(uid)``: bookkeeping-only op for a flash that ran
+        *outside* this server's own ``flash`` op -- sprint 002's ``mbdeploy``
+        flashes locally by running pyocd directly (ticket 007) rather than
+        through ``flash``, per sprint.md's Design Rationale ("a new
+        ``mark_flashed`` wire-protocol op, rather than reusing ``unlock`` or
+        extending ``flash``"). Without this op, nothing calls
+        ``store.increment_flash_count`` for that path.
+
+        Same precondition as ``flash``: a ``flash``-kind lock already held
+        by *this connection's* own pid, checked via ``LockManager.status``
+        exactly like :meth:`_op_flash` does -- a lock held by a different
+        connection (or no lock at all) is ``not_locked``, same as ``flash``.
+        On success, increments ``store.flash_count`` for ``uid`` by one and
+        returns ``{"ok": true}``. No pyocd invocation here, and no re-probe
+        trigger of its own: this op never releases the lock, so it doesn't
+        need to -- any ``flash``-kind lock release already re-probes
+        (``LockManager``'s ``flash_release_callback``, unconditional on the
+        releasing caller), regardless of what ran before it.
+        """
+        token = req.get("uid")
+        if not token:
+            return _error(CODE_INVALID_REQUEST, "'mark_flashed' requires 'uid'")
+        with self._lock:
+            record = self._store.find(str(token))
+            if record is None:
+                return _error(CODE_NOT_FOUND, f"no such device: {token!r}")
+            uid = record.uid
+            holder = self._locks.status(uid)
+            if holder is None or holder.kind != KIND_FLASH or holder.pid != pid:
+                return _error(
+                    CODE_NOT_LOCKED,
+                    f"{uid}: mark_flashed requires a flash-kind lock held by "
+                    "this connection (call 'lock' first)",
+                )
+            self._store.increment_flash_count(uid)
+            return {"ok": True}

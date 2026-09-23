@@ -1,7 +1,7 @@
 ---
 id: '002'
 title: 'Local clients: mbdeploy flash-by-name and mbserial connect'
-status: ticketing
+status: done
 branch: sprint/002-local-clients-mbdeploy-flash-by-name-and-mbserial-connect
 use-cases: []
 issues:
