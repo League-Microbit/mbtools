@@ -498,6 +498,103 @@ def test_flash_release_triggers_flash_release_callback(tmp_path, socket_dir, sto
 
 
 # ---------------------------------------------------------------------------
+# mark_flashed
+# ---------------------------------------------------------------------------
+
+
+def test_mark_flashed_without_flash_lock_is_refused(make_server, store):
+    srv = make_server(peer_pid_fn=_sequential_peer_pid_fn([PID_A]))
+    client = _Client(srv.socket_path)
+
+    resp = client.request({"op": "mark_flashed", "uid": UID})
+
+    assert resp["ok"] is False
+    assert resp["code"] == CODE_NOT_LOCKED
+    assert store.find(UID).flash_count == 0
+    client.close()
+
+
+def test_mark_flashed_held_by_a_different_connection_is_refused(make_server, locks, store):
+    srv = make_server(peer_pid_fn=_sequential_peer_pid_fn([PID_B]))
+    locks.acquire(UID, KIND_FLASH, PID_A)  # some other connection holds it
+    client = _Client(srv.socket_path)  # gets PID_B, not PID_A
+
+    resp = client.request({"op": "mark_flashed", "uid": UID})
+
+    assert resp["ok"] is False
+    assert resp["code"] == CODE_NOT_LOCKED
+    assert locks.status(UID).pid == PID_A  # untouched
+    assert store.find(UID).flash_count == 0
+    client.close()
+
+
+def test_mark_flashed_increments_flash_count_and_does_not_touch_the_lock(
+    make_server, locks, store
+):
+    srv = make_server(peer_pid_fn=_sequential_peer_pid_fn([PID_A]))
+    client = _Client(srv.socket_path)
+    client.request({"op": "lock", "uid": UID, "kind": KIND_FLASH})
+
+    resp = client.request({"op": "mark_flashed", "uid": UID})
+
+    assert resp == {"ok": True}
+    assert store.find(UID).flash_count == 1
+    # the lock is untouched -- mark_flashed does not release it, unlike flash.
+    assert locks.status(UID).kind == KIND_FLASH
+    assert locks.status(UID).pid == PID_A
+    client.close()
+
+
+def test_mark_flashed_does_not_invoke_pyocd(make_server):
+    runner = _SpyRunner()
+    srv = make_server(peer_pid_fn=_sequential_peer_pid_fn([PID_A]), runner=runner)
+    client = _Client(srv.socket_path)
+    client.request({"op": "lock", "uid": UID, "kind": KIND_FLASH})
+
+    client.request({"op": "mark_flashed", "uid": UID})
+
+    assert runner.calls == []
+    client.close()
+
+
+def test_mark_flashed_does_not_trigger_flash_release_callback(tmp_path, socket_dir, store):
+    fired = []
+    locks = LockManager(flash_release_callback=fired.append)
+    flash_op = FlashOp(locks=locks, store=store, runner=_SpyRunner(exit_code=0))
+    srv = RegistryAPIServer(
+        socket_path=f"{socket_dir}/api.sock",
+        store=store,
+        locks=locks,
+        flash_op=flash_op,
+        peer_pid_fn=_sequential_peer_pid_fn([PID_A]),
+        sweep_interval_s=100.0,
+    )
+    srv.start()
+    client = _Client(srv.socket_path)
+    client.request({"op": "lock", "uid": UID, "kind": KIND_FLASH})
+
+    client.request({"op": "mark_flashed", "uid": UID})
+
+    # mark_flashed never releases the lock, so the re-probe hook -- which
+    # fires on any flash-kind release, per LockManager's own contract --
+    # does not fire either.
+    assert fired == []
+    client.close()
+    srv.stop()
+
+
+def test_mark_flashed_unknown_uid_returns_not_found(make_server):
+    srv = make_server(peer_pid_fn=_sequential_peer_pid_fn([PID_A]))
+    client = _Client(srv.socket_path)
+
+    resp = client.request({"op": "mark_flashed", "uid": "does-not-exist"})
+
+    assert resp["ok"] is False
+    assert resp["code"] == CODE_NOT_FOUND
+    client.close()
+
+
+# ---------------------------------------------------------------------------
 # malformed requests
 # ---------------------------------------------------------------------------
 

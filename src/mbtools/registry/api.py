@@ -15,7 +15,7 @@ down here since it becomes sprint 002's de facto contract; see also
 ``docs/design/registry-api.md``): newline-delimited JSON over the Unix
 socket, one connection per client session. Each request line is a JSON
 object with an ``"op"`` field (``list``/``get``/``find``/``lock``/
-``unlock``/``flash``); each non-streaming op writes exactly one JSON
+``unlock``/``flash``/``mark_flashed``); each non-streaming op writes exactly one JSON
 response line. ``flash`` is the one streaming op: zero or more
 ``{"type": "log", "line": ...}`` lines (relayed from
 :meth:`~mbtools.registry.flash.FlashOp.flash_hex`'s log callback as they
@@ -447,6 +447,8 @@ class RegistryAPIServer:
             resp = self._op_unlock(req, pid, acquired_uids)
         elif op == "flash":
             resp = self._op_flash(req, pid, acquired_uids, wfile)
+        elif op == "mark_flashed":
+            resp = self._op_mark_flashed(req, pid)
         else:
             resp = _error(CODE_INVALID_REQUEST, f"unknown op {op!r}")
         self._write(wfile, resp)
@@ -628,3 +630,41 @@ class RegistryAPIServer:
             "exit_code": result.exit_code,
             "error": result.error,
         }
+
+    def _op_mark_flashed(self, req: dict[str, Any], pid: int) -> dict[str, Any]:
+        """``mark_flashed(uid)``: bookkeeping-only op for a flash that ran
+        *outside* this server's own ``flash`` op -- sprint 002's ``mbdeploy``
+        flashes locally by running pyocd directly (ticket 007) rather than
+        through ``flash``, per sprint.md's Design Rationale ("a new
+        ``mark_flashed`` wire-protocol op, rather than reusing ``unlock`` or
+        extending ``flash``"). Without this op, nothing calls
+        ``store.increment_flash_count`` for that path.
+
+        Same precondition as ``flash``: a ``flash``-kind lock already held
+        by *this connection's* own pid, checked via ``LockManager.status``
+        exactly like :meth:`_op_flash` does -- a lock held by a different
+        connection (or no lock at all) is ``not_locked``, same as ``flash``.
+        On success, increments ``store.flash_count`` for ``uid`` by one and
+        returns ``{"ok": true}``. No pyocd invocation here, and no re-probe
+        trigger of its own: this op never releases the lock, so it doesn't
+        need to -- any ``flash``-kind lock release already re-probes
+        (``LockManager``'s ``flash_release_callback``, unconditional on the
+        releasing caller), regardless of what ran before it.
+        """
+        token = req.get("uid")
+        if not token:
+            return _error(CODE_INVALID_REQUEST, "'mark_flashed' requires 'uid'")
+        with self._lock:
+            record = self._store.find(str(token))
+            if record is None:
+                return _error(CODE_NOT_FOUND, f"no such device: {token!r}")
+            uid = record.uid
+            holder = self._locks.status(uid)
+            if holder is None or holder.kind != KIND_FLASH or holder.pid != pid:
+                return _error(
+                    CODE_NOT_LOCKED,
+                    f"{uid}: mark_flashed requires a flash-kind lock held by "
+                    "this connection (call 'lock' first)",
+                )
+            self._store.increment_flash_count(uid)
+            return {"ok": True}

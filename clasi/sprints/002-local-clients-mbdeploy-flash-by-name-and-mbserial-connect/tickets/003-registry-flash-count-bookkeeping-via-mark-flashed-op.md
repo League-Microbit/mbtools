@@ -1,9 +1,11 @@
 ---
 id: '003'
 title: 'registry: flash-count bookkeeping via mark_flashed op'
-status: open
-use-cases: [UC-008]
-depends-on: ['001']
+status: in-progress
+use-cases:
+- UC-008
+depends-on:
+- '001'
 github-issue: ''
 issue: mbdeploy-flash-by-name-via-mbregistry.md
 completes_issue: true
@@ -38,22 +40,22 @@ following the same documentation shape as the existing ops.
 
 ## Acceptance Criteria
 
-- [ ] `{"op": "mark_flashed", "uid": "..."}` requires a `flash`-kind lock
+- [x] `{"op": "mark_flashed", "uid": "..."}` requires a `flash`-kind lock
       already held by the calling connection; without one, responds
       `{"ok": false, "code": "not_locked", ...}` — same precondition and
       same error code as the existing `flash` op.
-- [ ] On success, `store.flash_count` for that uid is incremented by
+- [x] On success, `store.flash_count` for that uid is incremented by
       exactly one and the response is `{"ok": true}`.
-- [ ] Calling `mark_flashed` does **not** invoke pyocd and does not by
+- [x] Calling `mark_flashed` does **not** invoke pyocd and does not by
       itself trigger a re-probe (the existing lock-release hook is what
       does that, unaffected by this op).
-- [ ] `mbtools.registry.client.mark_flashed(uid)` (extending ticket 001's
+- [x] `mbtools.registry.client.mark_flashed(uid)` (extending ticket 001's
       module) wraps this op the same way its other methods wrap
       `lock`/`unlock`/`find`.
-- [ ] `docs/design/registry-api.md` documents the new op in its existing
+- [x] `docs/design/registry-api.md` documents the new op in its existing
       table format (fields, response shape, error codes) as a new
       section alongside `flash`.
-- [ ] Every existing op's behavior, response shape, and error codes are
+- [x] Every existing op's behavior, response shape, and error codes are
       unchanged (regression-checked by re-running sprint 001's full API
       test suite unmodified).
 

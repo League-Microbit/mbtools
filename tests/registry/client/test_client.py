@@ -216,6 +216,34 @@ def test_unlock_when_not_held_by_this_connection_returns_false(server):
 
 
 # ---------------------------------------------------------------------------
+# mark_flashed
+# ---------------------------------------------------------------------------
+
+
+def test_mark_flashed_without_flash_lock_raises_registry_client_error(server, store):
+    with RegistryClient(server.socket_path) as client:
+        with pytest.raises(RegistryClientError) as excinfo:
+            client.mark_flashed(UID)
+
+    assert excinfo.value.code == "not_locked"
+    assert store.find(UID).flash_count == 0
+
+
+def test_mark_flashed_increments_flash_count(server, store):
+    with RegistryClient(server.socket_path) as client:
+        client.lock(UID, KIND_FLASH)
+        client.mark_flashed(UID)
+
+    assert store.find(UID).flash_count == 1
+
+
+def test_mark_flashed_unknown_uid_raises_device_not_found(server):
+    with RegistryClient(server.socket_path) as client:
+        with pytest.raises(DeviceNotFoundError):
+            client.mark_flashed("does-not-exist")
+
+
+# ---------------------------------------------------------------------------
 # session model: a lock is released when the connection closes
 # ---------------------------------------------------------------------------
 

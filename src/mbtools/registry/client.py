@@ -325,3 +325,19 @@ class RegistryClient:
         """
         resp = self._request({"op": "unlock", "uid": uid})
         return bool(resp.get("released", False))
+
+    def mark_flashed(self, uid: str) -> None:
+        """Record that ``uid`` was just flashed, per the ``mark_flashed``
+        op (ticket 003) -- bookkeeping only, for a flash that ran
+        *outside* the registry's own ``flash`` op (sprint 002's
+        ``mbdeploy``, which flashes locally via pyocd directly rather
+        than through ``flash``; see ``docs/design/registry-api.md``).
+        Increments ``store.flash_count`` for ``uid`` by one.
+
+        Requires a ``flash``-kind lock already held by this connection
+        (call :meth:`lock` first) -- the same precondition ``flash``
+        itself has. Raises :class:`DeviceNotFoundError` if ``uid``
+        doesn't resolve, or :class:`RegistryClientError` (``code ==
+        "not_locked"``) if this connection doesn't hold the lock.
+        """
+        self._request({"op": "mark_flashed", "uid": uid})
