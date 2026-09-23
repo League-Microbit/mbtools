@@ -2,9 +2,12 @@
 id: 009
 title: 'mbserial: local connect (resolve, serial-lock, open without reboot, interact,
   --reset)'
-status: open
-use-cases: [SUC-004, SUC-005]
-depends-on: ['001']
+status: in-progress
+use-cases:
+- SUC-004
+- SUC-005
+depends-on:
+- '001'
 github-issue: ''
 issue: mbserial-raw-serial-access-local-or-remote.md
 completes_issue: true
@@ -49,21 +52,21 @@ stream"):
 
 ## Acceptance Criteria
 
-- [ ] `mbserial <name>` opens the local board's port with DTR/RTS held
+- [x] `mbserial <name>` opens the local board's port with DTR/RTS held
       low by default — no reboot — and hands the user an interactive
       terminal (ported `console.interact`).
-- [ ] `mbserial <name> --reset` deliberately resets the board as part of
+- [x] `mbserial <name> --reset` deliberately resets the board as part of
       connect: BREAK on Linux, reopen on macOS.
-- [ ] `mbserial <name> <message...>` (one-shot mode) sends the message
+- [x] `mbserial <name> <message...>` (one-shot mode) sends the message
       and prints the reply lines, ported unchanged from `console.
       send_command`'s idle-gap/timeout behavior.
-- [ ] An already-locked device fails fast with the holder's kind and PID
+- [x] An already-locked device fails fast with the holder's kind and PID
       (`EXIT_LOCKED`) — no retry, no blocking wait, same as ticket 007's
       flash-lock fail-fast.
-- [ ] The `serial`-kind lock is released on every exit path: normal
+- [x] The `serial`-kind lock is released on every exit path: normal
       Ctrl-D, Ctrl-C, and a library caller explicitly closing the
       session — no leaked lock on any of these.
-- [ ] The session object returned to a library caller (not just the CLI)
+- [x] The session object returned to a library caller (not just the CLI)
       is usable directly — the `SocketSerial`-shaped idea from
       `mbdeploy`'s `remote.py` is the reference shape spec §5.1 names,
       even though this ticket's transport is a direct local port, not a

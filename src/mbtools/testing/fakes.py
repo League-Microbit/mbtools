@@ -125,6 +125,7 @@ class FakeSerial:
         self.open_calls = 0
         self.close_calls = 0
         self.reset_input_buffer_calls = 0
+        self.break_calls: list[float] = []
         for key, value in serial_kwargs.items():
             setattr(self, key, value)
         self.port = serial_kwargs.get("port")
@@ -177,3 +178,32 @@ class FakeSerial:
                 line += "\n"
             return line.encode("utf-8")
         return b""
+
+    def read(self, size: int = 1) -> bytes:
+        """Pyserial-shaped ``read`` (ticket 009, ``mbtools.serial.connect``'s
+        ``interact()``) -- delegates to :meth:`readline`, which already
+        returns a whole scripted line (or ``b""``) in one call rather
+        than one byte at a time. Good enough for ``interact()``'s pump
+        loop, which never depends on a partial read; mirrors the local
+        ``FakeSerial`` today's ``mbdeploy``'s own
+        ``tests/test_connect.py`` uses for the same purpose.
+        """
+        return self.readline()
+
+    @property
+    def in_waiting(self) -> int:
+        """Always ``0`` -- ``interact()``'s pump loop computes
+        ``max(1, ser.in_waiting)`` before every :meth:`read`, so a
+        constant ``0`` just means "read whatever's there right now, one
+        call at a time", same as mbdeploy's own connect-test fake.
+        """
+        return 0
+
+    def send_break(self, duration: float = 0.25) -> None:
+        """Pyserial's own BREAK-condition API
+        (``serial.Serial.send_break``). Records ``duration`` in
+        :attr:`break_calls` rather than doing anything to a real port, so
+        a test can assert ``mbserial --reset`` actually asserted BREAK on
+        Linux (ticket 009) instead of silently no-op'ing.
+        """
+        self.break_calls.append(duration)
