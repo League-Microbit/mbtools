@@ -1,7 +1,7 @@
 ---
 id: '005'
 title: 'Locks: PID-tied exclusive lock manager, kind-tagged'
-status: in-progress
+status: done
 use-cases:
 - SUC-005
 - SUC-006
