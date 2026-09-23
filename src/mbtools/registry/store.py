@@ -39,6 +39,7 @@ announcement field it didn't get fresh data for.
 from __future__ import annotations
 
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -178,6 +179,31 @@ class Store:
     depending on real wall-clock time to assert on ``first_seen``/
     ``last_seen``/``last_probe``. Production code leaves it at its default
     (``time.time``).
+
+    **Thread safety.** ``Store`` is shared across the daemon's own poll
+    thread, every ``RegistryAPIServer`` per-connection handler thread,
+    and (in some tests) the test's own main thread -- all against one
+    ``sqlite3.Connection`` opened with ``check_same_thread=False``. An
+    earlier revision of this docstring argued that was sufficient on its
+    own ("sqlite3's default (serialized) build-time threading mode
+    already protects the underlying connection handle"); in practice,
+    concurrent full-suite runs intermittently hit
+    ``sqlite3.InterfaceError``/``IndexError`` inside
+    :func:`_row_to_record` -- two threads interleaving a write-then-read
+    sequence (e.g. one thread's ``UPDATE ... commit()`` landing between
+    another thread's own ``execute`` and ``fetchone()``) can hand a
+    half-updated or cursor-invalidated row back to :func:`_row_to_record`.
+    ``self._lock`` (a ``threading.RLock``, reentrant so one public method
+    can call another, e.g. :meth:`upsert_attached` calling :meth:`get`,
+    without deadlocking itself) now serializes every public method's use
+    of ``self._conn`` -- every method below acquires it for its whole
+    body, not just the final ``commit()``, so a reader can never observe
+    another thread's write mid-flight. This is *this class's own*
+    internal guard; it does not replace ``api.py``'s separate shared
+    ``threading.RLock`` (ticket 009), which still serializes
+    check-then-act sequences that span *multiple* calls into
+    ``store``/``locks`` together (e.g. "check lock status, then write") --
+    a concern this class's own per-call lock cannot address by itself.
     """
 
     def __init__(
@@ -189,16 +215,19 @@ class Store:
         self.db_path = Path(db_path) if db_path is not None else DEFAULT_DB_PATH
         self._now = now_fn if now_fn is not None else time.time
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        # Reentrant so a public method can call another public method on
+        # `self` (e.g. upsert_attached -> get) without deadlocking on its
+        # own lock -- see the class docstring's "Thread safety" note.
+        self._lock = threading.RLock()
         # check_same_thread=False: ticket 008's api module calls into this
         # same Store instance from its connection-handler threads, which
-        # are never the thread that constructed it. Safe under the
-        # Design Rationale's already-accepted "no design here for
-        # multi-writer contention beyond SQLite's own file locking (WAL
-        # mode)" -- each method here is one atomic execute+commit, and
-        # sqlite3's default (serialized) build-time threading mode
-        # already protects the underlying connection handle. No
-        # additional Python-level locking is added here; api.py
-        # serializes the check-then-act sequences that need it.
+        # are never the thread that constructed it. Safe now that every
+        # public method below serializes its own use of self._conn
+        # through self._lock (see the class docstring) -- sqlite3's own
+        # serialized threading mode protects the connection handle from
+        # corruption, but does not by itself make a multi-statement
+        # execute+commit+fetch sequence atomic across threads, which is
+        # what this class's own lock adds.
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -207,7 +236,8 @@ class Store:
 
     def close(self) -> None:
         """Close the underlying SQLite connection."""
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
 
     # -- writes ---------------------------------------------------------
 
@@ -231,36 +261,37 @@ class Store:
         rescanning a device that was attached the whole time) keeps its
         ``state`` and ``last_probe`` untouched -- see the module docstring.
         """
-        now = self._now()
-        existing = self.get(uid)
-        if existing is None:
-            self._conn.execute(
-                """
-                INSERT INTO device (
-                    uid, short_uid, port, vid_pid, state,
-                    flash_count, first_seen, last_seen, last_probe
-                ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, 0.0)
-                """,
-                (uid, short_uid(uid), port, vid_pid, STATE_ATTACHED_UNPROBED, now, now),
-            )
-        elif existing.state == STATE_DISCONNECTED:
-            self._conn.execute(
-                """
-                UPDATE device
-                SET port = ?, vid_pid = ?, state = ?, last_seen = ?, last_probe = 0.0
-                WHERE uid = ?
-                """,
-                (port, vid_pid, STATE_ATTACHED_UNPROBED, now, uid),
-            )
-        else:
-            self._conn.execute(
-                "UPDATE device SET port = ?, vid_pid = ?, last_seen = ? WHERE uid = ?",
-                (port, vid_pid, now, uid),
-            )
-        self._conn.commit()
-        record = self.get(uid)
-        assert record is not None  # just written
-        return record
+        with self._lock:
+            now = self._now()
+            existing = self.get(uid)
+            if existing is None:
+                self._conn.execute(
+                    """
+                    INSERT INTO device (
+                        uid, short_uid, port, vid_pid, state,
+                        flash_count, first_seen, last_seen, last_probe
+                    ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, 0.0)
+                    """,
+                    (uid, short_uid(uid), port, vid_pid, STATE_ATTACHED_UNPROBED, now, now),
+                )
+            elif existing.state == STATE_DISCONNECTED:
+                self._conn.execute(
+                    """
+                    UPDATE device
+                    SET port = ?, vid_pid = ?, state = ?, last_seen = ?, last_probe = 0.0
+                    WHERE uid = ?
+                    """,
+                    (port, vid_pid, STATE_ATTACHED_UNPROBED, now, uid),
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE device SET port = ?, vid_pid = ?, last_seen = ? WHERE uid = ?",
+                    (port, vid_pid, now, uid),
+                )
+            self._conn.commit()
+            record = self.get(uid)
+            assert record is not None  # just written
+            return record
 
     def apply_probe_result(self, uid: str, result: ProbeResult | None) -> DeviceRecord:
         """Apply the outcome of an identity probe to ``uid``'s record.
@@ -283,43 +314,44 @@ class Store:
         Raises :class:`KeyError` if ``uid`` has no existing record -- the
         pipeline always calls :meth:`upsert_attached` before probing.
         """
-        if self.get(uid) is None:
-            raise KeyError(f"store.apply_probe_result: no record for uid {uid!r}")
-        now = self._now()
-        if result is not None:
-            self._conn.execute(
-                """
-                UPDATE device
-                SET role = ?, common_name = ?, device_name = ?, serial_payload = ?,
-                    raw_announcement = ?, state = ?, error_note = NULL,
-                    last_probe = ?, last_seen = ?
-                WHERE uid = ?
-                """,
-                (
-                    result.role,
-                    result.common_name,
-                    result.device_name,
-                    result.serial,
-                    result.raw,
-                    STATE_CONNECTED,
-                    now,
-                    now,
-                    uid,
-                ),
-            )
-        else:
-            self._conn.execute(
-                """
-                UPDATE device
-                SET state = ?, error_note = ?, last_probe = ?, last_seen = ?
-                WHERE uid = ?
-                """,
-                (STATE_CONNECTED_NO_FIRMWARE, _ERROR_NOTE_NO_ANNOUNCEMENT, now, now, uid),
-            )
-        self._conn.commit()
-        record = self.get(uid)
-        assert record is not None
-        return record
+        with self._lock:
+            if self.get(uid) is None:
+                raise KeyError(f"store.apply_probe_result: no record for uid {uid!r}")
+            now = self._now()
+            if result is not None:
+                self._conn.execute(
+                    """
+                    UPDATE device
+                    SET role = ?, common_name = ?, device_name = ?, serial_payload = ?,
+                        raw_announcement = ?, state = ?, error_note = NULL,
+                        last_probe = ?, last_seen = ?
+                    WHERE uid = ?
+                    """,
+                    (
+                        result.role,
+                        result.common_name,
+                        result.device_name,
+                        result.serial,
+                        result.raw,
+                        STATE_CONNECTED,
+                        now,
+                        now,
+                        uid,
+                    ),
+                )
+            else:
+                self._conn.execute(
+                    """
+                    UPDATE device
+                    SET state = ?, error_note = ?, last_probe = ?, last_seen = ?
+                    WHERE uid = ?
+                    """,
+                    (STATE_CONNECTED_NO_FIRMWARE, _ERROR_NOTE_NO_ANNOUNCEMENT, now, now, uid),
+                )
+            self._conn.commit()
+            record = self.get(uid)
+            assert record is not None
+            return record
 
     def mark_disconnected(self, uid: str) -> DeviceRecord:
         """Mark ``uid`` as ``disconnected`` and update ``last_seen``.
@@ -331,17 +363,18 @@ class Store:
 
         Raises :class:`KeyError` if ``uid`` has no existing record.
         """
-        if self.get(uid) is None:
-            raise KeyError(f"store.mark_disconnected: no record for uid {uid!r}")
-        now = self._now()
-        self._conn.execute(
-            "UPDATE device SET state = ?, last_seen = ? WHERE uid = ?",
-            (STATE_DISCONNECTED, now, uid),
-        )
-        self._conn.commit()
-        record = self.get(uid)
-        assert record is not None
-        return record
+        with self._lock:
+            if self.get(uid) is None:
+                raise KeyError(f"store.mark_disconnected: no record for uid {uid!r}")
+            now = self._now()
+            self._conn.execute(
+                "UPDATE device SET state = ?, last_seen = ? WHERE uid = ?",
+                (STATE_DISCONNECTED, now, uid),
+            )
+            self._conn.commit()
+            record = self.get(uid)
+            assert record is not None
+            return record
 
     def increment_flash_count(self, uid: str) -> DeviceRecord:
         """Bump ``flash_count`` by one -- called by ticket 007's flash op
@@ -349,15 +382,16 @@ class Store:
 
         Raises :class:`KeyError` if ``uid`` has no existing record.
         """
-        if self.get(uid) is None:
-            raise KeyError(f"store.increment_flash_count: no record for uid {uid!r}")
-        self._conn.execute(
-            "UPDATE device SET flash_count = flash_count + 1 WHERE uid = ?", (uid,)
-        )
-        self._conn.commit()
-        record = self.get(uid)
-        assert record is not None
-        return record
+        with self._lock:
+            if self.get(uid) is None:
+                raise KeyError(f"store.increment_flash_count: no record for uid {uid!r}")
+            self._conn.execute(
+                "UPDATE device SET flash_count = flash_count + 1 WHERE uid = ?", (uid,)
+            )
+            self._conn.commit()
+            record = self.get(uid)
+            assert record is not None
+            return record
 
     # -- reads ------------------------------------------------------------
 
@@ -375,17 +409,19 @@ class Store:
 
         Raises :class:`KeyError` if ``uid`` has no existing record.
         """
-        record = self.get(uid)
-        if record is None:
-            raise KeyError(f"store.needs_probe: no record for uid {uid!r}")
-        return record.last_probe == 0.0
+        with self._lock:
+            record = self.get(uid)
+            if record is None:
+                raise KeyError(f"store.needs_probe: no record for uid {uid!r}")
+            return record.last_probe == 0.0
 
     def get(self, uid: str) -> DeviceRecord | None:
         """Exact lookup by ``uid``. ``None`` if no such device."""
-        row = self._conn.execute(
-            "SELECT * FROM device WHERE uid = ?", (uid,)
-        ).fetchone()
-        return _row_to_record(row) if row is not None else None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM device WHERE uid = ?", (uid,)
+            ).fetchone()
+            return _row_to_record(row) if row is not None else None
 
     def find(self, token: str) -> DeviceRecord | None:
         """Resolve a user-supplied ``token`` to a device record.
@@ -408,18 +444,19 @@ class Store:
 
         ``None`` if none of the three match.
         """
-        row = self._conn.execute(
-            "SELECT * FROM device WHERE uid = ?", (token,)
-        ).fetchone()
-        if row is None:
+        with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM device WHERE short_uid = ?", (token,)
+                "SELECT * FROM device WHERE uid = ?", (token,)
             ).fetchone()
-        if row is None:
-            row = self._conn.execute(
-                "SELECT * FROM device WHERE device_name = ? COLLATE NOCASE", (token,)
-            ).fetchone()
-        return _row_to_record(row) if row is not None else None
+            if row is None:
+                row = self._conn.execute(
+                    "SELECT * FROM device WHERE short_uid = ?", (token,)
+                ).fetchone()
+            if row is None:
+                row = self._conn.execute(
+                    "SELECT * FROM device WHERE device_name = ? COLLATE NOCASE", (token,)
+                ).fetchone()
+            return _row_to_record(row) if row is not None else None
 
     def list_devices(self) -> list[DeviceRecord]:
         """Every record, including ``disconnected`` ones (UC-004's "gone,
@@ -428,5 +465,6 @@ class Store:
         Iteration is not required to be performant beyond "all records fit
         in memory," per spec §3.4.
         """
-        rows = self._conn.execute("SELECT * FROM device").fetchall()
-        return [_row_to_record(row) for row in rows]
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM device").fetchall()
+            return [_row_to_record(row) for row in rows]
