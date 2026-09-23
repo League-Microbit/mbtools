@@ -1,7 +1,7 @@
 ---
 id: '001'
 title: 'registry.client: shared local-socket client library'
-status: in-progress
+status: done
 use-cases:
 - UC-004
 - UC-006
