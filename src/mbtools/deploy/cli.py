@@ -2,20 +2,50 @@
 
 Per sprint.md's Architecture (module "deploy.cli"), this is the one place
 that composes ``registry.client`` (resolve/lock/unlock/mark_flashed),
-``deploy.flash`` (run pyOCD), and ``deploy.release`` (get a hex file from
-``--repo``) into the ``deploy`` subcommand -- plus the relay guard
-(``--force-relay``) and the wait-for-reprobe report. No business logic
-lives here that any of those modules could instead own; this module's own
-job is argument handling, sequencing, and turning each result into a
-message and a stable exit code.
+``deploy.flash`` (run pyOCD), ``deploy.release`` (get a hex file from
+``--repo``), and ``registry.render`` (``list``) into the ``deploy``/
+``list``/``build``/``debug`` subcommands -- plus the relay guard
+(``--force-relay``) and the build/debug passthroughs, each a thin wrapper
+with no responsibility of its own beyond argument handling. No business
+logic lives here that any of those modules could instead own; this
+module's own job is argument handling, sequencing, and turning each
+result into a message and a stable exit code.
 
-Ticket 007 builds only ``deploy`` here, replacing the sprint-001 stub
+Ticket 007 built ``deploy`` here, replacing the sprint-001 stub
 (``mbtools.deploy``'s former ``stub_main`` call -- ``pyproject.toml``'s
 ``[project.scripts]`` now points ``mbdeploy`` directly at :func:`main`
-here, matching ``mbregistry``'s own convention). ``list``/``build``/
-``debug`` are ticket 008's job, added to :func:`build_parser` alongside
+here, matching ``mbregistry``'s own convention). Ticket 008 adds
+``list``/``build``/``debug`` to this same :func:`build_parser` alongside
 ``deploy`` rather than in a second parser -- there is only ever one
 ``mbdeploy`` argument parser.
+
+**``list``** (SUC-003) is a plain client of the api socket, exactly like
+``mbregistry list``: :func:`cmd_list` calls ``registry.client.list()``
+and ``registry.render``'s same ``render_table``/``render_json``
+functions ``mbregistry list`` uses -- no ``mbdeploy``-specific rendering
+code exists, and a registry-unavailable connection reports the same
+``EXIT_NO_DAEMON`` error.
+
+**``build``** (SUC-006) never touches the registry at all -- it shells
+out to the firmware build script, ported near-verbatim from today's
+``mbdeploy``'s own ``builder.py`` (default ``<python> build.py`` in CWD,
+``--build-cmd`` overrides the whole command, ``--clean``/``--verbose``/
+``-j`` appended). Per sprint.md's component diagram, this stays inline
+here rather than becoming a fifth module -- the diagram's four edges out
+of ``deploy.cli`` don't include a "builder", since build has no registry
+interaction to abstract.
+
+**``debug``** (SUC-006) resolves and locks the named device
+(``kind=debug``) via ``registry.client``, then runs the given pyOCD
+invocation as a *bare passthrough* -- sprint.md's own Open Questions
+entry ("`mbdeploy debug`'s scope beyond a bare pyOCD passthrough is
+undefined ... this sprint ships the minimal passthrough needed to hold
+the lock correctly; richer debug UX is deferred"): the argv after
+``--`` is handed to ``pyocd`` completely unmodified (no injected
+``--uid``, no interpretation), unlike ``deploy.flash``'s own
+failure-signature-matching invocations. The lock is released when the
+pyOCD subprocess exits -- success, failure, or a Ctrl-C (SIGINT) that
+interrupts the session -- never leaked.
 
 **Local flashing, not the registry's own minimal ``flash`` op**
 (sprint.md's Design Rationale): this module runs
@@ -56,8 +86,11 @@ daemon's own internals.
 from __future__ import annotations
 
 import argparse
+import json
+import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
 from mbtools.common import (
@@ -80,17 +113,46 @@ from mbtools.registry.client import (
 )
 from mbtools.registry.client import SOCKET_ENV_VAR as _SOCKET_ENV_VAR
 from mbtools.registry.client import resolve_socket_path
+from mbtools.registry.render import render_json, render_table
 
-__all__ = ["main", "build_parser", "cmd_deploy"]
+__all__ = [
+    "main",
+    "build_parser",
+    "cmd_deploy",
+    "cmd_list",
+    "cmd_build",
+    "cmd_debug",
+]
 
 #: Lock kind the deploy flow takes -- a plain wire-protocol string, not a
 #: ``registry.locks.KIND_FLASH`` import (module docstring, "Literal ...
 #: not imports").
 _LOCK_KIND_FLASH = "flash"
 
+#: Lock kind the debug flow takes -- same "plain wire-protocol string,
+#: not an import" reasoning as ``_LOCK_KIND_FLASH`` above.
+_LOCK_KIND_DEBUG = "debug"
+
 #: ``registry.store``'s own "a real announcement was heard" state string
 #: -- same "plain string, not an import" reasoning as ``_LOCK_KIND_FLASH``.
 _STATE_CONNECTED = "connected"
+
+# Invoke pyocd through the running interpreter rather than as a bare PATH
+# lookup -- same reasoning, and the same literal invocation shape, as
+# deploy.flash._PYOCD/registry.flash._PYOCD (mbtools is typically
+# installed via an isolated venv, so pyocd -- a declared dependency -- is
+# importable here but its console script may not be on PATH). Duplicated
+# locally rather than imported since it is each module's own private
+# constant, not a shared export.
+_PYOCD = [sys.executable, "-m", "pyocd"]
+
+#: Conventional Unix "killed by SIGINT" exit code (128 + signal number 2)
+#: -- ``debug``'s own exit code when the pyOCD session is interrupted by
+#: Ctrl-C, distinct from every ``EXIT_*`` constant in ``mbtools.common``
+#: (those are this project's own stable protocol-level codes; this one
+#: describes how the child process ended, matching what a shell itself
+#: reports for a SIGINT-killed foreground command).
+_EXIT_SIGINT = 130
 
 #: How long ``deploy`` waits for the post-unlock re-probe to land a fresh
 #: announcement before giving up and reporting plainly that none arrived
@@ -322,6 +384,192 @@ def cmd_deploy(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# list -- a client of the api socket, identical output to `mbregistry list`
+# ---------------------------------------------------------------------------
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    """``mbdeploy list [--json]`` -- connect to the api socket, ask for
+    every device, render it (SUC-003). The exact same
+    ``registry.client.list()`` fetch and ``registry.render.render_table``/
+    ``render_json`` functions ``mbregistry list`` uses -- no
+    ``mbdeploy``-specific rendering code exists, so the two commands'
+    output is identical for the same device set by construction, not by
+    coincidence. A registry-unavailable connection reports the same
+    ``EXIT_NO_DAEMON`` error ``mbregistry list`` already gives, not a
+    stack trace.
+    """
+    socket_path = resolve_socket_path(
+        args.socket, _SOCKET_ENV_VAR, DEFAULT_SOCKET_PATH
+    )
+    try:
+        with RegistryClient(socket_path) as client:
+            devices = client.list()
+    except RegistryUnavailable as exc:
+        print(f"mbdeploy: {exc}", file=sys.stderr)
+        print(
+            "mbdeploy: is the registry daemon running? start it with "
+            "'mbregistry run'",
+            file=sys.stderr,
+        )
+        return EXIT_NO_DAEMON
+    except RegistryClientError as exc:
+        print(f"mbdeploy: {exc.message}", file=sys.stderr)
+        return exc.exit_code
+
+    if args.json:
+        print(json.dumps(render_json(devices), indent=2))
+        return EXIT_OK
+
+    print(render_table(devices))
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# build -- shells out to the firmware build script, no registry at all
+# ---------------------------------------------------------------------------
+
+
+def cmd_build(args: argparse.Namespace) -> int:
+    """``mbdeploy build [--clean] [--verbose] [--build-cmd CMD] [-j N]``
+    -- shells out to the firmware build script and returns its own exit
+    code verbatim (SUC-006). No registry interaction at all: this command
+    never touches a board.
+
+    Ported near-verbatim from today's ``mbdeploy``'s own ``builder.run``
+    (``src/mbdeploy/builder.py``): the default command is ``<python>
+    build.py`` in the current working directory unless ``--build-cmd``
+    overrides the entire command (split on whitespace); ``--clean``/
+    ``--verbose``/``-j N`` are appended either way. Missing ``build.py``
+    with no ``--build-cmd`` override is a clear, immediate error rather
+    than a subprocess-not-found stack trace.
+    """
+    if args.build_cmd:
+        cmd = args.build_cmd.split()
+    else:
+        if not Path("build.py").exists():
+            print(
+                "mbdeploy: build.py not found in CWD. Use --build-cmd to "
+                "override.",
+                file=sys.stderr,
+            )
+            return EXIT_ERROR
+        cmd = [sys.executable, "build.py"]
+
+    if args.clean:
+        cmd.append("--clean")
+    if args.verbose:
+        cmd.append("--verbose")
+    if args.jobs is not None:
+        cmd += ["-j", str(args.jobs)]
+
+    result = subprocess.run(cmd)
+    return result.returncode
+
+
+# ---------------------------------------------------------------------------
+# debug -- resolve, lock (kind=debug), bare pyocd passthrough, unlock
+# ---------------------------------------------------------------------------
+
+
+def _run_pyocd(cmd: list[str]) -> int:
+    """Run a pyocd invocation with inherited stdio, and return its exit
+    code.
+
+    Unlike ``deploy.flash``'s streamed/captured invocations (which parse
+    pyocd's output for retry/mass-erase decisions), a ``debug`` session
+    can be genuinely interactive (``pyocd commander``'s REPL reads
+    stdin; ``pyocd gdbserver`` prints progress a user watches live) --
+    this is a plain, uncaptured ``subprocess.run()`` so the pyOCD
+    subprocess gets the real terminal directly, not a pipe. Kept as its
+    own module-level function (rather than inlined into :func:`_run_debug`)
+    so a test can inject a fake in its place without touching a real
+    ``pyocd`` binary or probe.
+    """
+    return subprocess.run(cmd).returncode
+
+
+def _run_debug(client: RegistryClient, args: argparse.Namespace) -> int:
+    """``debug``'s actual body, run against an already-connected
+    ``client`` -- see :func:`cmd_debug` for the socket-path resolution
+    and :class:`RegistryUnavailable` handling one level up.
+
+    Resolve, lock (``kind=debug``, fail fast per SUC-005 -- no retry, no
+    blocking wait), run the given pyOCD invocation as a bare passthrough
+    (module docstring), release the lock when it exits -- success,
+    failure, or a Ctrl-C (SIGINT) that interrupts the session. The
+    ``finally`` block is what guarantees the lock is never leaked on an
+    interrupted debug session: :func:`_run_pyocd` propagating
+    ``KeyboardInterrupt`` still runs it before that exception (caught
+    just inside it) turns into a plain, reported exit code.
+    """
+    try:
+        device = client.find(args.target)
+    except RegistryClientError as exc:
+        print(f"mbdeploy: {exc.message}", file=sys.stderr)
+        return exc.exit_code
+
+    uid = device["uid"]
+    name = device.get("device_name") or uid
+
+    try:
+        client.lock(uid, _LOCK_KIND_DEBUG)
+    except DeviceLockedError as exc:
+        holder = exc.holder or {}
+        print(
+            f"mbdeploy: {name} is locked for {holder.get('kind')} by pid "
+            f"{holder.get('pid')}",
+            file=sys.stderr,
+        )
+        return exc.exit_code
+    except RegistryClientError as exc:
+        print(f"mbdeploy: {exc.message}", file=sys.stderr)
+        return exc.exit_code
+
+    cmd = [*_PYOCD, *args.pyocd_args]
+    try:
+        try:
+            return _run_pyocd(cmd)
+        except KeyboardInterrupt:
+            print(
+                f"mbdeploy: debug session on {name} interrupted",
+                file=sys.stderr,
+            )
+            return _EXIT_SIGINT
+    finally:
+        try:
+            client.unlock(uid)
+        except RegistryClientError as exc:
+            print(
+                f"mbdeploy: warning: unlock failed: {exc.message}",
+                file=sys.stderr,
+            )
+
+
+def cmd_debug(args: argparse.Namespace) -> int:
+    """``mbdeploy debug <name> -- <pyocd args>`` -- resolve the socket
+    path, open one :class:`RegistryClient` session for the whole flow
+    (same "Session model" reasoning as :func:`cmd_deploy`: the debug lock
+    taken on this connection must be released, or reported, on this same
+    connection), and hand off to :func:`_run_debug`.
+    """
+    socket_path = resolve_socket_path(
+        args.socket, _SOCKET_ENV_VAR, DEFAULT_SOCKET_PATH
+    )
+    try:
+        with RegistryClient(socket_path) as client:
+            return _run_debug(client, args)
+    except RegistryUnavailable as exc:
+        print(f"mbdeploy: {exc}", file=sys.stderr)
+        print(
+            "mbdeploy: is the registry daemon running? start it with "
+            "'mbregistry run'",
+            file=sys.stderr,
+        )
+        return EXIT_NO_DAEMON
+
+
+# ---------------------------------------------------------------------------
 # argument parsing / entry point
 # ---------------------------------------------------------------------------
 
@@ -370,6 +618,61 @@ def build_parser() -> argparse.ArgumentParser:
         f"{DEFAULT_REPROBE_TIMEOUT_S})",
     )
     deploy_p.set_defaults(func=cmd_deploy)
+
+    list_p = sub.add_parser("list", help="list devices known to the registry")
+    list_p.add_argument(
+        "--json", action="store_true", help="emit machine-readable JSON"
+    )
+    list_p.add_argument(
+        "--socket",
+        help=f"api socket path (default {DEFAULT_SOCKET_PATH}, or "
+        f"${_SOCKET_ENV_VAR})",
+    )
+    list_p.set_defaults(func=cmd_list)
+
+    build_p = sub.add_parser(
+        "build", help="build firmware locally (no registry interaction)"
+    )
+    build_p.add_argument(
+        "--clean", action="store_true", help="clean before building"
+    )
+    build_p.add_argument(
+        "--verbose", action="store_true", help="show build output"
+    )
+    build_p.add_argument(
+        "-j", dest="jobs", type=int, metavar="N", help="parallel jobs"
+    )
+    build_p.add_argument(
+        "--build-cmd",
+        dest="build_cmd",
+        metavar="CMD",
+        help="override the entire build command (default: '<python> "
+        "build.py' in CWD)",
+    )
+    build_p.set_defaults(func=cmd_build)
+
+    debug_p = sub.add_parser(
+        "debug",
+        help="run a pyocd invocation directly against a named device",
+        description="mbdeploy debug <name> [--socket ...] -- <pyocd args>: "
+        "give any flags of mbdeploy's own before <name>, not after -- "
+        "everything from <name> onward (including a literal '--') is a "
+        "bare pyocd passthrough.",
+    )
+    debug_p.add_argument("target", help="device name, uid, or short-uid token")
+    debug_p.add_argument(
+        "--socket",
+        help=f"api socket path (default {DEFAULT_SOCKET_PATH}, or "
+        f"${_SOCKET_ENV_VAR}) -- must be given before <name>",
+    )
+    debug_p.add_argument(
+        "pyocd_args",
+        nargs=argparse.REMAINDER,
+        metavar="-- pyocd-args",
+        help="the pyocd subcommand and arguments to run, verbatim "
+        "(e.g. -- commander --uid <uid>)",
+    )
+    debug_p.set_defaults(func=cmd_debug)
 
     return parser
 
