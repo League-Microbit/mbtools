@@ -1,9 +1,12 @@
 ---
 id: '003'
 title: 'USB watch: PortWatcher interface and polling implementation'
-status: open
-use-cases: [SUC-001, SUC-002]
-depends-on: ['001']
+status: in-progress
+use-cases:
+- SUC-001
+- SUC-002
+depends-on:
+- '001'
 github-issue: ''
 issue: mbregistry-device-registry-daemon.md
 completes_issue: false
@@ -46,19 +49,19 @@ without this ticket doing anything macOS-specific.
 
 ## Acceptance Criteria
 
-- [ ] `PortWatcher` is defined as an interface (ABC or `Protocol`) with
+- [x] `PortWatcher` is defined as an interface (ABC or `Protocol`) with
       at least `scan() -> dict[str, PortInfo]`, where `PortInfo` carries
       at minimum `port` (device path), `vid`, `pid`.
-- [ ] `PollingPortWatcher.scan()` returns only devices matching VID:PID
+- [x] `PollingPortWatcher.scan()` returns only devices matching VID:PID
       `0x0D28:0x0204`, keyed by the DAPLink UID (pyserial's
       `serial_number`), mirroring `port_serial_map`'s filtering.
-- [ ] A `comports()` result with no matching device returns an empty
+- [x] A `comports()` result with no matching device returns an empty
       dict, not `None` and not a raised exception.
-- [ ] `mbtools.testing.fakes.FakeUSBSource` (from ticket 001) satisfies
+- [x] `mbtools.testing.fakes.FakeUSBSource` (from ticket 001) satisfies
       the same `PortWatcher` interface, confirmed by a test that runs
       the same behavioral test cases against both `PollingPortWatcher`
       (with `comports()` monkeypatched) and `FakeUSBSource`.
-- [ ] No test in this ticket touches real USB hardware — `comports()`
+- [x] No test in this ticket touches real USB hardware — `comports()`
       itself is monkeypatched/injected in every `PollingPortWatcher`
       test.
 
