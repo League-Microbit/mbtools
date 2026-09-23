@@ -46,7 +46,6 @@ import argparse
 import json
 import os
 import signal
-import socket
 import sys
 import threading
 from pathlib import Path
@@ -54,6 +53,13 @@ from typing import Any
 
 from mbtools.common import EXIT_ERROR, EXIT_NO_DAEMON, EXIT_OK
 from mbtools.registry.api import DEFAULT_SOCKET_PATH, RegistryAPIServer
+from mbtools.registry.client import (
+    RegistryClient,
+    RegistryClientError,
+    RegistryUnavailable,
+)
+from mbtools.registry.client import SOCKET_ENV_VAR as _SOCKET_ENV_VAR
+from mbtools.registry.client import resolve_socket_path
 from mbtools.registry.daemon import DEFAULT_INTERVAL_S, Daemon
 from mbtools.registry.flash import FlashOp
 from mbtools.registry.store import (
@@ -83,20 +89,24 @@ __all__ = [
 #: tests" scoping).
 DEFAULT_UNIT_PATH = Path("/etc/systemd/system/mbregistry.service")
 
-_SOCKET_ENV_VAR = "MBREGISTRY_SOCKET"
 _DB_ENV_VAR = "MBREGISTRY_DB"
 
 
 # ---------------------------------------------------------------------------
 # path resolution -- flag > env var > module default (ticket 009's own
-# "socket/DB paths overridable by flags or env" acceptance criterion)
+# "socket/DB paths overridable by flags or env" acceptance criterion).
+# Socket-path precedence itself now lives in ``registry.client`` (ticket
+# 001's extraction, imported above as ``resolve_socket_path``) since that
+# module is also what sprint 002's ``mbdeploy``/``mbserial`` will use to
+# resolve it identically; ``_resolve_path`` stays here only for the db
+# path, which is this daemon's own concern, not the client library's.
 # ---------------------------------------------------------------------------
 
 
 def _resolve_path(flag_value: str | None, env_var: str, default: Path) -> Path:
     """``flag_value`` wins if given; else ``$env_var`` if set; else
     ``default``. Shared by every ``mbregistry`` subcommand that takes a
-    socket or db path, so the precedence can't drift between them.
+    db path.
     """
     if flag_value:
         return Path(flag_value)
@@ -109,29 +119,6 @@ def _resolve_path(flag_value: str | None, env_var: str, default: Path) -> Path:
 # ---------------------------------------------------------------------------
 # list -- a client of the api socket, per spec section 3.5
 # ---------------------------------------------------------------------------
-
-
-def _connect(socket_path: Path) -> socket.socket:
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.connect(str(socket_path))
-    return sock
-
-
-def _request(sock: socket.socket, payload: dict[str, Any]) -> dict[str, Any]:
-    """Send one newline-delimited-JSON request and read its one response
-    line, per ``docs/design/registry-api.md``'s framing. Mirrors
-    ``tests/registry/api/test_api.py``'s own ``_Client`` shape, minus
-    the streaming ``flash`` op this ticket's CLI never calls.
-    """
-    wfile = sock.makefile("w", encoding="utf-8", newline="\n")
-    rfile = sock.makefile("r", encoding="utf-8", newline="\n")
-    wfile.write(json.dumps(payload))
-    wfile.write("\n")
-    wfile.flush()
-    line = rfile.readline()
-    if not line:
-        raise ConnectionError("connection closed by mbregistry daemon")
-    return json.loads(line)
 
 
 def _state_cell(device: dict[str, Any]) -> str:
@@ -193,39 +180,28 @@ def _table(rows: list[list[str]], headers: list[str]) -> str:
 def cmd_list(args: argparse.Namespace) -> int:
     """``mbregistry list [--json]`` -- connect to the api socket, ask for
     every device, render it. Never touches ``store``/``locks`` directly
-    (see module docstring).
+    (see module docstring). Ticket 001's extraction: the socket
+    connect/framing/JSON that used to live inline here now lives in
+    :mod:`mbtools.registry.client`, so this is that module's first
+    caller rather than a parallel implementation of the same protocol.
     """
-    socket_path = _resolve_path(args.socket, _SOCKET_ENV_VAR, DEFAULT_SOCKET_PATH)
+    socket_path = resolve_socket_path(args.socket, _SOCKET_ENV_VAR, DEFAULT_SOCKET_PATH)
 
     try:
-        sock = _connect(socket_path)
-    except OSError as exc:
-        print(
-            f"mbregistry: registry unavailable at {socket_path}: {exc}",
-            file=sys.stderr,
-        )
+        with RegistryClient(socket_path) as client:
+            devices = client.list()
+    except RegistryUnavailable as exc:
+        print(f"mbregistry: {exc}", file=sys.stderr)
         print(
             "mbregistry: is the daemon running? start it with 'mbregistry run'",
             file=sys.stderr,
         )
         return EXIT_NO_DAEMON
+    except RegistryClientError as exc:
+        print(f"mbregistry: {exc.message}", file=sys.stderr)
+        return exc.exit_code
 
-    try:
-        try:
-            resp = _request(sock, {"op": "list"})
-        except (OSError, ConnectionError, json.JSONDecodeError) as exc:
-            print(f"mbregistry: registry unavailable: {exc}", file=sys.stderr)
-            return EXIT_NO_DAEMON
-    finally:
-        sock.close()
-
-    if not resp.get("ok"):
-        print(f"mbregistry: {resp.get('error', 'unknown error')}", file=sys.stderr)
-        return EXIT_ERROR
-
-    devices = sorted(
-        resp.get("devices", []), key=lambda d: d.get("short_uid") or d["uid"]
-    )
+    devices = sorted(devices, key=lambda d: d.get("short_uid") or d["uid"])
 
     if args.json:
         print(json.dumps({"devices": devices}, indent=2))
@@ -322,7 +298,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     (see :func:`render_systemd_unit`), and also what a developer runs
     directly on macOS (module docstring, "macOS foreground dev use").
     """
-    socket_path = _resolve_path(args.socket, _SOCKET_ENV_VAR, DEFAULT_SOCKET_PATH)
+    socket_path = resolve_socket_path(args.socket, _SOCKET_ENV_VAR, DEFAULT_SOCKET_PATH)
     db_path = _resolve_path(args.db, _DB_ENV_VAR, DEFAULT_DB_PATH)
 
     store = Store(db_path)

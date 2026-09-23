@@ -1,8 +1,11 @@
 ---
 id: '001'
 title: 'registry.client: shared local-socket client library'
-status: open
-use-cases: [UC-004, UC-006, UC-007]
+status: in-progress
+use-cases:
+- UC-004
+- UC-006
+- UC-007
 depends-on: []
 github-issue: ''
 issue:
@@ -48,26 +51,26 @@ This is the sprint's foundation ticket — every other client-tool ticket
 
 ## Acceptance Criteria
 
-- [ ] `mbtools.registry.client` exists with `list()`, `find(uid)`,
+- [x] `mbtools.registry.client` exists with `list()`, `find(uid)`,
       `lock(uid, kind)`, `unlock(uid)` methods, each returning a plain
       Python value (list of dicts / dict) on success and raising a typed
       exception on failure — no raw socket or JSON leaks past this
       module's boundary.
-- [ ] Protocol error codes (`not_found`, `locked`, `invalid_request`) map
+- [x] Protocol error codes (`not_found`, `locked`, `invalid_request`) map
       to distinct exception types (or one exception type carrying a
       `code` attribute) that a CLI can catch and translate to the
       matching `EXIT_*` constant without re-parsing strings.
-- [ ] A `locked` failure's `holder` (`kind`, `pid`) is preserved on the
+- [x] A `locked` failure's `holder` (`kind`, `pid`) is preserved on the
       raised exception, not discarded.
-- [ ] Socket-not-present / connection-refused raises `RegistryUnavailable`,
+- [x] Socket-not-present / connection-refused raises `RegistryUnavailable`,
       distinct from every protocol-level error.
-- [ ] `mbtools.registry.cli`'s `list`/`run` commands are refactored to
+- [x] `mbtools.registry.cli`'s `list`/`run` commands are refactored to
       call this module instead of their own inline `_connect`/`_request`
       code; `mbregistry list`'s behavior and output are unchanged (same
       table, same `--json`, same exit codes) — verified by re-running
       sprint 001's existing CLI tests unmodified against the refactored
       code.
-- [ ] Socket path resolution (default, `--socket` flag, env var
+- [x] Socket path resolution (default, `--socket` flag, env var
       override) matches `registry.cli`'s existing precedent exactly, so
       no caller's invocation changes.
 
