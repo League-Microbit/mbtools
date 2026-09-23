@@ -2,7 +2,7 @@
 id: 009
 title: 'mbserial: local connect (resolve, serial-lock, open without reboot, interact,
   --reset)'
-status: in-progress
+status: done
 use-cases:
 - SUC-004
 - SUC-005
