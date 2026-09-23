@@ -1,7 +1,7 @@
 ---
 id: '006'
 title: 'Daemon core: attach/detach to probe to store pipeline, re-probe rules'
-status: in-progress
+status: done
 use-cases:
 - SUC-001
 - SUC-002
