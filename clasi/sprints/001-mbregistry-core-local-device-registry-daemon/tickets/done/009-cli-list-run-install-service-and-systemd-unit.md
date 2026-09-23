@@ -1,7 +1,7 @@
 ---
 id: 009
 title: CLI (list/run/install-service) and systemd unit
-status: in-progress
+status: done
 use-cases:
 - SUC-004
 - SUC-007
