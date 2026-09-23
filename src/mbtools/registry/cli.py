@@ -62,13 +62,8 @@ from mbtools.registry.client import SOCKET_ENV_VAR as _SOCKET_ENV_VAR
 from mbtools.registry.client import resolve_socket_path
 from mbtools.registry.daemon import DEFAULT_INTERVAL_S, Daemon
 from mbtools.registry.flash import FlashOp
-from mbtools.registry.store import (
-    DEFAULT_DB_PATH,
-    STATE_ATTACHED_UNPROBED,
-    STATE_CONNECTED_NO_FIRMWARE,
-    STATE_DISCONNECTED,
-    Store,
-)
+from mbtools.registry.render import render_json, render_table
+from mbtools.registry.store import DEFAULT_DB_PATH, Store
 from mbtools.registry.usbwatch import PollingPortWatcher, PortWatcher
 
 __all__ = [
@@ -121,62 +116,6 @@ def _resolve_path(flag_value: str | None, env_var: str, default: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def _state_cell(device: dict[str, Any]) -> str:
-    """UC-004's STATE column: ``free`` / ``locked by <kind> pid <n>`` /
-    ``no-firmware`` / ``gone``. Lock status (folded into the ``list``
-    response by ``api._device_dict``) takes precedence over
-    ``connected_no_firmware`` -- a device can be locked (e.g. mid-flash)
-    while its last-known state is still "no firmware", and the lock is
-    the more useful thing to show.
-    """
-    if device["state"] == STATE_DISCONNECTED:
-        return "gone"
-    lock_kind = device.get("lock_kind")
-    if lock_kind:
-        return f"locked by {lock_kind} pid {device.get('lock_pid')}"
-    if device["state"] == STATE_CONNECTED_NO_FIRMWARE:
-        return "no-firmware"
-    return "free"
-
-
-def _firmware_cell(device: dict[str, Any]) -> str:
-    """The FIRMWARE/version column -- ``mbrelay``'s ``_firmware_cell``
-    precedent (``server/src/mbrelay/cli.py`` around line 406) for
-    distinguishing "unknown/never asked" from a real value, adapted to
-    this store's fields: no dedicated firmware-version field exists here
-    (see ``store.DeviceRecord``), so ``role``/``common_name`` from the
-    device's own announcement stand in for it.
-    """
-    if device["state"] == STATE_ATTACHED_UNPROBED:
-        return "(not probed yet)"
-    if device["state"] == STATE_CONNECTED_NO_FIRMWARE:
-        return "no firmware"
-    role = device.get("role")
-    common_name = device.get("common_name")
-    if role and common_name:
-        return f"{role}/{common_name}"
-    return role or common_name or "-"
-
-
-def _table(rows: list[list[str]], headers: list[str]) -> str:
-    """A minimal fixed-width table renderer -- ported from ``mbrelay``'s
-    own ``_table`` (``server/src/mbrelay/cli.py``), the precedent this
-    ticket's Description points at for the STATE/short-uid/FIRMWARE/port
-    rendering convention.
-    """
-    widths = [len(h) for h in headers]
-    for row in rows:
-        for i, cell in enumerate(row):
-            widths[i] = max(widths[i], len(str(cell)))
-    header_line = "  ".join(h.ljust(widths[i]) for i, h in enumerate(headers)).rstrip()
-    out = [header_line, "  ".join("-" * widths[i] for i in range(len(headers)))]
-    for row in rows:
-        out.append(
-            "  ".join(str(c).ljust(widths[i]) for i, c in enumerate(row)).rstrip()
-        )
-    return "\n".join(out)
-
-
 def cmd_list(args: argparse.Namespace) -> int:
     """``mbregistry list [--json]`` -- connect to the api socket, ask for
     every device, render it. Never touches ``store``/``locks`` directly
@@ -184,6 +123,12 @@ def cmd_list(args: argparse.Namespace) -> int:
     connect/framing/JSON that used to live inline here now lives in
     :mod:`mbtools.registry.client`, so this is that module's first
     caller rather than a parallel implementation of the same protocol.
+    Ticket 002's extraction: the table/JSON rendering that used to live
+    inline here (``_table``/``_state_cell``/``_firmware_cell``) now lives
+    in :mod:`mbtools.registry.render`, so this is that module's first
+    caller too -- ``mbdeploy list`` (ticket 008) is its second, sharing
+    the same functions rather than a parallel rendering implementation
+    (spec §4.3, SUC-003).
     """
     socket_path = resolve_socket_path(args.socket, _SOCKET_ENV_VAR, DEFAULT_SOCKET_PATH)
 
@@ -201,32 +146,11 @@ def cmd_list(args: argparse.Namespace) -> int:
         print(f"mbregistry: {exc.message}", file=sys.stderr)
         return exc.exit_code
 
-    devices = sorted(devices, key=lambda d: d.get("short_uid") or d["uid"])
-
     if args.json:
-        print(json.dumps({"devices": devices}, indent=2))
+        print(json.dumps(render_json(devices), indent=2))
         return EXIT_OK
 
-    if not devices:
-        print("no devices known to the registry")
-        return EXIT_OK
-
-    rows = [
-        [
-            _state_cell(d),
-            d.get("device_name") or "-",
-            d.get("short_uid") or d["uid"][-8:],
-            _firmware_cell(d),
-            d.get("port") or "-",
-        ]
-        for d in devices
-    ]
-    print(_table(rows, ["STATE", "NAME", "UID", "FIRMWARE", "PORT"]))
-    for d in devices:
-        note = d.get("error_note")
-        if note:
-            label = d.get("device_name") or d.get("short_uid") or d["uid"]
-            print(f"  {label}: {note}")
+    print(render_table(devices))
     return EXIT_OK
 
 

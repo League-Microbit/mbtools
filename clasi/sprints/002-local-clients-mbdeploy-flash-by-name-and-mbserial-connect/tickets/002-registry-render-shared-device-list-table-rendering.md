@@ -1,8 +1,9 @@
 ---
 id: '002'
 title: 'registry.render: shared device-list table rendering'
-status: open
-use-cases: [UC-004]
+status: in-progress
+use-cases:
+- UC-004
 depends-on: []
 github-issue: ''
 issue: mbdeploy-flash-by-name-via-mbregistry.md
@@ -31,18 +32,18 @@ list`) needs both.
 
 ## Acceptance Criteria
 
-- [ ] `mbtools.registry.render` exposes a function that takes the list of
+- [x] `mbtools.registry.render` exposes a function that takes the list of
       device dicts `registry.client.list()` (ticket 001) returns and
       produces the same STATE/NAME/UID/FIRMWARE/PORT table
       `mbregistry list` produces today, plus a `--json`-equivalent
       structured form.
-- [ ] `_table`/`_state_cell`/`_firmware_cell` are removed from
+- [x] `_table`/`_state_cell`/`_firmware_cell` are removed from
       `registry.cli` (not duplicated) — `registry.cli`'s `cmd_list` calls
       the new module.
-- [ ] `mbregistry list`'s table and `--json` output are byte-for-byte
+- [x] `mbregistry list`'s table and `--json` output are byte-for-byte
       unchanged from sprint 001's behavior — verified by re-running
       sprint 001's existing `cmd_list` tests unmodified.
-- [ ] The extracted function takes plain device dicts as input (not a
+- [x] The extracted function takes plain device dicts as input (not a
       live socket or a `Store` instance), so `mbdeploy list` (ticket 008)
       can call it against `registry.client.list()`'s return value with no
       adapter code in between.
