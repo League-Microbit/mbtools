@@ -1,7 +1,7 @@
 ---
 id: '001'
-title: 'mbtools package scaffold, fakes, console-script stubs'
-status: open
+title: mbtools package scaffold, fakes, console-script stubs
+status: in-progress
 use-cases: []
 depends-on: []
 github-issue: ''
@@ -57,30 +57,30 @@ get right — everything else here is scaffolding.
 
 ## Acceptance Criteria
 
-- [ ] `pyproject.toml` exists at repo root, managed with `uv`, declaring
+- [x] `pyproject.toml` exists at repo root, managed with `uv`, declaring
       `src/mbtools/` as the package root (`src` layout, not flat).
-- [ ] `mbtools/registry/`, `mbtools/common/`, `mbtools/testing/`,
+- [x] `mbtools/registry/`, `mbtools/common/`, `mbtools/testing/`,
       `mbtools/deploy/`, `mbtools/serial/`, `mbtools/relay/` all exist
       as importable subpackages (empty `__init__.py` where there's
       nothing to put yet).
-- [ ] Console scripts `mbregistry`, `mbdeploy`, `mbserial`, `mbrelay`
+- [x] Console scripts `mbregistry`, `mbdeploy`, `mbserial`, `mbrelay`
       are all registered in `pyproject.toml` and resolve after `uv sync`
       / `uv run`; the three stub scripts print a clear "not yet
       implemented" message naming the sprint that will implement them,
       and exit non-zero.
-- [ ] `mbtools.testing.fakes.FakeUSBSource` implements the same shape
+- [x] `mbtools.testing.fakes.FakeUSBSource` implements the same shape
       `PortWatcher.scan()` will consume (a `{uid: PortInfo}`-like
       mapping) and supports scripting at least: an empty scan, a scan
       with one matching device, a scan with one non-matching (wrong
       VID:PID) device, and a scripted sequence across multiple calls
       (to simulate attach-then-detach).
-  - [ ] `mbtools.testing.fakes.FakeSerial` supports scripting: a
+  - [x] `mbtools.testing.fakes.FakeSerial` supports scripting: a
       returned announcement line (either dialect), silence until
       timeout, and raising on `open()` to simulate a busy port.
-- [ ] `pytest` is configured (`pyproject.toml` or `pytest.ini`) and
+- [x] `pytest` is configured (`pyproject.toml` or `pytest.ini`) and
       `uv run pytest` runs (zero tests collected is fine at this
       ticket — the fakes' own tests count).
-- [ ] A minimal `README.md` or `CONTRIBUTING` note (a few lines is
+- [x] A minimal `README.md` or `CONTRIBUTING` note (a few lines is
       enough) documents `uv sync` / `uv run pytest` as the way to set
       up and test the repo, so ticket 002 onward doesn't have to
       rediscover it.
