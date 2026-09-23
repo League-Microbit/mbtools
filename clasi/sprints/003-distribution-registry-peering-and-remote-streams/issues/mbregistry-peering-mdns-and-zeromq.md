@@ -1,6 +1,16 @@
 ---
-status: pending
+status: in-progress
 sprint: '003'
+tickets:
+- 003-001
+- 003-002
+- 003-004
+- 003-005
+- 003-006
+- 003-009
+- 003-010
+- 003-011
+- 003-014
 ---
 
 # mbregistry peering: mDNS discovery plus a ZeroMQ attach/detach event network

@@ -1,7 +1,11 @@
 ---
-status: pending
+status: in-progress
 split_from: mbserial-raw-serial-access-local-or-remote.md
 sprint: '003'
+tickets:
+- 003-007
+- 003-013
+- 003-014
 ---
 
 # mbserial: raw serial connection to a micro:bit (remote)
