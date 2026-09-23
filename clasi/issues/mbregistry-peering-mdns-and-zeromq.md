@@ -1,5 +1,6 @@
 ---
 status: pending
+sprint: '003'
 ---
 
 # mbregistry peering: mDNS discovery plus a ZeroMQ attach/detach event network

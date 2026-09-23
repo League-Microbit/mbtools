@@ -1,5 +1,6 @@
 ---
 status: pending
+sprint: '004'
 ---
 
 # mbrelay: connect to a radio relay and send/receive, on top of mbregistry

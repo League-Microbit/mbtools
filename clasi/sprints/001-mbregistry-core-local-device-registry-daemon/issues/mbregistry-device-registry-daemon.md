@@ -1,7 +1,19 @@
 ---
-status: pending
+status: in-progress
+split_into:
+- mbregistry-windows-platform-support.md
+sprint: '001'
+tickets:
+- 001-001
+- 001-002
+- 001-003
+- 001-004
+- 001-005
+- 001-006
+- 001-007
+- 001-008
+- 001-009
 ---
-
 # mbregistry: the single device-registry daemon (USB watch, identify, database, locks)
 
 ## Description
@@ -11,11 +23,16 @@ identification and exclusive access for every micro:bit on the host. All the
 other tools (`mbdeploy`, `mbserial`, `mbrelay`) are its clients. Full
 requirements are in `docs/brief.md` §3.
 
+Scope here is **Linux-first**. Windows USB event watch and Windows service
+installation are split out to `mbregistry-windows-platform-support.md`
+(sprint 4) — see that issue for rationale.
+
 ## Scope
 
-- **USB watch.** React to attach and detach events on Linux (udev/netlink)
-  and Windows. Polling `comports()` is an acceptable first cut, provided the
-  interface allows event sources later.
+- **USB watch (Linux).** React to attach and detach events on Linux
+  (udev/netlink). Polling `comports()` is an acceptable first cut, provided
+  the interface allows swapping in a real event source later, on Linux or
+  Windows.
 - **Least-intrusive identification.**
   1. Classify from USB data only: VID:PID `0x0D28:0x0204`, serial number =
      DAPLink UID, port path.
@@ -25,25 +42,25 @@ requirements are in `docs/brief.md` §3.
      `device <role> ...`).
 - **Re-probe rules.** Never reopen a device that has not been re-attached or
   flashed. Re-probe exactly once after a flash.
-- **Database.** SQL, machine-level (see brief §9.1–9.2 for the SQLite vs
-  MySQL and path decisions). One record per device: uid, short uid
+- **Database.** SQL, machine-level (see brief §9.1-9.2 for the SQLite vs
+  MySQL and path decisions — treat as ASSUMPTIONS for stakeholder
+  confirmation at plan review). One record per device: uid, short uid
   (`uid[16:24]`), port, announcement, role, common name, device name,
   first seen, last seen, connected, last probe, flash count and state.
-- **Query service.** A local API (Unix socket; a named pipe on Windows) to
-  list, get and find devices by name, short uid or uid. Simple iteration is
-  fine.
-- **Locks.** Exclusive per-device lock, tied to the holder's PID. The lock is
-  released when the PID dies or the connection closes. A lock carries a kind
-  (serial / relay / flash / debug) so listings can show *what* holds a
-  board.
+- **Query service.** A local API (Unix socket) to list, get and find
+  devices by name, short uid or uid. Simple iteration is fine.
+- **Locks.** Exclusive per-device lock, tied to the holder's PID via the
+  Unix socket connection (`SO_PEERCRED`) — an ASSUMPTION for stakeholder
+  confirmation. The lock is released when the PID dies or the connection
+  closes. A lock carries a kind (serial / relay / flash / debug) so
+  listings can show *what* holds a board.
 - **Flash awareness.** The registry knows when a device is being flashed and
   re-probes it afterwards. Whether that happens through a lock of kind
   "flash" or through the registry's minimal flash op is brief §9.4.
 - **Minimal flash op.** Only if needed for remote flashing (brief §3.6):
   device by name or port, plus a hex file, flashed with pyOCD by UID,
   streaming log lines back.
-- **Service install.** A systemd unit with restart on failure, and a
-  Windows service.
+- **Service install (Linux).** A systemd unit with restart on failure.
 - **Listing CLI.** `mbregistry list` (plus `--json`), with the conveniences
   learned from mbrelay:
   - a STATE column (free / locked by kind+pid / no-firmware / gone);
@@ -54,8 +71,9 @@ requirements are in `docs/brief.md` §3.
 
 ## Out of scope here
 
-Peering between registries (separate issue), and the remote network API
-beyond what peering needs.
+Peering between registries (separate issue), the remote network API beyond
+what peering needs, and all Windows-specific work (USB event watch, named
+pipe, Windows service) — see `mbregistry-windows-platform-support.md`.
 
 ## Port from
 
