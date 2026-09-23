@@ -1,9 +1,14 @@
 ---
 id: '004'
 title: 'Store: SQLite device database and re-probe-eligibility fields'
-status: open
-use-cases: [SUC-001, SUC-002, SUC-003, SUC-004]
-depends-on: ['001']
+status: done
+use-cases:
+- SUC-001
+- SUC-002
+- SUC-003
+- SUC-004
+depends-on:
+- '001'
 github-issue: ''
 issue: mbregistry-device-registry-daemon.md
 completes_issue: false
@@ -48,15 +53,15 @@ for.
 
 ## Acceptance Criteria
 
-- [ ] SQLite schema created on first use (`CREATE TABLE IF NOT EXISTS`,
+- [x] SQLite schema created on first use (`CREATE TABLE IF NOT EXISTS`,
       no migration framework needed for a v1 single-table schema); the
       database path is a constructor parameter, defaulting to
       `/var/lib/mbregistry/devices.db` but overridable (tests always
       override to `tmp_path`).
-- [ ] `store.upsert_attached(uid, port, vid_pid) -> DeviceRecord` creates
+- [x] `store.upsert_attached(uid, port, vid_pid) -> DeviceRecord` creates
       a new `attached_unprobed` record, or updates `port`/`last_seen` on
       an existing one, without touching announcement fields.
-- [ ] `store.apply_probe_result(uid, result: ProbeResult | None)`:
+- [x] `store.apply_probe_result(uid, result: ProbeResult | None)`:
       on a successful probe, updates
       `role`/`common_name`/`device_name`/`serial_payload`/
       `raw_announcement`, sets `state="connected"`, updates
@@ -65,24 +70,24 @@ for.
       any previously-known announcement fields untouched (mirrors
       `mbdeploy`'s "preserve existing announcement fields unchanged"
       rule).
-- [ ] `store.mark_disconnected(uid)` sets `state="disconnected"` and
+- [x] `store.mark_disconnected(uid)` sets `state="disconnected"` and
       updates `last_seen`; the record is never deleted from the table.
-- [ ] `store.needs_probe(uid) -> bool` reflects the re-probe rule's data
+- [x] `store.needs_probe(uid) -> bool` reflects the re-probe rule's data
       side: true for a never-probed device (`last_probe == 0.0`), false
       for an already-probed, still-attached, not-flash-marked device.
       (The "was it flashed" trigger itself is ticket 006/007's job —
       this method only answers the store-data half of the rule.)
-- [ ] `store.increment_flash_count(uid)` bumps `flash_count` — called by
+- [x] `store.increment_flash_count(uid)` bumps `flash_count` — called by
       ticket 007's flash op on completion.
-- [ ] `store.list_devices() -> list[DeviceRecord]` returns every record
+- [x] `store.list_devices() -> list[DeviceRecord]` returns every record
       (including `disconnected` ones, per UC-004's "gone, not silently
       dropped" requirement) — iteration is not required to be
       performant beyond "all records fit in memory," per spec §3.4.
-- [ ] `store.get(uid)` / `store.find(token)` (matching by uid, short_uid,
+- [x] `store.get(uid)` / `store.find(token)` (matching by uid, short_uid,
       or device_name — same precedence family as `mbdeploy`'s
       `resolve_target`, minus its enum/port-path cases which don't apply
       to the store layer) support the API's list/get/find (ticket 008).
-- [ ] All tests run against a real SQLite file in `tmp_path` — no mock
+- [x] All tests run against a real SQLite file in `tmp_path` — no mock
       database layer, since SQLite itself is the thing being tested.
 
 ## Testing
