@@ -1,9 +1,12 @@
 ---
 id: '007'
 title: 'Minimal flash op: pyOCD flash by UID, flash-triggered re-probe'
-status: open
-use-cases: [SUC-003]
-depends-on: ['005', '006']
+status: in-progress
+use-cases:
+- SUC-003
+depends-on:
+- '005'
+- '006'
 github-issue: ''
 issue: mbregistry-device-registry-daemon.md
 completes_issue: false
@@ -52,29 +55,29 @@ to a remote client without buffering the whole flash in memory.
 
 ## Acceptance Criteria
 
-- [ ] `flash.flash_hex(uid: str, hex_path: str, log: Callable[[str],
+- [x] `flash.flash_hex(uid: str, hex_path: str, log: Callable[[str],
       None]) -> FlashResult` validates the hex file with `intelhex`
       before touching pyOCD, returning a clear `FlashResult` (or raising
       a distinguishable exception) for an unreadable/malformed file
       without invoking pyOCD at all.
-- [ ] Requires evidence of a held `flash`-kind lock on `uid` (e.g. takes
+- [x] Requires evidence of a held `flash`-kind lock on `uid` (e.g. takes
       a `locks` reference and checks `locks.status(uid)` names a
       `flash`-kind holder) — refuses to flash otherwise, so this module
       can never be the thing that bypasses the locking contract it
       itself depends on for the re-probe hook to work.
-- [ ] The pyOCD subprocess invocation is behind an injectable callable
+- [x] The pyOCD subprocess invocation is behind an injectable callable
       (constructor parameter or similar) — no test in this ticket shells
       out to a real `pyocd` binary or touches a real probe.
-- [ ] On successful completion, `store.increment_flash_count(uid)` is
+- [x] On successful completion, `store.increment_flash_count(uid)` is
       called exactly once.
-- [ ] On a pyOCD failure (non-zero exit, or the injected runner raising),
+- [x] On a pyOCD failure (non-zero exit, or the injected runner raising),
       `flash_hex` returns/raises a result distinguishing failure from
       success, and still calls `increment_flash_count` (an attempted
       flash counts, per the ERD's `flash_count` semantics — "incremented
       on each *completed* flash," where completed means "pyOCD ran to
       completion," not "succeeded"; a hex-validation failure that never
       reaches pyOCD does *not* increment it).
-- [ ] Log lines from the injected pyOCD runner are relayed to the `log`
+- [x] Log lines from the injected pyOCD runner are relayed to the `log`
       callback in order, not buffered and dumped at the end.
 
 ## Testing
