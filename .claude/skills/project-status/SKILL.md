@@ -1,0 +1,1 @@
+/Volumes/Proj/proj/robot-projects/mbtools/.agents/skills/project-status/SKILL.md
