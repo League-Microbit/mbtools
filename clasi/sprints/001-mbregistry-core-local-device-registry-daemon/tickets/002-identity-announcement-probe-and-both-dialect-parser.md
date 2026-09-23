@@ -1,9 +1,12 @@
 ---
 id: '002'
 title: 'Identity: announcement probe and both-dialect parser'
-status: open
-use-cases: [SUC-001, SUC-003]
-depends-on: ['001']
+status: in-progress
+use-cases:
+- SUC-001
+- SUC-003
+depends-on:
+- '001'
 github-issue: ''
 issue: mbregistry-device-registry-daemon.md
 completes_issue: false
@@ -56,30 +59,30 @@ best-effort diagnostic (swallow `lsof`/`ps` failures, fall back to
 
 ## Acceptance Criteria
 
-- [ ] `identity.probe(port: str, timeout_s: float = 1.6) ->
+- [x] `identity.probe(port: str, timeout_s: float = 1.6) ->
       ProbeResult | None` opens with DTR/RTS low, sends `HELLO` if
       silent, and returns `None` on timeout (no exception) — mirroring
       `probe_type`'s contract.
-- [ ] Both announcement dialects parse into the same `ProbeResult`
+- [x] Both announcement dialects parse into the same `ProbeResult`
       shape: `DEVICE:<role>:<common>:<name>:<serial>` and
       `device <role> <common> <name> <serial>`.
-- [ ] A malformed or unrecognized line does not crash the probe; it is
+- [x] A malformed or unrecognized line does not crash the probe; it is
       treated as "no match," and the raw line is retained on the
       `ProbeResult`/caller side for diagnostics (per UC-001's "malformed
       announcement" error flow — role/name blank, raw line kept, not
       dropped).
-- [ ] `is_relay(role)` matches both `RADIORELAY` and `RADIOBRIDGE`
+- [x] `is_relay(role)` matches both `RADIORELAY` and `RADIOBRIDGE`
       case-insensitively; does not match a robot role (e.g. `NEZHA2`).
-- [ ] `short_uid(uid)` returns `uid[16:24]` for a well-formed 48-hex-char
+- [x] `short_uid(uid)` returns `uid[16:24]` for a well-formed 48-hex-char
       UID, and a documented fallback for a shorter/malformed UID (match
       `mbrelay`'s own fallback: last 8 chars).
-- [ ] A port-busy failure (open raises) produces a diagnostic string
+- [x] A port-busy failure (open raises) produces a diagnostic string
       naming the holding process (best-effort via `lsof`/`ps`) or
       falls back to "another program" — never raises out of the probe
       call itself.
-- [ ] The VID:PID constant lives in one place (`mbtools.common`) and is
+- [x] The VID:PID constant lives in one place (`mbtools.common`) and is
       imported here, not redefined.
-- [ ] Every test in this ticket runs against `mbtools.testing.fakes.
+- [x] Every test in this ticket runs against `mbtools.testing.fakes.
       FakeSerial` from ticket 001 — no real serial port opened.
 
 ## Testing

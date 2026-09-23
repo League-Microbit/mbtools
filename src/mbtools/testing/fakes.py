@@ -13,12 +13,9 @@ from __future__ import annotations
 from collections import deque
 from typing import Deque, Iterable, Sequence
 
-from mbtools.common import PortInfo
+from mbtools.common import DAPLINK_VID_PID, PortInfo
 
-#: ARM DAPLink's USB VID:PID — every micro:bit's onboard debug/CDC
-#: interface enumerates as this pair, on both macOS and Linux (ported from
-#: mbdeploy's ``devices.py`` ``_DAPLINK_VID_PID``).
-DAPLINK_VID_PID = (0x0D28, 0x0204)
+__all__ = ["DAPLINK_VID_PID", "FakeSerial", "FakeUSBSource"]
 
 
 class FakeUSBSource:
