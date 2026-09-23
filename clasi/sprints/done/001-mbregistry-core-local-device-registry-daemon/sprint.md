@@ -1,7 +1,7 @@
 ---
 id: '001'
 title: 'mbregistry core: local device registry daemon'
-status: executing
+status: done
 branch: sprint/001-mbregistry-core-local-device-registry-daemon
 use-cases:
 - SUC-001
