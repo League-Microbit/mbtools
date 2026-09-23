@@ -14,3 +14,18 @@ Status: early planning. See [docs/brief.md](docs/brief.md) for the design brief 
 
 Successor to `mbdeploy` (Busboombot/mbdeploy) and the `mbrelay` server in
 `microbit-radio-relay`.
+
+## Development
+
+Managed with [`uv`](https://docs.astral.sh/uv/); `pytest` is the test runner.
+
+```sh
+uv sync       # create/update the .venv and install mbtools (editable) + dev deps
+uv run pytest  # run the test suite
+```
+
+`mbregistry`, `mbdeploy`, `mbserial`, and `mbrelay` are console scripts
+registered in `pyproject.toml` and resolve via `uv run <name>` (or directly,
+once `uv sync` has put `.venv/bin` on `PATH`). Only `mbregistry` is under
+active development this sprint — the other three currently print a
+"not yet implemented" message and exit non-zero.
