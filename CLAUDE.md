@@ -25,10 +25,21 @@ Hostnames resolve on the garage LAN; don't hard-code IP addresses in this repo
 (it is public). Per-host details live on the Robot Garage wiki
 (<http://robot-garage.home/doku.php?id=mbdeploy>).
 
-The Nolanet nodes still run the **old** `mbdeploy serve` (`mbdeploy.service`,
-running as user `jtl` from `/home/jtl/mbdeploy`). It is being replaced and may be
-removed; nothing on it needs saving. It holds the serial ports, so stop it
-before running `mbregistry` on a node.
+The **old** `mbdeploy serve` (`mbdeploy.service`, user `jtl`,
+`/home/jtl/mbdeploy`) was retired on all four Nolanet nodes during sprint
+001's hardware acceptance pass (`docs/acceptance/001-hardware.md`) — it no
+longer exists on any of these hosts. `mbregistry.service` (this project's
+own daemon) holds the serial port instead; stop *that* before redeploying a
+new build to a Nolanet node (`uv venv --clear` can't remove root-owned
+`__pycache__` files the running-as-root daemon created — see
+`scripts/deploy-test-host.sh`'s own usage comment).
+
+Local (client-side) pyOCD/serial access on the Nolanet nodes needs `sudo`:
+`eric` is not in the `plugdev` group and no udev rule grants raw CMSIS-DAP/
+tty access to a non-root user on these hosts, so `mbdeploy deploy`/`debug`
+and `mbserial` all need `sudo` there (same reason `mbregistry.service`
+itself runs as root). Not needed on `braeburn` (macOS). See
+`docs/acceptance/002-hardware.md` for where this was confirmed.
 
 ## Firmware for tests (GitHub release assets — use `MICROBIT.hex`)
 
@@ -36,6 +47,6 @@ before running `mbregistry` on a node.
 |---|---|---|
 | Radio relay | `League-Robotics/microbit-radio-relay` (ignore the moving `latest` tag; use the newest versioned release) | `DEVICE:RADIOBRIDGE:relay:<name>:<serial>` |
 | Nezha robot | `League-Microbit/nezha-robot-template` | `device NEZHA2 robot <name> ...` |
-| Remote joystick | `League-Microbit/Remote-Joystick-Student` | (check on first probe) |
+| Remote joystick | `League-Microbit/Remote-Joystick-Student` | `DEVICE:JOYSTICK:joystick:<name>:<serial>` |
 
 `gh release download -R <repo> -p MICROBIT.hex` fetches the newest one.
