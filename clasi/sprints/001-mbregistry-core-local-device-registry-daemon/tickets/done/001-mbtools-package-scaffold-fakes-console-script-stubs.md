@@ -1,7 +1,7 @@
 ---
 id: '001'
 title: mbtools package scaffold, fakes, console-script stubs
-status: in-progress
+status: done
 use-cases: []
 depends-on: []
 github-issue: ''
