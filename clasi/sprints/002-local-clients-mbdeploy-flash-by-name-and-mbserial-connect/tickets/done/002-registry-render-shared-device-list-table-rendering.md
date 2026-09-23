@@ -1,7 +1,7 @@
 ---
 id: '002'
 title: 'registry.render: shared device-list table rendering'
-status: in-progress
+status: done
 use-cases:
 - UC-004
 depends-on: []
