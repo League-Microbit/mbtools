@@ -214,25 +214,38 @@ listed above, for the same one-place reason.
 
 - **Threading model.** One OS thread per accepted connection, plus one
   sweep thread, serialized by a single `threading.RLock` around every call
-  into `store`/`locks`/`flash_op`. `flash` holds that lock for its *entire*
-  duration (including the streamed pyocd run) — at this sprint's device-count
-  scale ("not a lot of devices", per the brief) a `list`/`get` from another
-  connection blocking for the duration of one flash is an accepted,
-  documented trade-off, not an oversight. Revisit only if that stops being
-  true.
+  into `store`/`locks`/`flash_op` — **except** the `flash` op's own pyocd
+  run, resolved below.
 - **`Store`'s sqlite3 connection** is opened with `check_same_thread=False`
-  (this ticket's one change to `store.py`) because the API introduces the
+  (ticket 008's one change to `store.py`) because the API introduces the
   first cross-thread callers of a `Store` instance — the daemon's own poll
   loop and this module's connection-handler threads. No additional
   app-level locking was added inside `store.py` itself, consistent with the
   architecture's already-accepted "no design here for multi-writer
   contention beyond SQLite's own file locking (WAL mode)".
-- **Cross-module concurrency** between `daemon.run_once()`'s own thread and
-  the API's connection-handler threads touching the same `LockManager`
-  instance is not separately locked by this ticket (`LockManager`'s
-  individual methods are short, GIL-atomic-in-practice dict operations, but
-  a compound check-then-act sequence spanning *both* `daemon` and `api`
-  simultaneously is not guarded by anything this ticket added). Worth
-  flagging for ticket 009's assembly (`mbregistry run` is what actually
-  starts running `Daemon.run()` and `RegistryAPIServer.serve_forever()`
-  concurrently) rather than silently assumed safe.
+- **Cross-module concurrency between `daemon` and `api` — resolved in
+  ticket 009.** The gap flagged here through ticket 008 (`daemon.run_once()`'s
+  own thread and the API's connection-handler threads touching the same
+  `Store`/`LockManager` instances with nothing serializing *across* the two
+  modules) is closed by `mbregistry run`'s assembly: it constructs one
+  `threading.RLock` and passes it to both `Daemon(lock=...)` and
+  `RegistryAPIServer(lock=...)`, so every store/locks access from either
+  side goes through the same lock. `Daemon` holds it only around its
+  in-memory/single-sqlite-statement bookkeeping (the attach/detach diff and
+  the pre/post-probe store writes), never around the real port I/O in
+  `identity.probe()` — see `daemon.py`'s own "Concurrency" docstring note.
+- **`flash` no longer holds the shared lock for the whole pyocd run —
+  resolved in ticket 009.** Holding it there was an acceptable sprint-1
+  trade-off when the lock was scoped to `api` alone; it stopped being
+  acceptable once the lock became shared with `daemon`'s own scan loop,
+  since it would then also block the daemon from ever completing a cycle
+  for the duration of any one flash. `_op_flash` now holds the shared lock
+  only for the short bookkeeping before and after the run (resolving the
+  record and confirming this connection's flash-kind lock is held; then,
+  afterwards, releasing that lock) — the run itself happens with the shared
+  lock released. The per-device `flash`-kind lock, already held as a
+  verified precondition and not released until the attempt concludes, is
+  what continues to protect the device for the whole run; the daemon's own
+  "never probe a locked device" check (`LockManager.status`) still sees it
+  as locked throughout, so this does not reopen the race the flash-kind
+  lock exists to prevent.

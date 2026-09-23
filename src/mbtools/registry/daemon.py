@@ -51,11 +51,32 @@ it is.
 :meth:`LockManager.status` is checked; a locked uid is skipped for this
 cycle and retried on a later one once it is unlocked — the probe would
 otherwise fight over the very port a lock exists to protect.
+
+**Concurrency (ticket 009's assembly)**: this class's own thread (the
+poll loop calling :meth:`run_once`) and the API's per-connection threads
+(ticket 008) both touch the same ``store``/``locks`` instances with no
+common guard between the two modules — flagged as a known gap in
+``docs/design/registry-api.md``'s "Known limitations". ``mbregistry run``
+(ticket 009) closes that gap by constructing one shared
+``threading.RLock`` at assembly time and passing it to both this class's
+``lock`` parameter and
+:class:`~mbtools.registry.api.RegistryAPIServer`'s. :class:`Daemon` holds
+it only around the short, in-memory-or-single-sqlite-statement bookkeeping
+steps (the attach/detach diff and store writes in :meth:`run_once`, and
+the eligibility check plus the post-probe store write in
+:meth:`_maybe_probe`) — never around :func:`mbtools.registry.identity.probe`
+itself, which opens a real serial port and can block for over a second.
+Holding a shared lock across that would stall every API call for the
+duration of every probe, which is worse than the race the lock exists to
+close. A caller that constructs a bare :class:`Daemon` without ``lock=``
+(every test in this module, and any future single-threaded use) gets a
+private ``RLock`` of its own — harmless, since nothing else shares it.
 """
 
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from typing import Any, Callable
 
@@ -65,7 +86,7 @@ from mbtools.registry.locks import LockManager
 from mbtools.registry.store import STATE_DISCONNECTED, Store, format_vid_pid
 from mbtools.registry.usbwatch import PortWatcher
 
-__all__ = ["Daemon"]
+__all__ = ["Daemon", "DEFAULT_INTERVAL_S", "DEFAULT_FLASH_REPROBE_TIMEOUT_S"]
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +124,13 @@ class Daemon:
     for flash-pending deadline bookkeeping — a test passes a deterministic
     stepped clock instead of depending on real wall-clock time to exercise
     the timeout path without sleeping.
+
+    ``lock`` is the shared ``threading.RLock`` ticket 009's ``mbregistry
+    run`` constructs once and passes to both this class and
+    :class:`~mbtools.registry.api.RegistryAPIServer` — see the module
+    docstring's "Concurrency" note. Defaults to a private ``RLock`` of
+    this instance's own when omitted, so single-threaded callers (every
+    test in this module) are unaffected.
     """
 
     def __init__(
@@ -115,6 +143,7 @@ class Daemon:
         settle_s: float | None = None,
         flash_reprobe_timeout_s: float = DEFAULT_FLASH_REPROBE_TIMEOUT_S,
         now_fn: Callable[[], float] = time.monotonic,
+        lock: threading.RLock | None = None,
     ) -> None:
         self._usbwatch = usbwatch
         self._store = store
@@ -123,6 +152,7 @@ class Daemon:
         self._settle_s = settle_s
         self._flash_reprobe_timeout_s = flash_reprobe_timeout_s
         self._now = now_fn
+        self._lock = lock if lock is not None else threading.RLock()
 
         #: uid -> deadline (per ``now_fn``) by which a flash-triggered
         #: re-probe must see the device re-enumerate, or it gives up.
@@ -176,37 +206,50 @@ class Daemon:
         uid against whatever the store already believes, and
         ``store.upsert_attached``'s own "not a reattach unless previously
         disconnected" rule (ticket 004) takes it from there.
+
+        The attach/detach diff and every store/locks write it makes runs
+        under :attr:`_lock` (see the module docstring's "Concurrency"
+        note) — this is all in-memory work plus single, atomic sqlite
+        statements, never a real port open, so holding the shared lock
+        for it doesn't stall the API. Probing (:meth:`_maybe_probe`) is
+        deliberately done in a second pass, after that block releases the
+        lock, so the port I/O itself never runs with the shared lock
+        held.
         """
         now = self._now()
         current = self._usbwatch.scan()
-        previously_attached = {
-            record.uid
-            for record in self._store.list_devices()
-            if record.state != STATE_DISCONNECTED
-        }
+
+        with self._lock:
+            previously_attached = {
+                record.uid
+                for record in self._store.list_devices()
+                if record.state != STATE_DISCONNECTED
+            }
+
+            for uid, info in current.items():
+                if uid not in previously_attached:
+                    self._store.upsert_attached(
+                        uid, info.port, format_vid_pid(info.vid, info.pid)
+                    )
+
+            for uid in previously_attached - current.keys():
+                holder = self.locks.status(uid)
+                if holder is not None:
+                    self.locks.release(uid, holder.pid)
+                self._store.mark_disconnected(uid)
+
+            for uid, deadline in list(self._flash_pending.items()):
+                if uid not in current and now >= deadline:
+                    logger.warning(
+                        "daemon: %s never re-enumerated after flash within timeout; "
+                        "marking no-firmware",
+                        uid,
+                    )
+                    self._store.apply_probe_result(uid, None)
+                    del self._flash_pending[uid]
 
         for uid, info in current.items():
-            if uid not in previously_attached:
-                self._store.upsert_attached(
-                    uid, info.port, format_vid_pid(info.vid, info.pid)
-                )
             self._maybe_probe(uid, info)
-
-        for uid in previously_attached - current.keys():
-            holder = self.locks.status(uid)
-            if holder is not None:
-                self.locks.release(uid, holder.pid)
-            self._store.mark_disconnected(uid)
-
-        for uid, deadline in list(self._flash_pending.items()):
-            if uid not in current and now >= deadline:
-                logger.warning(
-                    "daemon: %s never re-enumerated after flash within timeout; "
-                    "marking no-firmware",
-                    uid,
-                )
-                self._store.apply_probe_result(uid, None)
-                del self._flash_pending[uid]
 
     def _maybe_probe(self, uid: str, info: PortInfo) -> None:
         """Probe ``uid`` on ``info.port`` if, and only if, it is eligible.
@@ -218,19 +261,35 @@ class Daemon:
         construction, either in active use or mid-flash; the passive
         pipeline must never open its port). A locked-but-eligible uid is
         simply skipped for this cycle and retried on the next one.
+
+        The eligibility check and the post-probe store write are each
+        wrapped in :attr:`_lock` (see the module docstring's
+        "Concurrency" note); the actual :func:`~mbtools.registry.identity.probe`
+        call — the one part of this method that opens a real port and can
+        block for over a second — runs with the lock released, so it
+        never stalls the API. This narrows, but does not eliminate, the
+        pre-existing race between "checked unlocked" and "port opened": a
+        client could acquire a lock in that gap. That race already existed
+        before this method held any lock at all (there was no shared lock
+        to close it with); this change only stops it from stalling
+        unrelated API calls, it does not add a new guarantee against that
+        specific interleaving.
         """
-        if not (self._store.needs_probe(uid) or uid in self._flash_pending):
-            return
-        if self.locks.status(uid) is not None:
-            return
+        with self._lock:
+            eligible = self._store.needs_probe(uid) or uid in self._flash_pending
+            if not eligible or self.locks.status(uid) is not None:
+                return
+
         result = identity.probe(
             info.port,
             self._probe_timeout_s,
             serial_factory=self._serial_factory,
             settle_s=self._settle_s,
         )
-        self._store.apply_probe_result(uid, result)
-        self._flash_pending.pop(uid, None)
+
+        with self._lock:
+            self._store.apply_probe_result(uid, result)
+            self._flash_pending.pop(uid, None)
 
     # -- run loop --------------------------------------------------------
 

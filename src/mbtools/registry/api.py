@@ -58,13 +58,39 @@ scale — "not a lot of devices," per the brief — does not need an event
 loop), plus one periodic sweep thread. A single :class:`threading.RLock`
 serializes every call into ``store``/``locks``/``flash`` so two
 connections' check-then-act sequences (e.g. "does this uid exist, then
-acquire its lock") can't interleave; ``flash`` holds it for the whole
-pyocd run (see :meth:`RegistryAPIServer._op_flash`'s own note) — a
-known, documented sprint-1 trade-off, not a general-purpose scheduler.
-``mbtools.registry.store.Store``'s sqlite3 connection is opened with
-``check_same_thread=False`` (ticket 008's change, in ``store.py``) so it
-can be called from these connection-handler threads at all; see that
-module's own comment for why no further change was needed there.
+acquire its lock") can't interleave. ``mbtools.registry.store.Store``'s
+sqlite3 connection is opened with ``check_same_thread=False`` (ticket
+008's change, in ``store.py``) so it can be called from these
+connection-handler threads at all; see that module's own comment for why
+no further change was needed there.
+
+**Shared lock across daemon and api (ticket 009's assembly)**: this
+class's own ``RLock`` (above) and :class:`~mbtools.registry.daemon.Daemon`'s
+each guarded only their own module's store/locks access until ticket 009
+wired the two together — a documented gap (this module's own "Known
+limitations" note in ``docs/design/registry-api.md``), since
+``Daemon.run_once()``'s thread and this class's per-connection threads
+touch the same ``Store``/``LockManager`` instances with nothing
+serializing *across* the two. ``mbregistry run`` (ticket 009) closes that
+gap by constructing one ``threading.RLock`` at assembly time and passing
+it to both this class's ``lock`` parameter and ``Daemon``'s — see that
+class's own "Concurrency" docstring note. A caller that constructs a bare
+:class:`RegistryAPIServer` without ``lock=`` (every test in this module
+that doesn't also construct a ``Daemon``) gets a private ``RLock`` of its
+own, exactly as before.
+
+**Flash does not hold the shared lock for the pyocd run**
+(:meth:`RegistryAPIServer._op_flash`'s own note has the mechanics): the
+shared lock only guards the short bookkeeping before and after —
+resolving the record, checking this connection's own flash-kind lock is
+held, and, afterwards, releasing that lock. The per-device flash-kind
+lock (already held as a precondition, never released until the flash
+attempt concludes) is what protects the device itself for the whole
+streamed pyocd run; the shared lock is not needed for that, and holding
+it there — this ticket's fix — is exactly what would have blocked
+``list``/``get``/``lock`` for every other device once the lock became
+shared with the daemon's own scan loop, which is worse than the
+sprint-1 trade-off it replaces.
 """
 
 from __future__ import annotations
@@ -215,6 +241,14 @@ class RegistryAPIServer:
     ``peer_pid_fn``/``is_pid_alive_fn`` are the injectable escape hatches
     described in the module docstring; both default to the real,
     platform-appropriate production implementations.
+
+    ``lock`` is the shared ``threading.RLock`` ticket 009's ``mbregistry
+    run`` constructs once and passes to both this class and
+    :class:`~mbtools.registry.daemon.Daemon` — see the module docstring's
+    "Shared lock across daemon and api" note. Defaults to a private
+    ``RLock`` of this instance's own when omitted, matching this class's
+    pre-ticket-009 behavior for every test that constructs a server on
+    its own.
     """
 
     def __init__(
@@ -227,6 +261,7 @@ class RegistryAPIServer:
         peer_pid_fn: Callable[[socket.socket], int] | None = None,
         is_pid_alive_fn: Callable[[int], bool] | None = None,
         sweep_interval_s: float = DEFAULT_SWEEP_INTERVAL_S,
+        lock: threading.RLock | None = None,
     ) -> None:
         self.socket_path = Path(socket_path)
         self._store = store
@@ -238,7 +273,7 @@ class RegistryAPIServer:
         )
         self._sweep_interval_s = sweep_interval_s
 
-        self._lock = threading.RLock()
+        self._lock = lock if lock is not None else threading.RLock()
         self._stop_event = threading.Event()
         self._sock: socket.socket | None = None
         self._accept_thread: threading.Thread | None = None
@@ -489,13 +524,16 @@ class RegistryAPIServer:
         (success, pyocd failure, or a validation error). That release is
         what ``daemon``'s flash-triggered re-probe hook is watching for.
 
-        Held under ``self._lock`` for its whole duration, including the
-        streamed pyocd run: this sprint's device-count scale does not
-        need ``list``/``get`` to stay responsive during a flash, and
-        holding the lock the whole time is the simplest way to keep
-        ``store``/``locks`` access serialized without touching
-        ``flash.py``'s own contract. See the module docstring's
-        Threading model note.
+        ``self._lock`` is held only for the short bookkeeping before and
+        after the streamed pyocd run — resolving the record and checking
+        this connection's own flash-kind lock is held, then, afterwards,
+        releasing that lock — never for the run itself (ticket 009's
+        fix; see the module docstring's "Flash does not hold the shared
+        lock for the pyocd run" note). The per-device flash-kind lock,
+        already held as a verified precondition and never released until
+        the attempt concludes, is what protects ``uid`` for the whole
+        run; the shared lock's job here is only the two short
+        store/locks bookkeeping steps, not guarding the device itself.
         """
         def _flash_error(code: str, message: str) -> dict[str, Any]:
             # Every response to a "flash" request -- whether a
@@ -518,6 +556,9 @@ class RegistryAPIServer:
         def log(line: str) -> None:
             self._write(wfile, {"type": "log", "line": line})
 
+        # Bookkeeping step 1 (short, held under the shared lock): resolve
+        # the record and confirm this connection's own flash-kind lock is
+        # held. Nothing here touches pyocd or the hex file.
         with self._lock:
             record = self._store.find(str(token))
             if record is None:
@@ -530,25 +571,41 @@ class RegistryAPIServer:
                     f"{uid}: flash requires a flash-kind lock held by this "
                     "connection (call 'lock' first)",
                 )
-            try:
-                result = self._flash_op.flash_hex(uid, str(hex_path), log)
-            except HexValidationError as exc:
+
+        # The run itself: deliberately outside the shared lock (see the
+        # module docstring and this method's own docstring). ``uid``'s
+        # own flash-kind lock, verified above and not released until one
+        # of the branches below runs, is what protects the device for
+        # this whole streamed pyocd invocation.
+        try:
+            result = self._flash_op.flash_hex(uid, str(hex_path), log)
+        except HexValidationError as exc:
+            # Bookkeeping step 2 (short, held under the shared lock): the
+            # flash never ran -- release the lock this connection is
+            # still holding.
+            with self._lock:
                 self._locks.release(uid, pid)
                 acquired_uids.discard(uid)
-                return {
-                    "type": "result",
-                    "ok": False,
-                    "code": CODE_INVALID_REQUEST,
-                    "success": False,
-                    "exit_code": None,
-                    "error": str(exc),
-                }
-            self._locks.release(uid, pid)
-            acquired_uids.discard(uid)
             return {
                 "type": "result",
-                "ok": result.success,
-                "success": result.success,
-                "exit_code": result.exit_code,
-                "error": result.error,
+                "ok": False,
+                "code": CODE_INVALID_REQUEST,
+                "success": False,
+                "exit_code": None,
+                "error": str(exc),
             }
+
+        # Bookkeeping step 2 (short, held under the shared lock): the
+        # attempt concluded (success or pyocd failure) -- release the
+        # lock. This release is what daemon's flash-triggered re-probe
+        # hook is watching for.
+        with self._lock:
+            self._locks.release(uid, pid)
+            acquired_uids.discard(uid)
+        return {
+            "type": "result",
+            "ok": result.success,
+            "success": result.success,
+            "exit_code": result.exit_code,
+            "error": result.error,
+        }
