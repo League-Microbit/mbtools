@@ -1,9 +1,12 @@
 ---
 id: '005'
 title: 'Locks: PID-tied exclusive lock manager, kind-tagged'
-status: open
-use-cases: [SUC-005, SUC-006]
-depends-on: ['001']
+status: in-progress
+use-cases:
+- SUC-005
+- SUC-006
+depends-on:
+- '001'
 github-issue: ''
 issue: mbregistry-device-registry-daemon.md
 completes_issue: false
@@ -55,31 +58,31 @@ API — implementer's choice, keep it narrow).
 
 ## Acceptance Criteria
 
-- [ ] `locks.acquire(uid, kind, pid) -> bool` grants a lock if the
+- [x] `locks.acquire(uid, kind, pid) -> bool` grants a lock if the
       device is currently unlocked, and fails (returns `False` or
       raises a distinguishable exception — pick one and use it
       consistently) if already locked, without mutating state on
       failure.
-- [ ] A failed acquire's failure carries the current holder's kind and
+- [x] A failed acquire's failure carries the current holder's kind and
       pid, for the API (ticket 008) to build UC-006's "locked for flash
       by pid 4821" message.
-- [ ] `locks.release(uid, pid)` releases only if `pid` matches the
+- [x] `locks.release(uid, pid)` releases only if `pid` matches the
       current holder; releasing with a non-matching or absent pid is a
       no-op (not an error that could be used to steal a lock).
-- [ ] `locks.sweep(is_pid_alive: Callable[[int], bool])` releases every
+- [x] `locks.sweep(is_pid_alive: Callable[[int], bool])` releases every
       lock whose holder PID `is_pid_alive` reports as dead, and leaves
       live-holder locks untouched.
-- [ ] Releasing a `flash`-kind lock (via either `release()` or `sweep()`)
+- [x] Releasing a `flash`-kind lock (via either `release()` or `sweep()`)
       fires the registered flash-release callback/notification exactly
       once, naming the uid; releasing a non-`flash`-kind lock does not.
-- [ ] `locks.status(uid) -> LockStatus | None` reports the current
+- [x] `locks.status(uid) -> LockStatus | None` reports the current
       holder's kind and pid (or `None` if unlocked), for `store`/`api`
       listings to compose "locked by kind+pid" (UC-004's STATE column).
-- [ ] A device with no lock ever taken behaves identically to one that
+- [x] A device with no lock ever taken behaves identically to one that
       was locked and fully released (idempotent unlocked state) — no
       special-cased "never touched" vs. "released" distinction leaks
       out.
-- [ ] One integration-style test spawns a real short-lived subprocess,
+- [x] One integration-style test spawns a real short-lived subprocess,
       acquires a lock with its real PID, kills the subprocess, and
       confirms `sweep()` with the *real* liveness check (e.g.
       `os.kill(pid, 0)`-based) releases it — proving the injectable
