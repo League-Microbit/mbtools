@@ -1,5 +1,5 @@
 ---
-status: in-progress
+status: done
 split_into:
 - mbdeploy-flash-by-name-remote.md
 sprint: '002'

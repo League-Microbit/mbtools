@@ -1,7 +1,7 @@
 ---
 id: '010'
 title: Hardware acceptance on Nolanet and braeburn
-status: in-progress
+status: done
 use-cases:
 - SUC-001
 - SUC-002
