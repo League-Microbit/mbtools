@@ -1,9 +1,16 @@
 ---
 id: '006'
 title: 'Daemon core: attach/detach to probe to store pipeline, re-probe rules'
-status: open
-use-cases: [SUC-001, SUC-002, SUC-003]
-depends-on: ['002', '003', '004', '005']
+status: in-progress
+use-cases:
+- SUC-001
+- SUC-002
+- SUC-003
+depends-on:
+- '002'
+- '003'
+- '004'
+- '005'
 github-issue: ''
 issue: mbregistry-device-registry-daemon.md
 completes_issue: false
@@ -56,30 +63,30 @@ to distinguish. An ordinary unplug never has a flash-kind lock in play.
 
 ## Acceptance Criteria
 
-- [ ] A single `run()` (or equivalent) loop performs one scan-diff-probe
+- [x] A single `run()` (or equivalent) loop performs one scan-diff-probe
       cycle per interval; the interval is configurable (tests use a
       very short one or drive cycles manually rather than sleeping).
-- [ ] A newly-attached matching device gets exactly one probe (subject
+- [x] A newly-attached matching device gets exactly one probe (subject
       to `needs_probe`), never re-probed on a later cycle while it stays
       attached and unflashed — verified by a test that runs multiple
       cycles with the device present throughout and asserts the fake
       serial port's probe was invoked exactly once.
-- [ ] A detach releases any held lock and marks the record
+- [x] A detach releases any held lock and marks the record
       `disconnected`; a subsequent reattach (same uid reappears in a
       scan) is probed again (re-probe rule's "reattached" exception).
-- [ ] A `flash`-kind lock's release triggers exactly one re-probe of
+- [x] A `flash`-kind lock's release triggers exactly one re-probe of
       that uid, once it reappears in a scan — verified with
       `FakeUSBSource` scripted to drop and re-add the uid to simulate
       the flash-induced reboot.
-- [ ] A flash-triggered re-probe that never sees the device
+- [x] A flash-triggered re-probe that never sees the device
       re-enumerate within a bounded timeout ends in a `no-firmware`/
       blank-equivalent state rather than hanging the daemon loop
       indefinitely.
-- [ ] The pipeline never opens a port for a device currently locked by
+- [x] The pipeline never opens a port for a device currently locked by
       someone else (a locked device is, by construction, either being
       actively used or mid-flash — either way not something the
       passive attach/detach pipeline should touch).
-- [ ] All tests run against `FakeUSBSource` and `FakeSerial` (ticket
+- [x] All tests run against `FakeUSBSource` and `FakeSerial` (ticket
       001) plus real `store`/`locks` instances (tickets 004/005) —
       no real USB, no real serial port, no real subprocess beyond the
       one already covered by ticket 005's liveness integration test.

@@ -1,0 +1,260 @@
+"""mbtools.registry.daemon — the attach/detach → probe → store pipeline
+and the re-probe rules.
+
+Per sprint.md's Architecture (module "daemon"), this is the orchestrator
+that wires :mod:`mbtools.registry.usbwatch`, :mod:`mbtools.registry.identity`,
+:mod:`mbtools.registry.store`, and :mod:`mbtools.registry.locks` into the
+running service. :class:`Daemon` holds no *persistent* state of its own —
+everything it touches lives in ``store`` or ``locks`` — its job is the
+*pipeline* (scan, diff, probe, persist) and the *policy* (when a probe is
+allowed to happen at all).
+
+**Re-probe rule** (SUC-001/UC-001's core invariant): a device already
+probed and still attached is never reopened. The pipeline only probes a
+uid when :meth:`mbtools.registry.store.Store.needs_probe` says so (true
+exactly for a never-probed or just-reattached device) — or when this
+module's own flash-pending tracking says a flash-triggered re-probe is
+due (see below). An already-``connected`` device staying attached across
+scans is never touched again.
+
+**Flash-triggered re-probe**: :class:`Daemon` owns its own
+:class:`~mbtools.registry.locks.LockManager` (constructed in
+:meth:`Daemon.__init__`, exposed as :attr:`Daemon.locks` for callers —
+ticket 007's flash op and ticket 008's API dispatch against this same
+instance) and registers :meth:`Daemon._on_flash_release` as its
+``flash_release_callback``. When a ``flash``-kind lock on a uid releases,
+that uid is recorded in :attr:`Daemon._flash_pending` with a deadline.
+Every cycle, a flash-pending uid is probed as soon as it is seen attached
+again — regardless of what :meth:`Store.needs_probe` says, since a flash
+can leave the DAPLink interface enumerated throughout (no detach/reattach
+cycle to trip the store's own "reattach resets last_probe" rule) — and if
+it never reappears before its deadline, it is marked
+``connected_no_firmware`` (the store's existing "blank-equivalent" state,
+reused here rather than inventing a new one) instead of waiting forever.
+
+**Detach handling**: a uid that drops out of a scan has any lock it holds
+force-released (a detach is not a graceful release — UC-002's
+postcondition "any lock is released") by reading the current holder's pid
+off :meth:`LockManager.status` and passing it back to
+:meth:`LockManager.release` — legitimate because this is the daemon's own
+privileged bookkeeping, not a client-supplied pid a caller could use to
+steal someone else's lock. The record is then marked ``disconnected``.
+Flash-pending tracking is left untouched across a detach — the very next
+scan that sees the uid reattach clears it (see above); the ticket's
+"detach-vs-flash disambiguation" is, concretely, that an ordinary detach
+never has a flash-pending entry to preserve, so this shared code path
+behaves identically for both cases without needing to branch on which one
+it is.
+
+**Locked devices are never probed.** Before opening a port for any uid
+(new attach, still-attached-and-flash-pending, or reattach),
+:meth:`LockManager.status` is checked; a locked uid is skipped for this
+cycle and retried on a later one once it is unlocked — the probe would
+otherwise fight over the very port a lock exists to protect.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from typing import Any, Callable
+
+from mbtools.common import PortInfo
+from mbtools.registry import identity
+from mbtools.registry.locks import LockManager
+from mbtools.registry.store import STATE_DISCONNECTED, Store, format_vid_pid
+from mbtools.registry.usbwatch import PortWatcher
+
+__all__ = ["Daemon"]
+
+logger = logging.getLogger(__name__)
+
+#: Default bound on how long a flash-triggered re-probe waits for the
+#: device to re-enumerate before giving up (UC-003's error flow) — chosen
+#: generously relative to a DAPLink reset/re-enumeration cycle without
+#: being so long a genuinely failed flash hangs the record in limbo.
+DEFAULT_FLASH_REPROBE_TIMEOUT_S = 10.0
+
+#: Default poll interval for :meth:`Daemon.run`.
+DEFAULT_INTERVAL_S = 2.0
+
+
+class Daemon:
+    """Orchestrates one scan-diff-probe cycle at a time.
+
+    ``usbwatch`` and ``store`` are injected — the caller (a test, or the
+    real assembly ticket 009's ``mbregistry run`` builds) owns their
+    lifecycle. ``locks`` is *not* injected: :class:`Daemon` always
+    constructs its own :class:`~mbtools.registry.locks.LockManager` so it
+    can wire its flash-release callback at construction (the only point
+    ``LockManager`` accepts one) — exposed as :attr:`locks` so ticket
+    007/008 (and tests) can acquire/release/inspect locks against the
+    exact instance this daemon watches.
+
+    ``serial_factory``/``probe_timeout_s``/``settle_s`` are forwarded
+    verbatim to :func:`mbtools.registry.identity.probe` on every probe
+    call — the same test-only escape hatch ``identity.probe`` itself
+    documents (a test passes a ``serial_factory`` returning
+    ``mbtools.testing.fakes.FakeSerial`` instances and ``settle_s=0``;
+    production code leaves both at their defaults).
+
+    ``now_fn`` is this module's own injectable clock (mirroring
+    ``store``'s ``now_fn`` and ``usbwatch``'s ``comports_fn``), used only
+    for flash-pending deadline bookkeeping — a test passes a deterministic
+    stepped clock instead of depending on real wall-clock time to exercise
+    the timeout path without sleeping.
+    """
+
+    def __init__(
+        self,
+        *,
+        usbwatch: PortWatcher,
+        store: Store,
+        serial_factory: Callable[..., Any] | None = None,
+        probe_timeout_s: float = 1.6,
+        settle_s: float | None = None,
+        flash_reprobe_timeout_s: float = DEFAULT_FLASH_REPROBE_TIMEOUT_S,
+        now_fn: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._usbwatch = usbwatch
+        self._store = store
+        self._serial_factory = serial_factory
+        self._probe_timeout_s = probe_timeout_s
+        self._settle_s = settle_s
+        self._flash_reprobe_timeout_s = flash_reprobe_timeout_s
+        self._now = now_fn
+
+        #: uid -> deadline (per ``now_fn``) by which a flash-triggered
+        #: re-probe must see the device re-enumerate, or it gives up.
+        #: Ephemeral, in-memory only — lost on restart, same as
+        #: ``locks``' own table; a daemon that crashed mid-flash-wait has
+        #: no record of the wait to resume, which is acceptable per
+        #: sprint.md's Open Questions (no stronger guarantee is asked
+        #: for).
+        self._flash_pending: dict[str, float] = {}
+
+        self.locks = LockManager(flash_release_callback=self._on_flash_release)
+
+    # -- flash-release hook ------------------------------------------------
+
+    def _on_flash_release(self, uid: str) -> None:
+        """Registered as :class:`LockManager`'s ``flash_release_callback``.
+
+        Fires exactly once per ``flash``-kind lock release (the
+        guarantee is ``LockManager``'s own — see its ``_release``
+        docstring). Records a deadline; does not probe here — probing
+        only happens once the device is actually seen attached again, in
+        :meth:`run_once`.
+        """
+        deadline = self._now() + self._flash_reprobe_timeout_s
+        self._flash_pending[uid] = deadline
+        logger.info(
+            "daemon: flash lock released for %s, awaiting re-enumeration by %.3f",
+            uid,
+            deadline,
+        )
+
+    # -- the pipeline --------------------------------------------------
+
+    def run_once(self) -> None:
+        """Perform exactly one scan-diff-probe cycle.
+
+        1. Snapshot currently-attached devices via ``usbwatch.scan()``.
+        2. For each attached uid: ``store.upsert_attached`` if it wasn't
+           already known as attached, then probe it if eligible (see
+           :meth:`_maybe_probe`).
+        3. For each uid that was attached last cycle but is gone now:
+           force-release any lock it holds, then ``store.mark_disconnected``.
+        4. For each flash-pending uid that is still absent and past its
+           deadline: give up and mark it ``connected_no_firmware``.
+
+        "Attached last cycle" is read from ``store`` (any record whose
+        ``state`` isn't ``disconnected``) rather than kept as a separate
+        in-memory set — per the module's "no persistent state of its own"
+        boundary, and because it makes a daemon restart naturally
+        idempotent: the very next scan re-attaches every currently-present
+        uid against whatever the store already believes, and
+        ``store.upsert_attached``'s own "not a reattach unless previously
+        disconnected" rule (ticket 004) takes it from there.
+        """
+        now = self._now()
+        current = self._usbwatch.scan()
+        previously_attached = {
+            record.uid
+            for record in self._store.list_devices()
+            if record.state != STATE_DISCONNECTED
+        }
+
+        for uid, info in current.items():
+            if uid not in previously_attached:
+                self._store.upsert_attached(
+                    uid, info.port, format_vid_pid(info.vid, info.pid)
+                )
+            self._maybe_probe(uid, info)
+
+        for uid in previously_attached - current.keys():
+            holder = self.locks.status(uid)
+            if holder is not None:
+                self.locks.release(uid, holder.pid)
+            self._store.mark_disconnected(uid)
+
+        for uid, deadline in list(self._flash_pending.items()):
+            if uid not in current and now >= deadline:
+                logger.warning(
+                    "daemon: %s never re-enumerated after flash within timeout; "
+                    "marking no-firmware",
+                    uid,
+                )
+                self._store.apply_probe_result(uid, None)
+                del self._flash_pending[uid]
+
+    def _maybe_probe(self, uid: str, info: PortInfo) -> None:
+        """Probe ``uid`` on ``info.port`` if, and only if, it is eligible.
+
+        Eligible means: the store's own re-probe rule says so
+        (:meth:`Store.needs_probe`), or this uid is awaiting its
+        flash-triggered re-probe (:attr:`_flash_pending`) — and, either
+        way, the device is not currently locked (a locked device is, by
+        construction, either in active use or mid-flash; the passive
+        pipeline must never open its port). A locked-but-eligible uid is
+        simply skipped for this cycle and retried on the next one.
+        """
+        if not (self._store.needs_probe(uid) or uid in self._flash_pending):
+            return
+        if self.locks.status(uid) is not None:
+            return
+        result = identity.probe(
+            info.port,
+            self._probe_timeout_s,
+            serial_factory=self._serial_factory,
+            settle_s=self._settle_s,
+        )
+        self._store.apply_probe_result(uid, result)
+        self._flash_pending.pop(uid, None)
+
+    # -- run loop --------------------------------------------------------
+
+    def run(
+        self,
+        *,
+        interval_s: float = DEFAULT_INTERVAL_S,
+        stop: Callable[[], bool] | None = None,
+    ) -> None:
+        """Run :meth:`run_once` on an ``interval_s`` cadence until ``stop()``
+        returns ``True``.
+
+        ``stop`` defaults to ``None``, meaning "run forever" (the real
+        ``mbregistry run``, ticket 009's job, supplies one tied to a
+        signal handler or similar). Tests drive :meth:`run_once` directly
+        cycle-by-cycle instead of calling this method, per sprint.md's
+        Test Strategy ("tests use a very short [interval] or drive cycles
+        manually rather than sleeping") — this method exists to satisfy
+        the ticket's "a single run() loop" acceptance criterion and to
+        give ticket 009 something to call, not because any test in this
+        ticket exercises real sleeping at length.
+        """
+        while stop is None or not stop():
+            self.run_once()
+            if stop is not None and stop():
+                break
+            time.sleep(interval_s)
