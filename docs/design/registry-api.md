@@ -220,6 +220,49 @@ the real mechanism (`pytest.mark.skipif` gated to the right platform, per
 sprint.md's Test Strategy — not `xfail`, so it fails loudly if the platform
 check is ever wrong).
 
+## Store schema additions for peering (sprint 003, ticket 001)
+
+`mbtools.registry.store.Store` gained the data model
+`registry.remote_api` (ticket 006+) will need to describe in its own
+`list`/`find` responses — see sprint.md's ERD. Written down here rather
+than only in `store.py` so this document stays the one place that
+describes what a device dict *can* contain, per this file's own reason
+for existing (Open Question #1).
+
+- **`device.host`** (`TEXT`, nullable): `NULL` means this row is a
+  locally-owned device (attached to a port on this registry); otherwise
+  it is the owning peer's hostname, and the row was written by
+  `registry.peering` applying a remote snapshot or event.
+- **`device.remote_lock_kind` / `device.remote_lock_display`** (`TEXT`,
+  nullable): a display-only cache of a remote-owned row's lock state,
+  replicated over the event bus (Decision 3) — never consulted for a
+  local row, which always reads live `LockManager` state instead. Set
+  only by `Store.apply_remote_lock_state`, never by anything that
+  touches `LockManager`.
+- **`peer` table** (new): one row per discovered registry —
+  `host` (`TEXT PRIMARY KEY`), `endpoint` (`TEXT`, `host:port` of that
+  peer's own `remote_api` listener), `last_seen` (`REAL`), `reachable`
+  (`INTEGER`, boolean). A vanished peer is marked `reachable = 0`, never
+  deleted (Decision 5) — `registry.render` (ticket 010) is expected to
+  render that peer's devices as "peer unreachable" rather than their
+  last-known live state.
+- **`Store.find(token)`** now accepts an optional `name@host` suffix
+  (e.g. `"zavaz@loki"`, case-insensitive on both parts) to resolve a
+  device name that collides across hosts. Without a suffix, a
+  `device_name` match that is ambiguous across more than one `host`
+  value (the local `NULL` host counts as one candidate) raises
+  `mbtools.registry.store.AmbiguousNameError` instead of silently
+  picking one — a future `remote_api`/local-API error path will need a
+  `CODE_*` for this (not assigned by this ticket; `registry.remote_api`,
+  ticket 006+, is this module's first real caller of the ambiguity
+  path).
+
+An updated device dict (once `registry.remote_api`/`render` surface it)
+is expected to add `host`/`remote_lock_kind`/`remote_lock_display` to
+the shape shown above, plus a `reachable` flag derived from the owning
+`peer` row for a remote-owned device — none of that wiring exists yet as
+of this ticket, which only touches `store.py`.
+
 ## Exit codes
 
 `mbtools.common` defines the stable process exit codes ticket 009's CLI (and

@@ -1,7 +1,7 @@
 ---
 id: '003'
 title: 'Distribution: registry peering and remote streams'
-status: ticketing
+status: executing
 branch: sprint/003-distribution-registry-peering-and-remote-streams
 use-cases: []
 issues:
