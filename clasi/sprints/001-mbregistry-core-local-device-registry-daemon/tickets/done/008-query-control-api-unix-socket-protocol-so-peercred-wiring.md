@@ -1,7 +1,7 @@
 ---
 id: 008
 title: 'Query/control API: Unix socket protocol, SO_PEERCRED wiring'
-status: in-progress
+status: done
 use-cases:
 - SUC-004
 - SUC-005
