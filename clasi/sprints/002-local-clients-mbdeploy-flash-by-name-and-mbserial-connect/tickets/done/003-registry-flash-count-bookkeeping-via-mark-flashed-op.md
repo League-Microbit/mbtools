@@ -1,7 +1,7 @@
 ---
 id: '003'
 title: 'registry: flash-count bookkeeping via mark_flashed op'
-status: in-progress
+status: done
 use-cases:
 - UC-008
 depends-on:
