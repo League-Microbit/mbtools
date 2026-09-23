@@ -1,7 +1,7 @@
 ---
 id: '007'
 title: 'Minimal flash op: pyOCD flash by UID, flash-triggered re-probe'
-status: in-progress
+status: done
 use-cases:
 - SUC-003
 depends-on:
