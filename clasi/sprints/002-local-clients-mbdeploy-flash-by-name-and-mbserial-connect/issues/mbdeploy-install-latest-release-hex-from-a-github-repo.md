@@ -1,6 +1,10 @@
 ---
-status: pending
+status: in-progress
 sprint: '002'
+tickets:
+- 002-006
+- 002-007
+- 002-010
 ---
 
 # mbdeploy: flash the latest release hex straight from a GitHub repo

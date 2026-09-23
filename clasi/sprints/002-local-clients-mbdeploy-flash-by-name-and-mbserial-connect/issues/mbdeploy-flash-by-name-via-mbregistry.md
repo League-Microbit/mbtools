@@ -1,8 +1,17 @@
 ---
-status: pending
+status: in-progress
 split_into:
 - mbdeploy-flash-by-name-remote.md
 sprint: '002'
+tickets:
+- 002-001
+- 002-002
+- 002-003
+- 002-004
+- 002-005
+- 002-007
+- 002-008
+- 002-010
 ---
 # mbdeploy: flash a micro:bit by name through mbregistry (local)
 
