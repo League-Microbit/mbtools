@@ -1,7 +1,7 @@
 ---
 id: '002'
 title: 'Identity: announcement probe and both-dialect parser'
-status: in-progress
+status: done
 use-cases:
 - SUC-001
 - SUC-003
