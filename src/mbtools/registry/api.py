@@ -113,7 +113,13 @@ from mbtools.common import (
     CODE_NOT_LOCKED,
 )
 from mbtools.registry.flash import FlashOp, HexValidationError
-from mbtools.registry.locks import KIND_FLASH, LOCK_KINDS, LockHeldError, LockManager
+from mbtools.registry.locks import (
+    KIND_FLASH,
+    LOCK_KINDS,
+    HolderRef,
+    LockHeldError,
+    LockManager,
+)
 from mbtools.registry.store import DeviceRecord, Store
 
 __all__ = [
@@ -227,6 +233,19 @@ def _error(code: str, message: str, **extra: Any) -> dict[str, Any]:
     payload: dict[str, Any] = {"ok": False, "code": code, "error": message}
     payload.update(extra)
     return payload
+
+
+def _local_holder(pid: int) -> HolderRef:
+    """Build the :class:`~mbtools.registry.locks.HolderRef` for a local,
+    Unix-socket connection's own pid (ticket 002, sprint.md Decision 2) --
+    every ``lock``/``unlock``/``flash``/``mark_flashed`` op and the
+    connection-close release path construct one of these from the
+    ``SO_PEERCRED``/``LOCAL_PEERPID``-derived pid, never a client-supplied
+    value. ``ref`` mirrors ``pid`` as a string so :meth:`LockManager.release`
+    has a stable identity to match on for every origin, not just the ones
+    with a real pid.
+    """
+    return HolderRef(origin="local", ref=str(pid), pid=pid)
 
 
 class RegistryAPIServer:
@@ -407,9 +426,28 @@ class RegistryAPIServer:
         """
         while not self._stop_event.wait(self._sweep_interval_s):
             with self._lock:
-                released = self._locks.sweep(self._is_pid_alive_fn)
+                released = self._locks.sweep(self._is_holder_alive)
             if released:
                 logger.info("api: liveness sweep released locks for %s", released)
+
+    def _is_holder_alive(self, holder: HolderRef) -> bool:
+        """The ``is_alive`` callable :meth:`LockManager.sweep` needs,
+        adapted from this server's own pid-based ``is_pid_alive_fn``
+        (ticket 002, sprint.md Architecture point 4's "``api.py``" bullet).
+
+        Dispatches on ``holder.origin``: every lock this server's own
+        ``lock`` op grants is local (see :func:`_local_holder`), so only
+        the ``"local"`` branch is exercised in this ticket's scope. The
+        ``"remote"`` branch is unreachable code today -- nothing in this
+        ticket constructs a remote holder -- added defensively so ticket
+        006's ``registry.remote_api`` liveness path has a safe default to
+        fall through to rather than crashing on an unhandled origin; a
+        remote holder is reported alive (never locally swept) until that
+        ticket wires its own remote liveness check.
+        """
+        if holder.origin == "local":
+            return self._is_pid_alive_fn(holder.pid)
+        return True
 
     # -- connection handling ---------------------------------------------
 
@@ -437,8 +475,9 @@ class RegistryAPIServer:
             # the locks this connection acquired, never a blanket sweep
             # -- see the module docstring.
             with self._lock:
+                holder = _local_holder(pid)
                 for uid in list(acquired_uids):
-                    self._locks.release(uid, pid)
+                    self._locks.release(uid, holder)
             for f in (rfile, wfile):
                 try:
                     f.close()
@@ -527,7 +566,7 @@ class RegistryAPIServer:
             if record is None:
                 return _error(CODE_NOT_FOUND, f"no such device: {token!r}")
             try:
-                self._locks.acquire(record.uid, kind, pid)
+                self._locks.acquire(record.uid, kind, _local_holder(pid))
             except LockHeldError as exc:
                 return _error(
                     CODE_LOCKED,
@@ -547,7 +586,7 @@ class RegistryAPIServer:
             record = self._store.find(str(token))
             if record is None:
                 return _error(CODE_NOT_FOUND, f"no such device: {token!r}")
-            released = self._locks.release(record.uid, pid)
+            released = self._locks.release(record.uid, _local_holder(pid))
             acquired_uids.discard(record.uid)
             return {"ok": True, "released": released}
 
@@ -630,7 +669,7 @@ class RegistryAPIServer:
             # flash never ran -- release the lock this connection is
             # still holding.
             with self._lock:
-                self._locks.release(uid, pid)
+                self._locks.release(uid, _local_holder(pid))
                 acquired_uids.discard(uid)
             return {
                 "type": "result",
@@ -646,7 +685,7 @@ class RegistryAPIServer:
         # lock. This release is what daemon's flash-triggered re-probe
         # hook is watching for.
         with self._lock:
-            self._locks.release(uid, pid)
+            self._locks.release(uid, _local_holder(pid))
             acquired_uids.discard(uid)
         return {
             "type": "result",

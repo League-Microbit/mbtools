@@ -40,7 +40,7 @@ from mbtools.registry import cli as registry_cli_mod
 from mbtools.registry.api import RegistryAPIServer
 from mbtools.registry.flash import FlashOp
 from mbtools.registry.identity import ProbeResult
-from mbtools.registry.locks import KIND_DEBUG, KIND_FLASH, LockManager
+from mbtools.registry.locks import KIND_DEBUG, KIND_FLASH, HolderRef, LockManager
 from mbtools.registry.store import Store
 
 VID_PID = "0d28:0204"
@@ -49,6 +49,13 @@ VID_PID = "0d28:0204"
 def _uid(tag: str) -> str:
     unique = (tag * 4)[:16]
     return "9900" + "0000" + "11112222" + unique + "77778888" + "6e052820"
+
+
+def _local_holder(pid: int) -> HolderRef:
+    """Mirrors api.py's own ``_local_holder`` construction (ticket 002)
+    for tests that acquire directly against ``LockManager``, bypassing
+    the wire protocol."""
+    return HolderRef(origin="local", ref=str(pid), pid=pid)
 
 
 def _unexpected(*args, **kwargs):
@@ -129,7 +136,7 @@ def test_mbdeploy_list_table_identical_to_mbregistry_list(
     _seed_device(store, uid_free, device_name="vevov")
     uid_locked = _uid("locked22")
     _seed_device(store, uid_locked, device_name="getez", role="RADIOBRIDGE")
-    locks.acquire(uid_locked, KIND_FLASH, 4821)
+    locks.acquire(uid_locked, KIND_FLASH, _local_holder(4821))
 
     with pytest.raises(SystemExit) as info:
         cli_mod.main(["list", "--socket", str(server.socket_path)])
@@ -346,7 +353,7 @@ def test_debug_against_already_locked_device_fails_fast_no_retry(
 ):
     uid = _uid("dbglock1")
     _seed_device(store, uid, device_name="tovez")
-    locks.acquire(uid, KIND_FLASH, 9911)
+    locks.acquire(uid, KIND_FLASH, _local_holder(9911))
 
     monkeypatch.setattr(cli_mod, "_run_pyocd", _unexpected)
 

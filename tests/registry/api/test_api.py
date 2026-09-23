@@ -34,7 +34,7 @@ from mbtools.common import (
 from mbtools.registry.api import RegistryAPIServer, default_peer_pid
 from mbtools.registry.flash import FlashOp
 from mbtools.registry.identity import ProbeResult
-from mbtools.registry.locks import KIND_FLASH, KIND_SERIAL, LockManager
+from mbtools.registry.locks import KIND_FLASH, KIND_SERIAL, HolderRef, LockManager
 from mbtools.registry.store import Store
 
 UID = "9900" + "0000" + "11112222" + "3333444455556666" + "77778888" + "6e052820"
@@ -42,6 +42,13 @@ UID2 = "aa11" + "0000" + "11112222" + "3333444455556666" + "77778888" + "6e05282
 VID_PID = "0d28:0204"
 PID_A = 1001
 PID_B = 1002
+
+
+def _local_holder(pid: int) -> HolderRef:
+    """Mirrors api.py's own ``_local_holder`` construction (ticket 002)
+    for tests that reach directly into ``LockManager`` to set up a
+    pre-existing lock, bypassing the wire protocol."""
+    return HolderRef(origin="local", ref=str(pid), pid=pid)
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +273,7 @@ def test_stop_joins_connection_handler_threads_before_returning(make_server):
 
 def test_list_includes_every_device_with_lock_status_folded_in(make_server, locks):
     srv = make_server(peer_pid_fn=_sequential_peer_pid_fn([PID_A]))
-    locks.acquire(UID, KIND_SERIAL, PID_A)
+    locks.acquire(UID, KIND_SERIAL, _local_holder(PID_A))
     client = _Client(srv.socket_path)
 
     resp = client.request({"op": "list"})
@@ -431,7 +438,7 @@ def test_flash_without_flash_lock_is_refused(make_server, tmp_path):
 
 def test_flash_requires_the_lock_be_held_by_this_connections_own_pid(make_server, locks, tmp_path):
     srv = make_server(peer_pid_fn=_sequential_peer_pid_fn([PID_B]))
-    locks.acquire(UID, KIND_FLASH, PID_A)  # some other connection holds it
+    locks.acquire(UID, KIND_FLASH, _local_holder(PID_A))  # some other connection holds it
     client = _Client(srv.socket_path)  # gets PID_B, not PID_A
     hex_path = _valid_hex_path(tmp_path)
 
@@ -540,7 +547,7 @@ def test_mark_flashed_without_flash_lock_is_refused(make_server, store):
 
 def test_mark_flashed_held_by_a_different_connection_is_refused(make_server, locks, store):
     srv = make_server(peer_pid_fn=_sequential_peer_pid_fn([PID_B]))
-    locks.acquire(UID, KIND_FLASH, PID_A)  # some other connection holds it
+    locks.acquire(UID, KIND_FLASH, _local_holder(PID_A))  # some other connection holds it
     client = _Client(srv.socket_path)  # gets PID_B, not PID_A
 
     resp = client.request({"op": "mark_flashed", "uid": UID})

@@ -34,11 +34,15 @@ reused here rather than inventing a new one) instead of waiting forever.
 
 **Detach handling**: a uid that drops out of a scan has any lock it holds
 force-released (a detach is not a graceful release — UC-002's
-postcondition "any lock is released") by reading the current holder's pid
-off :meth:`LockManager.status` and passing it back to
-:meth:`LockManager.release` — legitimate because this is the daemon's own
-privileged bookkeeping, not a client-supplied pid a caller could use to
-steal someone else's lock. The record is then marked ``disconnected``.
+postcondition "any lock is released") by reading the current holder's
+:class:`~mbtools.registry.locks.HolderRef` off :meth:`LockManager.status`
+and passing it back to :meth:`LockManager.release` — legitimate because
+this is the daemon's own privileged bookkeeping, not a client-supplied
+identity a caller could use to steal someone else's lock. Every local
+caller only ever holds local (PID-tied) locks in this ticket's scope, so
+this is unchanged in effect from the pre-ticket-002 pid-based release;
+it is now holder-generalized only because :meth:`LockManager.release`'s
+signature is. The record is then marked ``disconnected``.
 Flash-pending tracking is left untouched across a detach — the very next
 scan that sees the uid reattach clears it (see above); the ticket's
 "detach-vs-flash disambiguation" is, concretely, that an ordinary detach
@@ -233,9 +237,9 @@ class Daemon:
                     )
 
             for uid in previously_attached - current.keys():
-                holder = self.locks.status(uid)
-                if holder is not None:
-                    self.locks.release(uid, holder.pid)
+                status = self.locks.status(uid)
+                if status is not None:
+                    self.locks.release(uid, status.holder)
                 self._store.mark_disconnected(uid)
 
             for uid, deadline in list(self._flash_pending.items()):

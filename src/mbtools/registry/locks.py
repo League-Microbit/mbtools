@@ -1,30 +1,41 @@
-"""mbtools.registry.locks — PID-tied exclusive lock manager, kind-tagged.
+"""mbtools.registry.locks — exclusive lock manager, kind-tagged, holder
+identity generalized to local (PID-tied) or remote (session-tied).
 
 Per sprint.md's Architecture (module "locks") and Design Rationale
 ("locks are in-memory only, never persisted to the SQLite store"), this
-is a pure, in-memory table of ``uid -> (holder pid, kind)`` plus a
-liveness sweep -- no I/O, no socket. Holder identity comes in as a plain
-``pid: int`` parameter; the real ``SO_PEERCRED`` extraction that turns a
-socket connection into a PID is the API module's job (ticket 008), which
-calls into this module with the PID it extracted. That boundary is what
+is a pure, in-memory table of ``uid -> (holder, kind)`` plus a liveness
+sweep -- no I/O, no socket. Holder identity comes in as a
+:class:`HolderRef` (ticket 002, sprint.md Decision 2), which names
+either a local, PID-tied caller or a remote, session-tied one -- "a PID
+means nothing across hosts" (brief open decision #3) is why a remote
+holder can't just be another ``int``. Constructing the ``HolderRef`` for
+a real local connection is the API module's job (ticket 008: it derives
+one from the ``SO_PEERCRED``/``LOCAL_PEERPID`` pid it extracts); ticket
+006's ``registry.remote_api`` will construct the remote-origin
+equivalent, session-tied rather than PID-tied. That boundary is what
 makes this module testable without any real process or socket -- except
 for the one integration test in ``tests/registry/locks/test_locks.py``
 that deliberately *does* use a real subprocess, to prove the injectable
 ``is_pid_alive`` seam matches real OS behavior, not just its own fakes.
 
-A lock is exclusive per device uid, regardless of kind: a ``serial``
-lock and a ``flash`` lock cannot coexist on the same uid -- kind is
-metadata for listings (SUC-005/UC-006's "locked for flash by pid 4821"),
-not a separate lock namespace. Release happens two ways per sprint.md's
-ASSUMPTION ("the lock releases when the PID dies *or* the connection
-closes" -- kept as separate triggers because a leaked fd across a fork
-could keep a connection open after its original process exits, or vice
-versa): explicit :meth:`LockManager.release` (checked against the
-current holder, so a non-holder can't steal or grief a lock), and
-:meth:`LockManager.sweep`, a liveness check driven by an injected
-``is_pid_alive`` callable. Both are mechanism only -- wiring ``sweep()``
-to a timer or a connection-close event is ``daemon``'s job (ticket 006)
-or ``api``'s (ticket 008), not this module's.
+A lock is exclusive per device uid, regardless of kind or holder origin:
+a ``serial`` lock and a ``flash`` lock cannot coexist on the same uid,
+and a local and a remote holder cannot both hold a lock on the same uid
+at once -- kind is metadata for listings (SUC-005/UC-006's "locked for
+flash by pid 4821"), not a separate lock namespace, and origin is
+holder-identity metadata, not a second lock table (Decision 2's whole
+point: one table, one acquire path, so exclusivity stays provably
+correct across both local and remote callers). Release happens two ways
+per sprint.md's ASSUMPTION ("the lock releases when the PID dies *or*
+the connection closes" -- kept as separate triggers because a leaked fd
+across a fork could keep a connection open after its original process
+exits, or vice versa): explicit :meth:`LockManager.release` (checked
+against the current holder by full :class:`HolderRef` equality, so a
+non-holder can't steal or grief a lock), and :meth:`LockManager.sweep`,
+a liveness check driven by an injected ``is_alive`` callable. Both are
+mechanism only -- wiring ``sweep()`` to a timer or a connection-close
+event is ``daemon``'s job (ticket 006) or ``api``'s (ticket 008), not
+this module's.
 
 A ``flash``-kind lock's release is also the daemon's re-probe trigger
 (per Design Rationale, "a flash-kind lock's release is the re-probe
@@ -44,6 +55,7 @@ __all__ = [
     "LockManager",
     "LockStatus",
     "LockHeldError",
+    "HolderRef",
     "KIND_SERIAL",
     "KIND_RELAY",
     "KIND_FLASH",
@@ -61,6 +73,35 @@ LOCK_KINDS = (KIND_SERIAL, KIND_RELAY, KIND_FLASH, KIND_DEBUG)
 
 
 @dataclass(frozen=True)
+class HolderRef:
+    """Identifies a lock holder -- either a local, PID-tied client or a
+    remote, session-tied one (ticket 002, sprint.md Decision 2).
+
+    ``origin`` is ``"local"`` or ``"remote"``. A local holder is
+    constructed by ``api.py`` from the ``SO_PEERCRED``/``LOCAL_PEERPID``
+    pid it reads off the connection: ``HolderRef(origin="local",
+    ref=str(pid), pid=pid)`` -- ``ref`` duplicates ``pid`` as a string so
+    every origin has a stable, hashable-by-equality identity to match on
+    (see :meth:`LockManager.release`), not just the origins that happen
+    to have a pid. A remote holder (ticket 006's ``registry.remote_api``,
+    not constructed anywhere in this ticket's scope) is constructed as
+    ``HolderRef(origin="remote", ref=session_id, host=peer_display_host)``
+    -- ``pid`` stays ``None`` since "a PID means nothing across hosts"
+    (brief open decision #3).
+
+    Frozen and equality-comparable (the dataclass default) so
+    :meth:`LockManager.release` can match a caller-supplied ``HolderRef``
+    against the stored one field-for-field, rather than trusting just one
+    field the way the pre-ticket-002 bare-``pid`` design did.
+    """
+
+    origin: str
+    ref: str
+    pid: int | None = None
+    host: str | None = None
+
+
+@dataclass(frozen=True)
 class LockStatus:
     """A device's current lock holder -- what kind of lock, held by whom.
 
@@ -68,10 +109,21 @@ class LockStatus:
     carried by :class:`LockHeldError` on a failed acquire, so a caller
     (the API, ticket 008) can build UC-006's "locked for flash by pid
     4821" message from either path without a second lookup.
+
+    ``holder`` (a :class:`HolderRef`) is the source of truth; ``pid`` is
+    a read-only convenience property over ``holder.pid`` (``None`` for a
+    remote holder) kept so the local-only call sites that only ever cared
+    about a bare pid -- ``daemon.py``, ``api.py``'s wire-protocol dict,
+    and every pre-ticket-002 test -- don't all need to learn about
+    :class:`HolderRef` just to read it back out.
     """
 
     kind: str
-    pid: int
+    holder: HolderRef
+
+    @property
+    def pid(self) -> int | None:
+        return self.holder.pid
 
 
 class LockHeldError(Exception):
@@ -86,14 +138,32 @@ class LockHeldError(Exception):
     first. :meth:`LockManager.acquire` uses this exception consistently:
     it never returns ``False``, only ``True`` on success or this
     exception on conflict.
+
+    ``holder`` is unchanged in shape from before ticket 002 -- still a
+    :class:`LockStatus`, still exposing ``.kind``/``.pid`` for every
+    existing caller -- plus, via that same ``LockStatus``, the new
+    ``.holder`` (a :class:`HolderRef`) for a caller that needs the full
+    identity (host, origin) rather than just the pid.
     """
 
     def __init__(self, uid: str, holder: LockStatus) -> None:
         self.uid = uid
         self.holder = holder
         super().__init__(
-            f"{uid} already locked for {holder.kind} by pid {holder.pid}"
+            f"{uid} already locked for {holder.kind} by {_describe_holder(holder.holder)}"
         )
+
+
+def _describe_holder(holder: HolderRef) -> str:
+    """Human-readable holder description for :class:`LockHeldError`'s
+    message -- ``"pid 4821"`` for a local holder (unchanged from
+    pre-ticket-002 wording, since that's still the only origin any
+    caller constructs today) and ``"session <ref> on <host>"`` for a
+    remote one.
+    """
+    if holder.origin == "local":
+        return f"pid {holder.pid}"
+    return f"session {holder.ref} on {holder.host}"
 
 
 class LockManager:
@@ -114,52 +184,59 @@ class LockManager:
         self._locks: dict[str, LockStatus] = {}
         self._flash_release_callback = flash_release_callback
 
-    def acquire(self, uid: str, kind: str, pid: int) -> bool:
-        """Grant an exclusive lock of ``kind`` on ``uid`` to ``pid``.
+    def acquire(self, uid: str, kind: str, holder: HolderRef) -> bool:
+        """Grant an exclusive lock of ``kind`` on ``uid`` to ``holder``.
 
         Returns ``True`` if ``uid`` was unlocked and the lock is now
-        held by ``pid``. Raises :class:`LockHeldError` (never returns
+        held by ``holder``. Raises :class:`LockHeldError` (never returns
         ``False`` -- see the exception's own docstring for why) if
-        ``uid`` is already locked by a different holder. State is left
+        ``uid`` is already locked by a different holder -- local or
+        remote, checked against the single lock table regardless of
+        origin (Decision 2: one table is what makes a local and a remote
+        request mutually exclusive on the same uid). State is left
         untouched on failure: the existing holder keeps its lock.
         """
         current = self._locks.get(uid)
         if current is not None:
             raise LockHeldError(uid, current)
-        self._locks[uid] = LockStatus(kind=kind, pid=pid)
+        self._locks[uid] = LockStatus(kind=kind, holder=holder)
         return True
 
-    def release(self, uid: str, pid: int) -> bool:
-        """Release ``uid``'s lock, but only if ``pid`` matches the
-        current holder.
+    def release(self, uid: str, holder: HolderRef) -> bool:
+        """Release ``uid``'s lock, but only if ``holder`` matches the
+        current holder by full :class:`HolderRef` equality.
 
         A no-op (not an error) if ``uid`` is unlocked or held by a
-        different pid -- per the ticket's "not an error that could be
+        different holder -- per the ticket's "not an error that could be
         used to steal a lock" requirement. Returns whether a release
         actually happened. The flash-release callback (when ``uid`` held
         a ``flash``-kind lock) only fires on an actual release, never on
         the no-op path.
         """
         current = self._locks.get(uid)
-        if current is None or current.pid != pid:
+        if current is None or current.holder != holder:
             return False
         self._release(uid, current)
         return True
 
-    def sweep(self, is_pid_alive: Callable[[int], bool]) -> list[str]:
-        """Release every lock whose holder pid ``is_pid_alive`` reports
-        as dead; leave live-holder locks untouched.
+    def sweep(self, is_alive: Callable[[HolderRef], bool]) -> list[str]:
+        """Release every lock whose holder ``is_alive`` reports as dead;
+        leave live-holder locks untouched.
 
         Returns the uids that were released, for a caller that wants to
         log or react beyond the flash-release callback.
-        ``is_pid_alive`` is injected (see module docstring) so this can
-        be unit-tested with a fake liveness function and, separately,
+        ``is_alive`` is injected (see module docstring) so this can be
+        unit-tested with a fake liveness function and, separately,
         proven against a real one
         (``tests/registry/locks/test_locks.py``'s subprocess integration
-        test).
+        test). It receives the full :class:`HolderRef`, not just a pid,
+        so a caller (``api.py``, ticket 008) can dispatch on
+        ``holder.origin`` -- today only ``"local"`` holders ever exist,
+        so that dispatch is exercised, but the seam itself is
+        origin-agnostic ahead of ticket 006's remote liveness path.
         """
         dead_uids = [
-            uid for uid, holder in self._locks.items() if not is_pid_alive(holder.pid)
+            uid for uid, status in self._locks.items() if not is_alive(status.holder)
         ]
         for uid in dead_uids:
             self._release(uid, self._locks[uid])

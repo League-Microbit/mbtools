@@ -16,7 +16,7 @@ import pytest
 
 from mbtools.common import DAPLINK_VID_PID, PortInfo
 from mbtools.registry.daemon import Daemon
-from mbtools.registry.locks import KIND_FLASH, KIND_SERIAL
+from mbtools.registry.locks import KIND_FLASH, KIND_SERIAL, HolderRef
 from mbtools.registry.store import (
     STATE_ATTACHED_UNPROBED,
     STATE_CONNECTED,
@@ -34,6 +34,13 @@ ANNOUNCEMENT = "device NEZHA2 robot vevov 1198504156"
 
 def _port_info(uid: str = UID, port: str = "/dev/ttyACM0") -> PortInfo:
     return PortInfo(uid=uid, port=port, vid=VID, pid=PID_)
+
+
+def _local_holder(pid: int) -> HolderRef:
+    """Mirrors api.py's own ``_local_holder`` construction (ticket 002)
+    for tests that acquire/release directly against ``daemon.locks``,
+    bypassing the wire protocol."""
+    return HolderRef(origin="local", ref=str(pid), pid=pid)
 
 
 def _store_clock(start: float = 1000.0, step: float = 1.0):
@@ -140,7 +147,7 @@ def test_detach_releases_lock_and_marks_disconnected(store):
     daemon = _make_daemon(usbwatch, store, script)
 
     daemon.run_once()  # attach + probe
-    assert daemon.locks.acquire(UID, KIND_SERIAL, 555) is True
+    assert daemon.locks.acquire(UID, KIND_SERIAL, _local_holder(555)) is True
 
     daemon.run_once()  # detach
 
@@ -190,8 +197,8 @@ def test_flash_lock_release_triggers_exactly_one_reprobe_on_reenumeration(store)
     daemon.run_once()  # attach + probe #1
     assert script.calls == 1
 
-    assert daemon.locks.acquire(UID, KIND_FLASH, 777) is True
-    assert daemon.locks.release(UID, 777) is True  # fires flash-release hook
+    assert daemon.locks.acquire(UID, KIND_FLASH, _local_holder(777)) is True
+    assert daemon.locks.release(UID, _local_holder(777)) is True  # fires flash-release hook
 
     daemon.run_once()  # sees the drop (flash-induced reboot)
     assert store.get(UID).state == STATE_DISCONNECTED
@@ -217,8 +224,8 @@ def test_flash_reprobe_without_intervening_detach_still_reprobes(store):
     assert script.calls == 1
     assert store.needs_probe(UID) is False
 
-    daemon.locks.acquire(UID, KIND_FLASH, 777)
-    daemon.locks.release(UID, 777)
+    daemon.locks.acquire(UID, KIND_FLASH, _local_holder(777))
+    daemon.locks.release(UID, _local_holder(777))
 
     daemon.run_once()  # still attached the whole time -> re-probed anyway
 
@@ -241,8 +248,8 @@ def test_flash_reprobe_timeout_marks_no_firmware_without_reopening_port(store):
     daemon.run_once()  # attach + probe #1
     assert script.calls == 1
 
-    daemon.locks.acquire(UID, KIND_FLASH, 777)
-    daemon.locks.release(UID, 777)  # flash_pending[UID] = 0 + 5.0
+    daemon.locks.acquire(UID, KIND_FLASH, _local_holder(777))
+    daemon.locks.release(UID, _local_holder(777))  # flash_pending[UID] = 0 + 5.0
 
     daemon.run_once()  # detach seen; deadline not reached yet (t=0 < 5)
     assert store.get(UID).state == STATE_DISCONNECTED
@@ -263,8 +270,8 @@ def test_flash_reprobe_before_deadline_does_not_time_out(store):
     )
 
     daemon.run_once()
-    daemon.locks.acquire(UID, KIND_FLASH, 777)
-    daemon.locks.release(UID, 777)
+    daemon.locks.acquire(UID, KIND_FLASH, _local_holder(777))
+    daemon.locks.release(UID, _local_holder(777))
 
     clock.advance(1.0)
     daemon.run_once()  # detach; well within the 5s window
@@ -282,7 +289,7 @@ def test_locked_device_is_never_probed_until_unlocked(store):
     script = _ProbeScript([ANNOUNCEMENT])
     daemon = _make_daemon(usbwatch, store, script)
 
-    assert daemon.locks.acquire(UID, KIND_SERIAL, 999) is True
+    assert daemon.locks.acquire(UID, KIND_SERIAL, _local_holder(999)) is True
 
     daemon.run_once()
     daemon.run_once()
@@ -290,7 +297,7 @@ def test_locked_device_is_never_probed_until_unlocked(store):
     assert script.calls == 0
     assert store.get(UID).state == STATE_ATTACHED_UNPROBED
 
-    assert daemon.locks.release(UID, 999) is True
+    assert daemon.locks.release(UID, _local_holder(999)) is True
     daemon.run_once()
 
     assert script.calls == 1
@@ -326,7 +333,7 @@ def test_locked_device_does_not_block_probing_other_devices(store):
     script = _ProbeScript([ANNOUNCEMENT])
     daemon = _make_daemon(usbwatch, store, script)
 
-    daemon.locks.acquire(UID, KIND_SERIAL, 999)
+    daemon.locks.acquire(UID, KIND_SERIAL, _local_holder(999))
 
     daemon.run_once()
 

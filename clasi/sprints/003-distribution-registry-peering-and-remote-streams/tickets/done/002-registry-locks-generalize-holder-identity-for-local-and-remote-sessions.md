@@ -1,8 +1,10 @@
 ---
 id: '002'
 title: 'registry.locks: generalize holder identity for local and remote sessions'
-status: open
-use-cases: [SUC-003, SUC-004]
+status: done
+use-cases:
+- SUC-003
+- SUC-004
 depends-on: []
 github-issue: ''
 issue: mbregistry-peering-mdns-and-zeromq.md
@@ -32,27 +34,27 @@ new capability's first real consumer.
 
 ## Acceptance Criteria
 
-- [ ] New frozen dataclass `HolderRef(origin: str, ref: str, pid: int |
+- [x] New frozen dataclass `HolderRef(origin: str, ref: str, pid: int |
       None = None, host: str | None = None)` in `locks.py`, exported from
       `__all__`. `origin` is `"local"` or `"remote"`.
-- [ ] `LockStatus.pid: int` is replaced by `LockStatus.holder: HolderRef`.
+- [x] `LockStatus.pid: int` is replaced by `LockStatus.holder: HolderRef`.
       A convenience `LockStatus.pid` property may be kept, returning
       `holder.pid` (may be `None` for a remote holder), so the smallest
       possible set of downstream call sites need updating beyond what
       this ticket touches directly — but the true source of truth is
       `holder`.
-- [ ] `LockManager.acquire(uid, kind, holder: HolderRef)`,
+- [x] `LockManager.acquire(uid, kind, holder: HolderRef)`,
       `.release(uid, holder: HolderRef)` (matches on full `HolderRef`
       equality, not just `pid`), and `.sweep(is_alive: Callable[[HolderRef],
       bool])` are updated accordingly. `LockHeldError` carries the
       existing holder's `LockStatus` unchanged in shape (still exposes
       `.kind`/`.pid` for today's callers, plus the new `.holder`).
-- [ ] `daemon.py`: the one place that force-releases a detached device's
+- [x] `daemon.py`: the one place that force-releases a detached device's
       lock (`run_once`) and the flash-release-callback wiring are updated
       to read/pass `HolderRef` instead of a bare pid — no behavior
       change, since every local caller still only ever holds local
       (PID-based) locks in this ticket's scope.
-- [ ] `api.py`: every `lock`/`unlock`/`flash`/`mark_flashed` op
+- [x] `api.py`: every `lock`/`unlock`/`flash`/`mark_flashed` op
       constructs `HolderRef(origin="local", ref=str(pid), pid=pid)` from
       the existing `SO_PEERCRED`/`LOCAL_PEERPID`-derived pid, and the
       sweep loop's `is_pid_alive_fn` is adapted into an `is_alive`
@@ -61,12 +63,12 @@ new capability's first real consumer.
       existing `is_pid_alive_fn(holder.pid)`; a `"remote"` origin is
       unreachable code in this ticket, since nothing constructs one yet
       — added defensively for ticket 006, not exercised until then).
-- [ ] The wire-protocol `holder` dict in a `locked`/`not_locked` response
+- [x] The wire-protocol `holder` dict in a `locked`/`not_locked` response
       (`api.py`'s `_error(..., holder={"kind":..., "pid":...})`) is
       unchanged in shape for a local holder — this is a purely internal
       refactor, not a protocol change, for every existing Unix-socket
       caller.
-- [ ] Every existing test in `tests/registry/locks/` and every test in
+- [x] Every existing test in `tests/registry/locks/` and every test in
       `tests/registry/api/`/`tests/registry/daemon/` that touches locking
       passes unchanged (adjusted only for the `LockStatus.pid` ->
       `.holder.pid` internals where a test reaches into that field
