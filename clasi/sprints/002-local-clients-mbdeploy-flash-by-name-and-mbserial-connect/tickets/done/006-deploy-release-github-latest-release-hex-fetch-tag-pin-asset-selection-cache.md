@@ -2,7 +2,7 @@
 id: '006'
 title: 'deploy.release: GitHub latest-release hex fetch, tag pin, asset selection,
   cache'
-status: in-progress
+status: done
 use-cases:
 - SUC-002
 depends-on: []
