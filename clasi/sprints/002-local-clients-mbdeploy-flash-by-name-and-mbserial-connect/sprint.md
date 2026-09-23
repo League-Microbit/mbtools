@@ -7,6 +7,7 @@ use-cases: []
 issues:
 - mbdeploy-flash-by-name-via-mbregistry.md
 - mbserial-raw-serial-access-local-or-remote.md
+- mbdeploy-install-latest-release-hex-from-a-github-repo.md
 ---
 <!-- CLASI: Before changing code or making plans, review the SE process in CLAUDE.md -->
 

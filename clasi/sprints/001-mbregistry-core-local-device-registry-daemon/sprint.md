@@ -13,6 +13,7 @@ use-cases:
 - SUC-007
 issues:
 - mbregistry-device-registry-daemon.md
+- hardware-acceptance-testing-on-nolanet-and-braeburn.md
 ---
 <!-- CLASI: Before changing code or making plans, review the SE process in CLAUDE.md -->
 
@@ -152,6 +153,13 @@ its tests.
 - Full suite runs once, at `close_sprint`, per `.claude/rules/source-
   code.md`; each ticket's own test run is scoped to the module(s) it
   touches.
+- **Real-hardware acceptance is a separate, later ticket, not a CI
+  gate.** Ticket 010 runs the sprint's one real-hardware acceptance pass
+  — on the dedicated Nolanet/braeburn test hosts (`CLAUDE.md`, "Hardware
+  test targets") — after ticket 009, retiring the old `mbdeploy` daemon
+  on the Nolanet nodes and recording results in
+  `docs/acceptance/001-hardware.md`. No ticket 001-009 depends on it or
+  on real hardware to pass.
 
 ## Architecture
 
@@ -606,5 +614,6 @@ Before tickets can be created, all of the following must be true:
 | 007 | Minimal flash op: pyOCD flash by UID, flash-triggered re-probe | 005, 006 |
 | 008 | Query/control API: Unix socket protocol, `SO_PEERCRED` wiring | 004, 005, 006, 007 |
 | 009 | CLI (`mbregistry list`/`run`/`install-service`) and systemd unit | 008 |
+| 010 | Hardware acceptance on Nolanet and braeburn | 009 |
 
 Tickets execute serially in the order listed.
