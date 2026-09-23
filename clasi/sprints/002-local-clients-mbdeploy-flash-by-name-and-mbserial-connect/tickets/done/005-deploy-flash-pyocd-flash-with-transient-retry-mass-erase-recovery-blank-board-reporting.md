@@ -2,8 +2,9 @@
 id: '005'
 title: 'deploy.flash: pyOCD flash with transient retry, mass-erase recovery, blank-board
   reporting'
-status: open
-use-cases: [UC-008]
+status: done
+use-cases:
+- UC-008
 depends-on: []
 github-issue: ''
 issue: mbdeploy-flash-by-name-via-mbregistry.md
@@ -55,25 +56,25 @@ registry dependency — can be built in parallel with any of them.
 
 ## Acceptance Criteria
 
-- [ ] `flash_hex()`'s behavior matches today's `mbdeploy`'s `flash.py`
+- [x] `flash_hex()`'s behavior matches today's `mbdeploy`'s `flash.py`
       exactly: transient-signature retry (exactly once), locked-signature
       mass-erase-then-retry (exactly once), unrecognized-failure fails
       without erasing, explicit blank-board report when a post-erase
       reflash still fails.
-- [ ] `_validate_hex` runs before any pyocd subprocess is constructed —
+- [x] `_validate_hex` runs before any pyocd subprocess is constructed —
       a missing/unreadable/malformed hex file fails with a clear message
       before touching a board.
-- [ ] Every pyocd invocation's output streams through the `log` callback
+- [x] Every pyocd invocation's output streams through the `log` callback
       as it arrives (not buffered until the process exits) — this is
       what let `mbdeploy`'s existing remote streaming stay within its
       client-side read timeout during a real multi-second flash
       (`mbdeploy`'s own ticket 010 finding); this sprint's local-only
       `mbdeploy` still benefits from live progress in its own terminal.
-- [ ] The pyOCD invocation shape (`[sys.executable, "-m", "pyocd"]`, not
+- [x] The pyOCD invocation shape (`[sys.executable, "-m", "pyocd"]`, not
       a bare PATH lookup) matches sprint 001's `registry.flash`'s own
       precedent, for the same reason (an isolated venv may not put
       pyocd's console script on PATH).
-- [ ] No test in this ticket shells out to a real `pyocd` binary — the
+- [x] No test in this ticket shells out to a real `pyocd` binary — the
       subprocess runner is injectable, same pattern as sprint 001's
       `registry.flash.Runner`.
 
