@@ -210,6 +210,32 @@ def make_server(socket_dir, store, locks):
 
 
 # ---------------------------------------------------------------------------
+# lifecycle -- socket creation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file mode bits only")
+def test_start_makes_the_socket_connectable_by_non_owning_users(make_server):
+    """Regression test for a bug ticket 010's real-hardware pass found:
+    production's ``mbregistry.service`` runs as root (no ``User=`` --
+    see ``cli.render_systemd_unit``), and binding an ``AF_UNIX`` socket
+    under root's default umask produced mode ``0o755`` -- readable but
+    not *writable*. Unix-domain ``connect()`` requires write permission
+    on the socket inode, so plain ``mbregistry list`` run as an
+    unprivileged user (exactly what this project's own acceptance
+    criteria call for -- no ``sudo`` in sight) failed with
+    ``PermissionError`` on every one of the four Nolanet nodes, until
+    :meth:`RegistryAPIServer.start` was fixed to ``chmod`` the socket to
+    ``0o666`` after binding. Asserts the permission bits directly rather
+    than re-deriving "can a different uid connect", which isn't
+    reproducible in a single-user test process.
+    """
+    srv = make_server()
+    mode = os.stat(srv.socket_path).st_mode
+    assert mode & 0o777 == 0o666
+
+
+# ---------------------------------------------------------------------------
 # list / get / find
 # ---------------------------------------------------------------------------
 

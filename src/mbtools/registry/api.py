@@ -285,12 +285,31 @@ class RegistryAPIServer:
     def start(self) -> None:
         """Bind the socket and start accepting connections plus the
         periodic sweep, both on background threads. Returns immediately.
+
+        Explicitly ``chmod``s the socket to ``0o666`` after binding.
+        Found on ticket 010's real-hardware pass: the production daemon
+        (systemd's ``mbregistry.service``, no ``User=``, so it runs as
+        root -- see ``cli.render_systemd_unit``) binds this socket under
+        root's default umask, which produces mode ``0o755`` --
+        readable/executable but not *writable* by anyone but the owner.
+        Unix-domain ``connect()`` requires write permission on the
+        socket inode, so every non-root invocation of ``mbregistry
+        list`` (this module's own docstring: "other programs consult it
+        through a service" -- with no mention that they must be root)
+        failed with ``PermissionError: [Errno 13] Permission denied``
+        before this fix, on every one of ticket 010's four Nolanet
+        nodes. The API has no authentication beyond per-connection
+        ``SO_PEERCRED`` pid tracking for lock ownership (ticket 008) --
+        it was never designed to restrict which local users can
+        connect, only which pid holds which lock -- so world-writable
+        matches its actual security model rather than narrowing it.
         """
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
         if self.socket_path.exists():
             self.socket_path.unlink()
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._sock.bind(str(self.socket_path))
+        os.chmod(self.socket_path, 0o666)
         self._sock.listen(_ACCEPT_BACKLOG)
         self._stop_event.clear()
 

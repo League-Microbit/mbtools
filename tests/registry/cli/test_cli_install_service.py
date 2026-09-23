@@ -7,6 +7,7 @@ manual verification on a spare board is a follow-up, not exercised here.
 
 from __future__ import annotations
 
+import subprocess
 import sys
 
 import pytest
@@ -68,3 +69,32 @@ def test_install_service_creates_parent_directories(tmp_path):
 
     assert excinfo.value.code == EXIT_OK
     assert output.exists()
+
+
+def test_module_invocation_shape_that_the_rendered_unit_s_execstart_uses_actually_runs():
+    """Regression test for a bug ticket 010's real-hardware pass found:
+    ``render_systemd_unit()``'s ``ExecStart=`` (and this module's own
+    docstring) both document ``{python} -m mbtools.registry.cli run`` as
+    the production entry point -- but ``cli.py`` had no
+    ``if __name__ == "__main__":`` guard, so that exact invocation shape
+    only imported the module and exited 0 *without ever calling
+    ``main()``*. Every other test in this suite drives ``cli.main()`` or
+    the ``mbregistry`` console script (``pyproject.toml``'s
+    ``[project.scripts]``, which calls ``main()`` directly) -- neither
+    exercises ``python -m ...``, so nothing caught this until a real
+    systemd unit's ``ExecStart=`` silently did nothing on ``meili``.
+
+    Runs the real module as a subprocess (the only way to reproduce
+    "invoked via ``-m``" faithfully -- an in-process import can't
+    simulate ``__name__ == "__main__"``) and asserts ``--help`` actually
+    produces argparse's usage text, not a silent no-op exit(0).
+    """
+    result = subprocess.run(
+        [sys.executable, "-m", "mbtools.registry.cli", "--help"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0
+    assert "usage: mbregistry" in result.stdout
+    assert "install-service" in result.stdout

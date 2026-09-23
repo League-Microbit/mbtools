@@ -486,3 +486,17 @@ def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
     sys.exit(args.func(args))
+
+
+if __name__ == "__main__":
+    # Without this guard, `python -m mbtools.registry.cli ...` -- exactly
+    # what render_systemd_unit()'s ExecStart= invokes, and what this
+    # module's own docstring documents as the systemd entry point -- only
+    # imports the module and exits 0 without ever calling main(). Found
+    # on ticket 010's real-hardware pass: `mbregistry` (the console
+    # script, which calls main() directly per pyproject.toml's
+    # `[project.scripts]`) worked, and every automated test in this
+    # sprint drives `cli.main()` or the console script directly, so
+    # nothing before this ticket exercised the `-m` invocation path that
+    # production's systemd unit actually uses.
+    main()
