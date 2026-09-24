@@ -1,7 +1,7 @@
 ---
-id: '009'
+id: 009
 title: README usage section
-status: open
+status: in-progress
 use-cases:
 - SUC-005
 depends-on: []
@@ -58,24 +58,24 @@ for this repo).
 
 ## Acceptance Criteria
 
-- [ ] The stale "Status: early planning... Only `mbregistry` is under
+- [x] The stale "Status: early planning... Only `mbregistry` is under
       active development" text is removed/corrected.
-- [ ] A new "Usage" (or similarly named) section documents install and
+- [x] A new "Usage" (or similarly named) section documents install and
       the four programs' most common invocation each, matching the
       actual current CLI (`--repo`/`--hex` on `mbdeploy deploy`,
       `<robot>[@host]` on `mbrelay connect`, `--peer` on `mbregistry
       run`) — verified against `build_parser()` in each program's
       `cli.py`, not guessed.
-- [ ] The peering/`--peer`/`@host` behavior is explained in at least one
+- [x] The peering/`--peer`/`@host` behavior is explained in at least one
       sentence, since it's the one piece of behavior a new user
       wouldn't discover from `--help` alone (it spans multiple
       programs).
-- [ ] The listening-ports list matches the actual current defaults in
+- [x] The listening-ports list matches the actual current defaults in
       `registry/cli.py`/`registry/console_compat/relay_pool.py` (7440,
       7442, 7443, 7444, 7445) — no invented or stale port numbers.
-- [ ] No hostname, IP address, or per-node filesystem path appears
+- [x] No hostname, IP address, or per-node filesystem path appears
       anywhere in the new section (public-repo constraint).
-- [ ] The existing program table and "Development" section remain
+- [x] The existing program table and "Development" section remain
       intact.
 
 ## Testing
