@@ -1,7 +1,7 @@
 ---
 id: '011'
 title: 'registry.remote_client: typed TCP client library for mbdeploy/mbserial'
-status: in-progress
+status: done
 use-cases:
 - SUC-003
 - SUC-004
