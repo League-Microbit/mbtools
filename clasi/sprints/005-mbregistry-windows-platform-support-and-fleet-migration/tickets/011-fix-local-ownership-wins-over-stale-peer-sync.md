@@ -1,7 +1,7 @@
 ---
 id: '011'
 title: 'Fix: local ownership wins over stale peer sync'
-status: open
+status: in-progress
 use-cases: []
 depends-on: []
 github-issue: ''
@@ -140,21 +140,21 @@ column.
 
 ## Acceptance Criteria
 
-- [ ] A remote upsert (snapshot or event) never overwrites a row that is
+- [x] A remote upsert (snapshot or event) never overwrites a row that is
       currently locally-owned (`host IS NULL`) and connected — it is
       logged and dropped instead (fix point 1).
-- [ ] Snapshots (`snapshot_local_devices`) and live attach/identity
+- [x] Snapshots (`snapshot_local_devices`) and live attach/identity
       events (`publish_daemon_event`) never advertise a disconnected
       local row as an active claim of ownership (fix point 2).
-- [ ] A remote `attach` for a uid this host holds as local-but-disconnected
+- [x] A remote `attach` for a uid this host holds as local-but-disconnected
       transfers ownership to the remote host; when this host's own
       `usbwatch` subsequently reattaches the same uid locally, local
       ownership is restored (fix point 3).
-- [ ] New tests cover the `torture`/`hodr` scenario (local-connected
+- [x] New tests cover the `torture`/`hodr` scenario (local-connected
       resists a stale remote claim), the reverse move (remote-owned row
       returns to local on local reattach), and a ping-pong (local →
       remote → local) (fix point 4).
-- [ ] Existing databases (e.g. `torture`, `hodr`) end up with correct
+- [x] Existing databases (e.g. `torture`, `hodr`) end up with correct
       ownership after a daemon restart running the fix, with no manual
       DB editing or deletion (fix point 5) — traced and confirmed (or a
       minimal explicit recovery step added if tracing shows it's
@@ -192,3 +192,102 @@ column.
   described in Acceptance Criteria (relay pool lists its attached
   relays; `mbregistry list` on every host shows `host=torture` for
   them).
+
+## Implementation Notes
+
+**Fix point 1** (`Store._upsert_device`, `src/mbtools/registry/store.py`):
+added a new `elif` branch ahead of the existing `state == STATE_DISCONNECTED`
+branch — `host is not None and existing.host is None and existing.state !=
+STATE_DISCONNECTED` — that logs a warning and returns the existing record
+unchanged, rejecting the remote claim. Ordered before the `DISCONNECTED`
+branch so a genuine hand-over (existing row locally-owned but disconnected)
+still falls through to the unconditional update, unaffected.
+
+**Fix point 2**: `Store.snapshot_local_devices` now filters `WHERE host IS
+NULL AND state != 'disconnected'`. `PeerDiscovery.publish_daemon_event`
+(`src/mbtools/registry/peering.py`) now returns early (no publish) for an
+`EVENT_ATTACH`/`EVENT_IDENTITY` call whose `record.state ==
+STATE_DISCONNECTED`; `EVENT_DETACH` is never suppressed.
+
+**Fix point 3**: verified, not changed — already correct. The `existing.state
+== STATE_DISCONNECTED` branch in `_upsert_device` is unconditional and
+untouched by point 1's new branch (which explicitly excludes it), so a
+remote `attach` for a local-but-disconnected uid still hands over cleanly.
+The reverse move (local `usbwatch` reattach while a row is remote-owned)
+already worked before this ticket too: `upsert_attached` always passes
+`host=None`, so point 1's rejection branch (which only fires for `host is
+not None`) never applies to it, and the existing final `else` branch's
+unconditional `host = ?` update already restores `host = NULL` — confirmed
+with `test_upsert_attached_restores_local_ownership_after_remote_takeover`
+and the ping-pong test, both passing without further code changes.
+
+**Beyond the ticket's original fix-point list — a downstream gap found while
+implementing point 1**: rejecting the `host` reassignment in
+`_upsert_device` alone was not sufficient. `_apply_snapshot_device` and
+`_apply_event`'s `detach`/`identity`/`lock_state` branches call
+`mark_remote_detached`/`apply_remote_probe`/`apply_remote_lock_state`
+*unconditionally by uid*, with no ownership check of their own — so even
+after point 1 correctly refused to reassign `host`, a stale remote payload
+(e.g. `hodr`'s own snapshot reporting `state: "disconnected"` for a row it
+no longer owns, which is exactly the production shape: `hodr`'s local copy
+of the board is itself disconnected) would still reach through the second
+call and flip *our* locally-owned row's `state` to `disconnected` —
+reproducing the reported "pool reports 0 devices" symptom by a different
+path than the one point 1 closes. Added `peering._attributed_to(store, uid,
+host)` (used by `_apply_event`'s `detach`/`identity`/`lock_state` branches)
+and an equivalent post-upsert `record.host != host` check in
+`_apply_snapshot_device`, both dropping (logged) a payload for a uid this
+store doesn't currently attribute to the sending host — covering both
+"locally owned" and, as a natural extension of the same principle, "owned
+by some other peer". Covered by
+`test_apply_snapshot_device_does_not_overwrite_local_connected_row`,
+`test_apply_event_detach_does_not_disconnect_local_connected_row`,
+`test_apply_event_identity_does_not_overwrite_local_connected_row`, and the
+positive-case `test_apply_event_detach_applies_when_attributed_to_sender`.
+
+**Fix point 5** (recovery, traced not implemented): confirmed no separate
+migration/backfill step is needed. `Daemon.run_once` (`src/mbtools/
+registry/daemon.py`) always calls `store.upsert_attached(uid, ...)` for any
+uid `usbwatch.scan()` reports that isn't already in its `previously_attached`
+set (`state != STATE_DISCONNECTED`). Tracing the actual `torture`/`hodr`
+production shape: `hodr`'s own stale row is itself `disconnected`, so its
+(pre-fix) unfiltered snapshot carries `state: "disconnected"` for it; on
+`torture`, `_apply_snapshot_device` applied that via the (pre-fix)
+unconditional `mark_remote_detached`, leaving `torture`'s hijacked row as
+`host="hodr", state="disconnected"`. That state means the uid is *not* in
+`previously_attached` on `torture`'s next daemon cycle, so `usbwatch`'s
+rescan calls `upsert_attached(uid, ..., host=None)` →
+`_upsert_device`'s existing `state == STATE_DISCONNECTED` branch (unchanged
+by this fix) does the unconditional reattach, restoring `host = NULL` and
+resetting `state`. No explicit recovery pass was added — a plain daemon
+restart on `torture`/`hodr` running this fix is sufficient.
+
+**Separate pre-existing defect found, out of this ticket's scope — flagged
+for a follow-up ticket, not fixed here**: `Daemon.run_once`'s
+`previously_attached` set (`store.list_devices()` filtered only by `state
+!= STATE_DISCONNECTED`) does not filter by `host`, so it includes
+*remote*-owned rows too. Any remote-owned uid not physically attached to
+*this* host (i.e. essentially all of them) falls into `previously_attached
+- current.keys()` every cycle, so the daemon calls `store.mark_disconnected`
+on it and fires a bogus `EVENT_DETACH` claiming `host=<this host>` for a
+uid it doesn't own — `_apply_event`'s `EVENT_DETACH` handling had no
+ownership check before this ticket either, so every peer (including the
+uid's actual owner) applied it. This ticket's new `_attributed_to` guard in
+`_apply_event` now stops that bogus detach from being *applied* by
+receivers, and the ownership-holding daemon's own next `run_once` cycle
+self-heals (reattach branch, same as point 5's trace) — so it is a source
+of continuous background churn (repeated spurious disconnect/reattach
+cycles logged, and brief incorrect `state` flapping on receivers' mirrored
+copies of foreign devices) rather than a lasting ownership bug, and it does
+not affect this ticket's `host=`-column acceptance criteria. Not fixed here:
+`daemon.py` is not in this ticket's listed files, and the ticket's
+root-cause chain doesn't implicate it — recommend a new ticket to scope
+`previously_attached` to `record.host is None`.
+
+**Doc touch outside the listed files**:
+`src/mbtools/registry/console_compat/relay_pool.py`'s
+`_pick_free_local_relay` docstring said `snapshot_local_devices()` "includes
+every local row regardless of state" — corrected to describe the new
+disconnected-row exclusion, since it directly describes behavior of a
+method this ticket changed. No logic change in that file; its existing
+`state != STATE_CONNECTED` filter was already correct and unaffected.

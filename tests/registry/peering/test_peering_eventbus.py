@@ -278,6 +278,157 @@ def test_apply_snapshot_device_disconnected(store):
     assert store.get(UID).state == STATE_DISCONNECTED
 
 
+# ---------------------------------------------------------------------------
+# Local ownership wins over stale peer sync (sprint 005 ticket 011) --
+# proving the rejection reaches through both application paths peering
+# routes into Store._upsert_device, and that publishing never re-asserts
+# a disconnected local row's ownership.
+# ---------------------------------------------------------------------------
+
+
+def test_apply_event_attach_does_not_overwrite_local_connected_row(store):
+    store.upsert_attached(UID, "/dev/ttyACM0", "0d28:0204")
+
+    peering_mod._apply_event(
+        store, "hodr", {"type": "attach", "uid": UID, "port": "/dev/ttyACM9", "vid_pid": "x"}
+    )
+
+    record = store.get(UID)
+    assert record.host is None
+    assert record.port == "/dev/ttyACM0"
+
+
+def test_apply_snapshot_device_does_not_overwrite_local_connected_row(store):
+    store.upsert_attached(UID, "/dev/ttyACM0", "0d28:0204")
+
+    peering_mod._apply_snapshot_device(
+        store,
+        "hodr",
+        {
+            "uid": UID,
+            "port": "/dev/ttyACM9",
+            "vid_pid": "x",
+            "state": STATE_DISCONNECTED,
+        },
+    )
+
+    # hodr's own stale snapshot row says "disconnected" -- exactly the
+    # production shape (hodr's own copy of a board it no longer has is
+    # disconnected on hodr's side too) -- but torture's row is locally
+    # owned and never went through the rejected upsert_remote_attached
+    # call, so the trailing mark_remote_detached in _apply_snapshot_device
+    # never even runs against it via the remote path; the row it *does*
+    # find by uid is still torture's own local, connected row and must be
+    # untouched.
+    record = store.get(UID)
+    assert record.host is None
+    assert record.port == "/dev/ttyACM0"
+    assert record.state == STATE_ATTACHED_UNPROBED
+
+
+def test_apply_event_attach_takes_over_local_disconnected_row(store):
+    store.upsert_attached(UID, "/dev/ttyACM0", "0d28:0204")
+    store.mark_disconnected(UID)
+
+    peering_mod._apply_event(
+        store, "hodr", {"type": "attach", "uid": UID, "port": "/dev/ttyACM9", "vid_pid": "x"}
+    )
+
+    record = store.get(UID)
+    assert record.host == "hodr"
+    assert record.port == "/dev/ttyACM9"
+
+
+def test_apply_event_detach_does_not_disconnect_local_connected_row(store):
+    # The downstream half of the same bug: even once the "attach" claim
+    # is rejected, a stale "detach" for the same uid must not be allowed
+    # to flip our own locally-owned row to disconnected either -- that
+    # would still empty out console_compat.relay_pool for a board that
+    # never actually left.
+    store.upsert_attached(UID, "/dev/ttyACM0", "0d28:0204")
+
+    peering_mod._apply_event(store, "hodr", {"type": "detach", "uid": UID})
+
+    record = store.get(UID)
+    assert record.host is None
+    assert record.state == STATE_ATTACHED_UNPROBED
+
+
+def test_apply_event_identity_does_not_overwrite_local_connected_row(store):
+    from mbtools.registry.identity import ProbeResult
+
+    store.upsert_attached(UID, "/dev/ttyACM0", "0d28:0204")
+    store.apply_probe_result(
+        UID,
+        ProbeResult(
+            role="NEZHA2",
+            common_name="vevov",
+            device_name="vevov",
+            serial="1198504156",
+            raw="device NEZHA2 robot vevov 1198504156",
+        ),
+    )
+
+    peering_mod._apply_event(
+        store,
+        "hodr",
+        {
+            "type": "identity",
+            "uid": UID,
+            "state": STATE_CONNECTED,
+            "role": "NEZHA2",
+            "common_name": "impostor",
+            "device_name": "impostor",
+            "serial_payload": "0",
+            "raw_announcement": "device NEZHA2 impostor impostor 0",
+        },
+    )
+
+    record = store.get(UID)
+    assert record.host is None
+    assert record.device_name == "vevov"
+
+
+def test_apply_event_detach_applies_when_attributed_to_sender(store):
+    # Positive case for the same guard: a legitimate detach from the peer
+    # that actually owns the row still works.
+    peering_mod._apply_event(
+        store, "hodr", {"type": "attach", "uid": UID, "port": "/dev/ttyACM0", "vid_pid": "x"}
+    )
+
+    peering_mod._apply_event(store, "hodr", {"type": "detach", "uid": UID})
+
+    record = store.get(UID)
+    assert record.host == "hodr"
+    assert record.state == STATE_DISCONNECTED
+
+
+def test_publish_daemon_event_suppresses_attach_for_disconnected_record(store):
+    peering = _make_peering(store, host="torture", pub_port=17592, snapshot_port=17593)
+    published: list[tuple[str, dict]] = []
+    peering.publish_event = lambda event_type, payload: published.append((event_type, payload))
+
+    record = store.upsert_attached(UID, "/dev/ttyACM0", "0d28:0204")
+    store.mark_disconnected(UID)
+    disconnected = store.get(UID)
+    assert disconnected.state == STATE_DISCONNECTED
+
+    peering.publish_daemon_event(peering_mod.EVENT_ATTACH, disconnected)
+    peering.publish_daemon_event(peering_mod.EVENT_IDENTITY, disconnected)
+
+    assert published == []
+
+    # A genuine detach publish for the same record is never suppressed.
+    peering.publish_daemon_event(peering_mod.EVENT_DETACH, disconnected)
+    assert len(published) == 1
+    assert published[0][0] == peering_mod.EVENT_DETACH
+
+    # And a live (non-disconnected) record still publishes normally.
+    peering.publish_daemon_event(peering_mod.EVENT_ATTACH, record)
+    assert len(published) == 2
+    assert published[1][0] == peering_mod.EVENT_ATTACH
+
+
 def test_snapshot_payload_round_trips_through_apply(store):
     store.upsert_attached(UID, "/dev/ttyACM0", "0d28:0204")
     payload = peering_mod._snapshot_payload(store)

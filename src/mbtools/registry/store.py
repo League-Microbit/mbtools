@@ -54,6 +54,7 @@ per the stakeholder's explicit ``name@host`` disambiguation requirement
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
 import time
@@ -64,6 +65,8 @@ from typing import Callable
 from mbtools.registry.identity import ProbeResult, short_uid
 from mbtools.registry.paths import default_db_path
 from mbtools.relay import naming
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "AmbiguousNameError",
@@ -517,6 +520,30 @@ class Store:
                         now,
                     ),
                 )
+            elif (
+                host is not None
+                and existing.host is None
+                and existing.state != STATE_DISCONNECTED
+            ):
+                # Local ownership wins over a stale/conflicting remote claim
+                # (sprint 005 ticket 011): a remote snapshot or live event
+                # (``host`` is the sending peer's hostname, never ``None``)
+                # must never steal a uid this host currently has attached
+                # and connected itself -- e.g. a peer that tested the same
+                # board in the past and still holds it as a stale local row
+                # must not overwrite the host that has it plugged in right
+                # now. A *disconnected* local row is a different story --
+                # that's a genuine hand-over, and falls through to the
+                # branch below instead. Logged and dropped, record
+                # returned unchanged.
+                logger.warning(
+                    "store: rejecting remote claim of uid %s by host %s -- "
+                    "locally owned and connected (state=%s)",
+                    uid,
+                    host,
+                    existing.state,
+                )
+                return existing
             elif existing.state == STATE_DISCONNECTED:
                 self._conn.execute(
                     """
@@ -875,19 +902,31 @@ class Store:
             return [_row_to_record(row) for row in rows]
 
     def snapshot_local_devices(self) -> list[DeviceRecord]:
-        """Every locally-owned row (``host IS NULL``), shaped for
-        ``registry.peering``'s snapshot-exchange payload (ticket 005) --
-        what this host hands a newly-joining peer before it subscribes to
-        the live event stream, and what a reconnecting peer's own resync
-        uses too.
+        """Every locally-owned, currently-connected row (``host IS NULL
+        AND state != 'disconnected'``), shaped for ``registry.peering``'s
+        snapshot-exchange payload (ticket 005) -- what this host hands a
+        newly-joining peer before it subscribes to the live event stream,
+        and what a reconnecting peer's own resync uses too.
 
         Never includes a row this host itself learned about from some
         *other* peer -- each registry's snapshot is its own devices only,
         so a peer applying it always tags the result with the snapshot's
         source host, never re-propagating a third host's rows.
+
+        Also never includes a disconnected local row (sprint 005 ticket
+        011): a uid this host once had attached but no longer does is not
+        an active claim of ownership, and must not be advertised as one --
+        a peer applying an unfiltered snapshot would otherwise re-tag a
+        board that has since moved elsewhere back to this host, exactly
+        the stale-reassertion bug this ticket fixes. The row itself is
+        never dropped from *this* store -- only excluded from what gets
+        sent to peers.
         """
         with self._lock:
-            rows = self._conn.execute("SELECT * FROM device WHERE host IS NULL").fetchall()
+            rows = self._conn.execute(
+                "SELECT * FROM device WHERE host IS NULL AND state != ?",
+                (STATE_DISCONNECTED,),
+            ).fetchall()
             return [_row_to_record(row) for row in rows]
 
     def list_peers(self) -> list[PeerRecord]:
