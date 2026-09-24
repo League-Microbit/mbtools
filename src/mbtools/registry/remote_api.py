@@ -740,6 +740,13 @@ class RemoteAPIServer(BaseAPIServer):
         step, so no separate client-facing ``mark_flashed`` call is
         needed on this path. The staged hex temp file is always removed
         afterwards, regardless of outcome.
+
+        ``record.port`` (already resolved above, under the lock) is
+        passed through as ``flash_hex``'s own ``port`` -- ticket 009's
+        permission pre-check runs here, server-side, against the actual
+        device this daemon owns, exactly like the local socket's flash
+        path runs it against the client's own already-resolved
+        ``device["port"]`` (``deploy.cli._flash``).
         """
 
         def _flash_error(code: str, message: str, **extra: Any) -> dict[str, Any]:
@@ -797,7 +804,9 @@ class RemoteAPIServer(BaseAPIServer):
         # pyocd invocation.
         board_name = record.device_name or uid
         try:
-            rc = flash_hex(uid, hex_path, log=log, board_name=board_name)
+            rc = flash_hex(
+                uid, hex_path, log=log, board_name=board_name, port=record.port
+            )
             success = rc == 0
             exit_code: int | None = rc
             error: str | None = None if success else f"pyocd flash failed (exit {rc})"

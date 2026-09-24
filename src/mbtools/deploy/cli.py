@@ -256,6 +256,7 @@ def _flash(
     hex_path: str,
     name: str,
     log: Callable[[str], None],
+    port: str | None = None,
 ) -> tuple[bool, int | None]:
     """Run the flash itself -- the one step ticket 012's local/remote
     branches don't share code for (module docstring's "Local vs. remote
@@ -265,7 +266,12 @@ def _flash(
     ``deploy.flash.flash_hex`` (Design Rationale: local flashing, not the
     registry's own minimal ``flash`` op), then calls ``mark_flashed`` for
     ``flash_count`` bookkeeping (non-fatal if an old daemon doesn't
-    support it).
+    support it). ``port`` (ticket 009 -- the already-resolved device's own
+    port, from the ``device`` dict ``_run_deploy_flow`` already has in
+    hand) is threaded through to ``flash_hex``'s own permission pre-check
+    on this branch only; the remote branch's pre-check runs server-side,
+    against ``remote_api``'s own resolved record (see that module's
+    ``_op_flash``), since this process never has that remote port itself.
 
     Remote (``RemoteRegistryClient``): the wire ``flash`` op runs the
     same ``flashlogic.flash_hex`` server-side, with the same retry/mass-
@@ -282,7 +288,7 @@ def _flash(
         result = client.flash(uid, hex_path, log_callback=log)
         return result.success, result.exit_code
 
-    rc = flash_hex(uid, hex_path, log=log, board_name=name)
+    rc = flash_hex(uid, hex_path, log=log, board_name=name, port=port)
     if rc == 0:
         try:
             client.mark_flashed(uid)
@@ -369,7 +375,9 @@ def _run_deploy_flow(
     # and must never be skipped just because something upstream of it
     # went wrong.
     try:
-        success, exit_code = _flash(client, uid, hex_path, name, _log_line)
+        success, exit_code = _flash(
+            client, uid, hex_path, name, _log_line, port=device.get("port")
+        )
     finally:
         try:
             client.unlock(uid)
@@ -609,6 +617,23 @@ def _run_pyocd(cmd: list[str]) -> int:
     own module-level function (rather than inlined into :func:`_run_debug`)
     so a test can inject a fake in its place without touching a real
     ``pyocd`` binary or probe.
+
+    **Deliberately outside ticket 009's fail-fast fix** (decided, not an
+    oversight): that ticket's no-progress *watchdog* must never apply
+    here -- ``pyocd commander``'s REPL, and a human just reading
+    ``gdbserver``'s output before typing a debugger command, can both be
+    legitimately silent for an arbitrary, unbounded stretch, which is
+    exactly the "genuinely-in-progress, don't cut it off" case that
+    ticket's own Decision 8 protects (there merely for a slow mass
+    erase; here for open-ended human interaction, an even clearer case).
+    The proactive permission *pre-check* would be safe to add here too,
+    but ``cmd`` above is a bare ``pyocd`` + ``args.pyocd_args`` passthrough
+    of whatever the operator typed after ``--`` (``pyocd list``, a raw
+    ``gdbserver`` invocation, ...) -- unlike ``flash_hex``, there is no
+    single, reliably-``--uid``-shaped invocation here to resolve a device
+    port against, so the pre-check has no natural place to attach. Left
+    unchanged; a future ticket could special-case a ``--uid``-bearing
+    invocation if this gap is ever felt in practice.
     """
     return subprocess.run(cmd).returncode
 

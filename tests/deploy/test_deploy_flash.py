@@ -14,8 +14,11 @@ how a real ``Popen`` instance is used, without invoking pyocd for real.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
+import threading
+import time
 
 import pytest
 
@@ -31,6 +34,15 @@ _VALID_HEX_CONTENT = ":00000001FF\n"
 
 #: A locked-device failure signature (see flash.py::_LOCKED_SIGNATURES).
 _LOCKED_SIGNATURE_LINES = ("flash erase sector failure (0x67)",)
+
+#: A short bound every "must not hang" test below asserts real wall-clock
+#: elapsed time against -- well under any of these tests' own
+#: ``no_progress_timeout`` (chosen large enough, e.g. 30s, that only an
+#: early-exit -- not the timeout itself -- could make the test finish
+#: this fast). Keeps these tests themselves fast and deterministic
+#: without ever actually waiting out a real long timeout (ticket 009's
+#: own Testing note).
+_MUST_FINISH_WITHIN_S = 5.0
 
 
 @pytest.fixture
@@ -49,21 +61,86 @@ def valid_hex(tmp_path) -> str:
 class _FakeProcess:
     """Stand-in for a ``subprocess.Popen`` instance.
 
-    ``flash.py::_run_streamed`` only ever iterates ``.stdout`` for lines
-    and calls ``.wait()`` for the exit code, so that's all this fake
-    needs to provide.
+    ``flash.run_streamed_with_watchdog`` iterates ``.stdout`` for lines
+    (from its own background reader thread) and calls ``.wait()`` for
+    the exit code, and -- since ticket 009 -- may call ``.kill()``; that
+    last one is a no-op here since this fake's ``.stdout`` is already a
+    finite, already-exhausting iterator that needs no killing to finish.
     """
 
     def __init__(self, returncode: int, lines: tuple[str, ...] = ()):
         self.returncode = returncode
         self.stdout = iter(f"{line}\n" for line in lines)
+        self.killed = False
+
+    def wait(self) -> int:
+        return self.returncode
+
+    def kill(self) -> None:
+        self.killed = True
+
+
+def _result(rc: int, lines: tuple[str, ...] = ()):
+    return _FakeProcess(rc, lines)
+
+
+class _FakeHangingProcess:
+    """Stand-in for a ``subprocess.Popen`` instance that never produces a
+    single line of output and never exits on its own -- ticket 009's
+    "pyocd retries an inaccessible probe forever" scenario, reduced to
+    its essence.
+
+    ``.stdout`` blocks (a real ``threading.Event.wait()``, not a fake
+    sleep) until ``.kill()`` is called, mirroring how a real
+    ``Popen.kill()`` closes the child's stdout pipe and unblocks a real
+    blocking read with EOF -- that's what lets
+    ``run_streamed_with_watchdog``'s background reader thread actually
+    terminate (and be ``.join()``-ed) once the no-progress watchdog (or
+    the early permission-denied exit, in the subclass below) calls
+    ``kill()``, instead of leaking a thread that blocks forever.
+    """
+
+    def __init__(self, returncode: int = -9):
+        self._stop = threading.Event()
+        self.returncode = returncode
+        self.killed = False
+        self.stdout = self
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self._stop.wait()
+        raise StopIteration
+
+    def kill(self) -> None:
+        self.killed = True
+        self._stop.set()
 
     def wait(self) -> int:
         return self.returncode
 
 
-def _result(rc: int, lines: tuple[str, ...] = ()):
-    return _FakeProcess(rc, lines)
+class _FakePermissionThenHangProcess(_FakeHangingProcess):
+    """Like :class:`_FakeHangingProcess`, but emits exactly one line
+    (a pyocd permission/access error) before going silent forever --
+    the real ``get_all_connected_probes`` shape confirmed by reading
+    this project's own installed pyocd (``core/helpers.py``): one
+    "Waiting for a debug probe ..." print, then an unbounded silent
+    ``sleep(0.01)`` loop. Proves the early-exit fires on that one line
+    without ever needing the no-progress timeout to elapse.
+    """
+
+    def __init__(self, line: str, returncode: int = 1):
+        super().__init__(returncode=returncode)
+        self._line = line
+        self._emitted = False
+
+    def __next__(self):
+        if not self._emitted:
+            self._emitted = True
+            return self._line + "\n"
+        return super().__next__()
 
 
 class TestArgvConstruction:
@@ -628,6 +705,222 @@ class TestHexValidation:
         assert rc != 0
         assert calls == []
         assert any("hex" in m.lower() for m in messages)
+
+
+class TestPermissionPrecheck:
+    """Ticket 009's primary defense: a proactive permission check on
+    ``port``, before any pyocd subprocess is constructed or run."""
+
+    def test_no_read_write_access_fails_fast_with_zero_subprocess_calls(
+        self, monkeypatch, valid_hex, tmp_path
+    ):
+        if os.name != "posix":
+            pytest.skip("os.access permission bits are POSIX-specific")
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            pytest.skip("root bypasses permission bits -- can't simulate denial")
+
+        device_path = tmp_path / "fake-cmsis-dap-device"
+        device_path.write_bytes(b"")
+        device_path.chmod(0o000)
+        try:
+            calls: list[list[str]] = []
+
+            def fake_run(cmd, **kw):
+                calls.append(cmd)
+                return _result(0)
+
+            monkeypatch.setattr(subprocess, "Popen", fake_run)
+
+            messages: list[str] = []
+            rc = flash_mod.flash_hex(
+                _UID, valid_hex, target_mcu=_MCU,
+                log=messages.append, port=str(device_path),
+            )
+
+            assert rc != 0
+            assert calls == []  # pyocd never spawned
+            assert any(
+                "permission" in m.lower() and str(device_path) in m
+                for m in messages
+            )
+        finally:
+            device_path.chmod(0o644)  # let tmp_path cleanup remove it
+
+    def test_accessible_port_does_not_block_the_flash(
+        self, monkeypatch, valid_hex, tmp_path
+    ):
+        """A regression guard: a readable/writable ``port`` must never
+        stop a flash that would otherwise succeed."""
+        device_path = tmp_path / "fake-cmsis-dap-device"
+        device_path.write_bytes(b"")
+
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return _result(0)
+
+        monkeypatch.setattr(subprocess, "Popen", fake_run)
+
+        rc = flash_mod.flash_hex(
+            _UID, valid_hex, target_mcu=_MCU, port=str(device_path)
+        )
+
+        assert rc == 0
+        assert len(calls) == 2  # flash + reset, same as the no-port case
+
+    def test_unknown_port_is_skipped_not_treated_as_a_failure(
+        self, monkeypatch, valid_hex
+    ):
+        """``port=None`` (the default -- a caller that doesn't have it
+        yet) must fall through to pyocd unchanged, exactly like every
+        pre-ticket-009 test in this file already proves."""
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return _result(0)
+
+        monkeypatch.setattr(subprocess, "Popen", fake_run)
+
+        rc = flash_mod.flash_hex(_UID, valid_hex, target_mcu=_MCU, port=None)
+
+        assert rc == 0
+        assert len(calls) == 2
+
+    def test_nonexistent_port_is_skipped_not_treated_as_a_permission_failure(
+        self, monkeypatch, valid_hex, tmp_path
+    ):
+        """A ``port`` that simply doesn't exist (a disconnected/
+        renumbering board) is a different problem than permission --
+        this check must defer to pyocd's own "no such device" reporting,
+        not misreport it as a udev-rule issue."""
+        missing_device = tmp_path / "does-not-exist-device"
+
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return _result(0)
+
+        monkeypatch.setattr(subprocess, "Popen", fake_run)
+
+        rc = flash_mod.flash_hex(
+            _UID, valid_hex, target_mcu=_MCU, port=str(missing_device)
+        )
+
+        assert rc == 0
+        assert len(calls) == 2
+
+
+class TestNoProgressWatchdog:
+    """Ticket 009's fallback defense: a bounded no-progress (not
+    total-runtime) timeout that kills a genuinely silent pyocd
+    invocation instead of hanging forever."""
+
+    def test_silent_process_is_killed_and_reported_within_the_short_timeout(
+        self, monkeypatch, valid_hex
+    ):
+        proc = _FakeHangingProcess()
+        monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kw: proc)
+
+        messages: list[str] = []
+        started = time.monotonic()
+        rc = flash_mod.flash_hex(
+            _UID, valid_hex, target_mcu=_MCU,
+            log=messages.append, no_progress_timeout=0.2,
+        )
+        elapsed = time.monotonic() - started
+
+        assert rc != 0
+        assert proc.killed
+        assert elapsed < _MUST_FINISH_WITHIN_S
+        assert any(
+            "no output" in m.lower() and "0.2" in m for m in messages
+        )
+
+    def test_progressing_process_is_never_killed_by_the_watchdog(
+        self, monkeypatch, valid_hex
+    ):
+        """A regression guard: a process that keeps producing output
+        (however slowly relative to a short test timeout) must never be
+        mistaken for a hang -- this reads the no-progress semantics
+        literally by never letting the gap between two lines actually
+        approach ``no_progress_timeout``."""
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return _result(0, ("Erasing...", "Programming...", "Verifying..."))
+
+        monkeypatch.setattr(subprocess, "Popen", fake_run)
+
+        rc = flash_mod.flash_hex(
+            _UID, valid_hex, target_mcu=_MCU, no_progress_timeout=0.2
+        )
+
+        assert rc == 0
+        assert len(calls) == 2
+
+
+class TestPermissionOutputDetection:
+    """Ticket 009's fallback-to-the-fallback: even with no known ``port``
+    to pre-check, a permission-denied line in pyocd's own output (real
+    wording confirmed by reading this project's installed pyocd -- see
+    ``flash.py``'s own ``_PERMISSION_SIGNATURES`` comment) is fatal the
+    instant it's seen, never retried, and never waits out the
+    no-progress timeout."""
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "[Errno 13] Access denied (insufficient permissions) while "
+            "trying to interrogate a USB device (VID=0d28 PID=0204). "
+            "This can probably be remedied with a udev rule.",
+            "Unable to open device: permission denied",
+        ],
+    )
+    def test_permission_line_kills_immediately_without_waiting_for_timeout(
+        self, monkeypatch, valid_hex, line
+    ):
+        proc = _FakePermissionThenHangProcess(line)
+        monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kw: proc)
+
+        messages: list[str] = []
+        started = time.monotonic()
+        rc = flash_mod.flash_hex(
+            _UID, valid_hex, target_mcu=_MCU,
+            log=messages.append,
+            # Deliberately much longer than this test's own bound below --
+            # only an early exit, never this timeout firing, could make
+            # the assertion on `elapsed` pass.
+            no_progress_timeout=30.0,
+        )
+        elapsed = time.monotonic() - started
+
+        assert rc != 0
+        assert proc.killed
+        assert elapsed < _MUST_FINISH_WITHIN_S
+        assert any("not retrying" in m.lower() for m in messages)
+
+    def test_permission_line_is_not_retried(self, monkeypatch, valid_hex):
+        calls: list[list[str]] = []
+        proc = _FakePermissionThenHangProcess(
+            "[Errno 13] Access denied (insufficient permissions)"
+        )
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return proc
+
+        monkeypatch.setattr(subprocess, "Popen", fake_run)
+
+        rc = flash_mod.flash_hex(
+            _UID, valid_hex, target_mcu=_MCU, no_progress_timeout=30.0
+        )
+
+        assert rc != 0
+        assert len(calls) == 1  # exactly one flash attempt -- no retry
 
 
 def test_default_mcu_reused_from_registry_flash():
