@@ -8,6 +8,7 @@ depends-on:
 - '001'
 - '007'
 - '008'
+- '011'
 github-issue: ''
 issue: mbtools-fleet-deployment-tooling-and-migration-docs.md
 completes_issue: true
@@ -95,6 +96,13 @@ matching the precedent set by tickets 001/010/011 in prior sprints.
       silently omit them or imply they were hardware-tested.
 - [ ] No robot in active use was disturbed during this ticket's hardware
       work (spare-board rule).
+- [ ] **Torture relay pool re-verified** (ticket 011): after ticket 011's
+      local-ownership-wins fix is deployed, `torture`'s relay pool
+      (`console_compat.relay_pool`) still offers its own attached relays
+      and every host's `mbregistry list` still shows them as
+      `host=torture` — confirming ticket 011's hardware check holds up
+      alongside this ticket's own five-test-host deployment-tooling
+      re-run, not just in isolation right after ticket 011 landed.
 
 ## Testing
 
@@ -111,9 +119,15 @@ matching the precedent set by tickets 001/010/011 in prior sprints.
 ## Implementation Notes
 
 - This ticket depends on 001 (the fix being validated), 007 (the tooling
-  being validated), and 008 (so the acceptance document can reference
+  being validated), 008 (so the acceptance document can reference
   the finished runbook by name/section, the same way prior
-  acceptance docs cross-reference sprint.md).
+  acceptance docs cross-reference sprint.md), and 011 (the
+  local-ownership-wins peer-sync fix — added after this ticket was first
+  written, per the newly linked issue
+  `peer-sync-overwrites-ownership-of-locally-attached-devices.md`; this
+  ticket's `torture` relay-pool re-check exercises that fix on real
+  hardware a second time, alongside this sprint's other hardware work,
+  not just once in isolation).
 - Follow `docs/acceptance/004-hardware.md`'s own honesty precedent: if
   something doesn't reproduce cleanly, or a result is ambiguous, say so
   plainly rather than smoothing it over — that document's own

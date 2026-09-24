@@ -1,6 +1,8 @@
 ---
-status: pending
+status: in-progress
 sprint: '005'
+tickets:
+- 005-011
 ---
 
 # Peer sync overwrites ownership of locally attached devices ("local must win")
