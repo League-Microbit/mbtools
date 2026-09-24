@@ -236,3 +236,371 @@ itself (e.g. a patched build logging its internal socket read-loop
 exceptions) to see what, if anything, throws. The heavy-ambient-multicast-
 traffic environmental factor above is the leading hypothesis but is
 unconfirmed.
+
+---
+
+# Ticket 011 — Real-hardware acceptance
+
+Sprint 004, ticket `011-real-hardware-acceptance` (the sprint-closing
+ticket — verifies every preceding ticket's claims: 005 `mbrelay` CLI, 006
+relay pool, 007 `/names` HTTP API, 008 udev/non-root USB, 009 pyOCD
+fail-fast, 010 braeburn mDNS). Run 2026-09-24 against the full fleet:
+`meili`, `loki`, `hodr`, `magni` (Debian 13 aarch64, Nolanet nodes) and
+`braeburn` (macOS 15.7.4 x86_64), all over SSH as `eric`. `robot-console`
+checkout used as the compatibility spec: per this ticket's own dispatch
+brief, `/Volumes/Proj/proj/league-projects/microbit/robot-console`
+(commit `9f536e76`, 2026-09-22) — the newer of the two local checkouts;
+`/Volumes/Proj/proj/robot-projects/robot-console` (commit `8dbc60cb`,
+2026-09-14) is the stale copy the ticket text itself warns not to use as
+the spec of record.
+
+## Pre-flight
+
+`uv run pytest tests/relay/ tests/registry/console_compat/
+tests/registry/peering/ tests/registry/flash/` — 218 passed, before
+spending any hardware time (file paths differ from the ticket's own text
+per the same per-command-subpackage convention tickets 007/008/009 already
+documented; `tests/registry/peering/` and `tests/registry/flash/`, not
+`test_peering.py`/`test_flashlogic.py` at the package root).
+
+## Fleet redeploy
+
+All five hosts were running a stale pre-sprint-004 build (`mbrelay names`
+answered "not yet implemented — see mbtools sprint 004" on first check) —
+redeployed via `scripts/deploy-test-host.sh` after `sudo systemctl stop
+mbregistry.service` on each Nolanet node. `uv venv --clear` failed on
+three of the four nodes (`hodr`, `magni`, and `meili` on a later
+redeploy) with `Permission denied` removing `lib/` — the running-as-root
+daemon leaves root-owned files in the venv exactly as
+`scripts/deploy-test-host.sh`'s own usage comment warns; `sudo chown -R
+eric:eric <venv>` before re-running the script resolved it cleanly each
+time (no `rm -rf` needed). `braeburn` had no `mbregistry` process running
+at all at session start (unlike `docs/acceptance/003-hardware.md`'s
+finding of one already up) — redeployed and started fresh under `nohup`
+at the same `--socket /tmp/mbregistry/api.sock --db
+~/.local/state/mbregistry/devices.db` paths `docs/acceptance/001-hardware.md`
+established. All five `mbregistry.service`/processes confirmed `active`
+on the current build (`mbtools==0.20260923.3`) before any scenario below.
+
+## Scenario 1 — firmware flashed onto designated boards
+
+**PASS.** `hodr`'s spare board (`togov`, uid `fe9a0254` — no announcing
+firmware at session start, exactly CLAUDE.md's "use a spare board"
+guidance) flashed with `League-Robotics/microbit-radio-relay@v0.20260913.2`
+(newest versioned release, `MICROBIT.hex` asset, `--force-relay`) —
+re-announced `RADIOBRIDGE` cleanly. `meili`'s dedicated robot board
+(`gitev`, already `NEZHA2/robot` from earlier sprint work) reflashed with
+`League-Microbit/nezha-robot-template@v0.20260919.7` (newest versioned
+release) — re-announced `NEZHA2` cleanly, `flash_count=1`. Neither board
+is a robot in active use (CLAUDE.md's constraint) — both are this
+project's own dedicated per-host test boards. `togov` was reflashed a
+second time mid-session to recover from an unrelated identification issue
+(see "New finding" below) — `flash_count=2` on that board by the end of
+the run.
+
+## Scenario 2 — `mbrelay connect` cross-host, `PING`→pong over radio
+
+**PASS, after two wrong turns worth recording.** All three attempts below
+were run from `loki` — a third host, neither the relay's host (`hodr`) nor
+the robot's host (`meili`) — satisfying "remote relay" per the ticket.
+
+**First attempt — wrong channel/group.** `nezha-robot-template`'s own
+release notes (`.github/workflows/release.yml` in that repo) state "The
+robot answers on the radio (channel 55 / group 114)", so `mbrelay names
+set gitev 55 114` was used to override the registry (mbtools' own derived
+default for `gitev` is channel 21 / group 185 —
+`naming.name_to_radio("gitev")` — which does not match that stated value).
+`mbrelay connect gitev@hodr --send PING --expect pong` tuned correctly to
+55/114 (confirmed via the relay's own `# channel: 55 group: 114` ack) but
+got **no answer**. A follow-up low-level diagnostic — driving the
+already-locked relay channel directly with `mbtools.relay.channel`/
+`mbtools.relay.protocol` primitives, skipping `RelayControl.normalize()`'s
+hardcoded `!MODE RAW250` step and sending `!MODE MAKECODE` by hand instead
+(no CLI flag exists for this; `relay.protocol.NORMALIZE_STEPS` is
+RAW250-only, matching legacy `mbrelay`'s own `relay.py` byte-for-byte —
+not a sprint-004 regression) — also got no reply. Source review at the
+time (`pxt-nezha-diffdrive`'s `RadioTransport::onDatagram()`) suggested
+RAW250 was actually the framing-compatible mode for this firmware's
+custom C++ radio layer, not MAKECODE, but that didn't explain why the
+*first*, RAW250, attempt had already failed either.
+
+**Second attempt — this is what actually mattered: wrong channel/group,
+still.** `mbserial gitev STATUS` (once non-root access was set up — see
+Scenario 5) printed an extra, not-in-the-currently-checked-out-source
+field set: `wifi=0 radio=1 channel=21 group=185` — the board's *own*,
+already-running radio is self-tuned to its own derived address
+(`naming.name_to_radio("gitev")` again — 21/185, exactly), not the
+55/114 the release notes describe. (`loki`'s own robot board, `vitut`,
+independently confirmed the same pattern: `channel=41 group=30`, exactly
+`naming.name_to_radio("vitut")`. Both boards were flashed with the exact
+same released image, `id diffdrive calibration-0.20260919.7 ...` on
+both — this is a property of the *released* firmware's runtime behavior,
+not a per-board fluke.) The checked-out `pxt-nezha-diffdrive` source's
+`test/boot.ts` reads `diffDrive.setupRadio(55, 114)` literally, so either
+that file changed after the tag this release was actually built from (the
+`v0.20260919.7` git tag was not present in the local checkout to diff
+against directly — `git tag -l` came back empty for it, a shallow-clone
+limitation this session didn't chase further) or some later
+identity-derived re-tune this session didn't locate overrides it at
+runtime. **Not root-caused** — flagged honestly, matching this project's
+own precedent for an evidenced-but-not-fully-explained firmware finding
+(`docs/acceptance/004-hardware.md`'s own ticket-010 section, "New
+finding", above).
+
+**Third attempt — success.** `mbrelay names clear gitev` (drop the wrong
+override), then `mbrelay names set gitev 21 185` (the board's own actual
+running address), then:
+
+```
+$ mbrelay connect gitev@hodr --send PING --expect pong --timeout 6
+gitev: channel 21 group 185 (registry)
+mbrelay: remote relay togov on hodr: relay togov reset and normalized, firmware 0.20260913.2
+mbrelay: tuned to gitev: channel 21 group 185 (source: registry)
+mbrelay: gitev answered PING
+```
+
+`mbrelay`'s own internal liveness probe (`_tune()`'s `PING`→`\bpong\b`
+match, sent automatically after `!GO`) matched — a confirmed `PING`→pong
+round trip over radio, relay on `hodr`, robot on `meili`, driven from
+`loki`. (The *second*, `--send`/`--expect`-scripted `PING` in the same
+session, sent moments later over the now-open data-plane byte pipe,
+raced against one of `gitev`'s own periodic `DBG:wifi ...` debug lines
+and timed out on the literal word match within its 6s window — a script
+timing/multiplexing artifact of firing a second probe manually, not a
+failure of the underlying link; the *first*, automatic probe already
+proved the round trip.)
+
+## Scenario 3 — remote relay reset over the remote stream
+
+**PASS.** `togov` (on `hodr`) was deliberately left stranded in the data
+plane by a local script on `hodr` that ran `!GO` and then closed the port
+without any `!DEFAULTS`/BREAK recovery — reproducing "a board parked in
+the data plane... nothing short of a reflash recovers it [without BREAK]"
+(`microbit-radio-relay/docs/radio-relay-protocol.md`). A subsequent
+`mbrelay connect gitev@hodr` **from `loki`** (a third host, over
+`RemoteRelayChannel`/`RemoteStream`, never a local BREAK) printed `relay
+togov reset and normalized` and proceeded normally — ticket 004's
+`RemoteRelayChannel.send_break()` recovered a genuinely stranded board
+over the network, real hardware, cross-host.
+
+## Bug found and fixed: remote `stream` op rejected a `relay`-kind lock
+
+While chasing Scenario 2/3 above, the very first `mbrelay connect
+gitev@hodr` from `loki` crashed with an uncaught traceback instead of a
+clean CLI error:
+
+```
+mbtools.registry.client.RegistryClientError: ...fe9a0254...: stream requires
+a serial-kind lock held by this connection (call 'lock' first)
+```
+
+Root cause: `registry.remote_api.RemoteAPIServer._op_stream_precheck`
+(ticket 007, written for `mbserial`'s own remote passthrough) only ever
+accepted a `KIND_SERIAL` lock — but `relay.channel.RemoteRelayChannel`
+(ticket 004) was always built to lock a remote relay `relay`-kind first,
+then call this exact same `stream` op. Every unit/integration test on
+both sides of this RPC uses a fake peer
+(`tests/relay/test_cli.py`'s `FakeRemoteRegistryClient`,
+`tests/registry/remote_api/test_remote_stream.py`'s own real-server tests
+only ever locked `serial`-kind), so this cross-module mismatch was
+invisible until two real, different-host `mbregistry`s actually talked to
+each other. **Fixed**: `_op_stream_precheck` now accepts `KIND_SERIAL`
+*or* `KIND_RELAY` (still excludes `flash`/`debug`-kind — neither has any
+business opening a raw byte stream). See
+`src/mbtools/registry/remote_api.py`'s updated docstring,
+`docs/design/registry-api.md`'s "Stream sub-protocol" section, and the
+new regression test
+`tests/registry/remote_api/test_remote_stream.py::test_stream_with_a_relay_kind_lock_is_accepted`.
+Scoped tests (`tests/registry/remote_api/ tests/relay/`, 144 tests) and
+the full suite (776 passed, 2 skipped) both pass after the fix.
+
+## New finding (not root-caused, flagged honestly): a relay mid-data-plane can have its registry identity corrupted by the radio traffic it's forwarding
+
+Discovered by accident, immediately after the Scenario 2 success above:
+`hodr`'s own `mbregistry list` briefly showed uid `fe9a0254` (physically
+`togov`, the `RADIOBRIDGE` relay) as **`gitev`, firmware `NEZHA2/robot`**
+— i.e. the *relay's own database row* had been overwritten with the
+*robot's* identity. Directly re-querying the physical board
+(`mbserial fe9a0254 --reset HELLO`, which forces a BREAK-based reset back
+to the command plane first) confirmed the board itself never changed:
+`DEVICE:RADIOBRIDGE:relay:togov:2108549556`, exactly as flashed. A plain
+`sudo systemctl restart mbregistry.service` (forcing a fresh
+attach-time probe) recovered the correct row immediately.
+
+**Working theory** (not confirmed with packet-level evidence, per this
+project's own "gather evidence rather than guessing, and say so when the
+root cause isn't nailed down" precedent): `togov` had, moments earlier,
+been left tuned to `gitev`'s own channel/group (21/185) in RAW250 data-plane
+mode by the just-completed `mbrelay connect` session above. `dmesg` on
+`hodr` shows the already-documented (CLAUDE.md) `dwc_otg` "Timed out
+waiting for FSM NP transfer to complete" USB timing warnings during this
+exact window, which is known to flap a board's attach state between "gone"
+and its real value. `identity.probe()` (`src/mbtools/registry/identity.py`)
+opens the port, writes `HELLO\n`, and accepts *whatever line arrives and
+parses* against either the relay or robot announcement dialect within its
+read window — it has no way to know the port currently belongs to a relay
+that is transparently bridging live radio traffic (RAW250 data plane), so
+a radio-forwarded fragment of `gitev`'s own periodic identity/debug
+chatter, arriving in that same window, is indistinguishable at the byte
+level from the relay's own genuine banner. `identity.is_relay()` already
+exists in that module but the daemon's attach/reattach probe pipeline
+(`registry.daemon`) never calls it — there is no special-casing today for
+"this device's *last known* role was a relay, so reset it (BREAK) before
+trusting a fresh HELLO reply as its own."
+
+**Not fixed in this ticket.** This is a real defect, but a proper fix
+touches the daemon's shared, heavily-tested attach/reprobe pipeline (used
+identically for every device, robot and relay alike) and needs a
+reliable repro to validate against — this session's one observation came
+from a specific, hard-to-script race (a relay mid-radio-forward at the
+exact moment a `dwc_otg`-flapped reattach triggers a reprobe) rather than
+a repeatable trigger. Given the daemon pipeline's blast radius, a rushed
+fix here risked doing more damage fleet-wide than leaving this
+documented. **Recommend a follow-up ticket**: have the daemon's reprobe
+path send a BREAK (mirroring `relay.protocol.RelayControl.hello`'s own
+already-proven recovery mechanism) before HELLO whenever a device's
+*stored* role indicates a relay/bridge, so a reprobe can never observe
+anything but the board's own genuine command-plane banner. Fleet state
+was left healthy (a service restart on `hodr` cleanly restored the
+correct `togov`/`RADIOBRIDGE` row; confirmed before moving on).
+
+## Scenario 4 — robot-console compatibility, against `robot-console`'s own source
+
+Verified directly against the endpoints, the same requests/shapes
+`packages/host/src/discovery/mdnsDiscovery.ts`, `mbrelayRegistry.ts`, and
+`connect/relayBridger.ts` use (see those files' own doc comments, read in
+full this session) — **not** a full headless run of the `@robot-console/host`
+package itself: that monorepo has no `node_modules` installed
+(`npm install` from scratch, with two native-compiled dependencies —
+`node-hid`, `serialport` — plus wiring a full `server.ts`/`cli.ts`
+composition root against a real registry, all inside a ticket whose own
+subject is `mbtools`, not `robot-console`) was judged out of proportion to
+this ticket's timebox and risk budget; the direct-endpoint verification
+below exercises literally the same wire contract that package's own code
+would.
+
+- **`_mbrelay._tcp` advertisement + TXT `registry=<port>`** — PASS.
+  `avahi-browse -rt _mbrelay._tcp` from `loki` (a different host) shows
+  all five hosts advertising, instance name = hostname (matching
+  `mdnsDiscovery.ts`'s live-verified legacy example, instance `torture` —
+  also a *hostname*, not a five-letter board name), port `7444` (the pool
+  port), TXT `registry=7445` — parses cleanly against
+  `parseRegistryPort`'s `/^\d+$/` check. A legacy `mbrelay` instance
+  (`torture`, port `8760`, TXT `registry=8761`) is simultaneously visible
+  on the same LAN with no port collision, confirming architecture
+  Decision 6's port choice.
+- **Pool-port reset-by-reconnect** — PASS. Raw `nc hodr 7444` from `loki`:
+  tune to `!CG 55 114` (confirmed via `# channel: 55 group: 114` ack),
+  disconnect, reconnect, query `?` — fresh banner
+  (`DEVICE:RADIOBRIDGE:relay:togov:...`) and `# channel: 0 group: 10 mode:
+  RAW250 power: 7` (factory defaults), every time. Exactly matches
+  `relayBridger.ts`'s own documented assumption for an `mbrelay`-transport
+  relay: "opening a *fresh* stream for every candidate attempt already
+  performs the reconnect" (no BREAK needed/possible over TCP). This test
+  needed several retries around the same `dwc_otg` USB flakiness noted
+  above (an intermittent "no relay available" while `togov`'s attach state
+  flapped) — not a pool-port defect, the same pre-existing, documented
+  hardware quirk.
+- **`GET`/`PUT`/`DELETE /names/<name>`** — PASS. `curl` from `loki` against
+  `hodr:7445`: `GET` on a never-seen name derives-and-persists
+  (`{"channel": 35, "group": 97, "source": "derived"}`, HTTP 200,
+  idempotent on repeat), `PUT` with a JSON body sets an override
+  (`source: "registry"`), `DELETE` re-derives and returns the fresh value,
+  a malformed name and an out-of-range channel both come back `400` with
+  a clear message. Response shape (`{channel: number, group: number,
+  source: string}`) matches `mbrelayRegistry.ts`'s `parseResolvedAddress`
+  exactly; mbtools only ever emits `"derived"`/`"registry"` for `source`,
+  both of which are in that module's `KNOWN_SOURCES` set (which also
+  tolerates a legacy-only `"config"` value mbtools never sends).
+
+## Scenario 5 — non-root USB access, including idempotent re-install
+
+**PASS**, on all four Nolanet nodes (the ticket requires one; all four
+were done for genuine fleet value going into sprint 005). Per host:
+`mbregistry install-service` (writes the systemd unit + the three-rule
+udev file — tty/CDC-ACM, raw USB, `hidraw*`, all `GROUP="plugdev"
+MODE="0660" TAG+="uaccess"`), `udevadm control --reload-rules && udevadm
+trigger`, `usermod -aG plugdev eric`, then **a fresh SSH session**
+(ticket 008's own documented caveat — an already-open session does not
+pick up the new group). Confirmed in the new session: `groups` shows
+`plugdev`; `mbserial <board> STATUS`/`"?"` and `mbregistry list` all work
+with **no `sudo`** on `meili`, `loki`, `hodr`, `magni`.
+
+**Idempotent re-run**, on `loki` (service already `active`): re-running
+`install-service` rewrote both files with byte-identical content (confirmed
+`md5sum` unchanged across the two runs), never touched
+`mbregistry.service`'s running state (`active` before and after, no
+restart), and non-root `mbserial` access kept working immediately after.
+
+**pyOCD fail-fast**, real permission failure (not simulated): on `hodr`,
+*before* `install-service` had been run there, `eric` (not yet in
+`plugdev`) ran `mbdeploy deploy togov --hex <local .hex> --force-relay`
+with no `sudo`:
+
+```
+Error: permission denied opening /dev/ttyACM0 -- this user has no read/write
+access to the device. Install the udev rule (run 'mbregistry install-service'
+as root -- ticket 008) then start a new session ... or run this command with
+sudo.
+mbdeploy: flash failed (exit 1)
+
+real  0m1.408s
+```
+
+1.4 seconds, no pyOCD invocation at all (the pre-check catches it first),
+a clear actionable message — exactly ticket 009's "report within seconds"
+criterion. (`mbdeploy debug`'s own fail-fast is deliberately out of that
+ticket's scope, per its own Implementation Notes — not re-tested here for
+the same reason.)
+
+## Scenario 6 — braeburn mDNS discovery without `--peer`
+
+**PASS at this session's uptime; the multi-hour degradation itself
+neither reproduced nor ruled out.** `braeburn`'s `mbregistry` was started
+fresh this session (none was running at all at session start, unlike
+`docs/acceptance/003-hardware.md`'s finding of one already up) and stayed
+discoverable from a Nolanet node throughout: `avahi-browse -rt
+_mbregistry._tcp` on `loki`, **no `--peer` flag**, found `braeburn`
+immediately at session start and again ~27 minutes later (this session's
+own real-time budget did not extend to the ~3.5-hour window
+`docs/acceptance/004-hardware.md`'s own ticket-010 section measured the
+degradation at) — `mbregistry list` on `loki` shows `braeburn`'s board
+(`zugit`) with `HOST: braeburn`, unprompted. Ticket 010's self-check
+diagnostic (a `WARNING` log the moment `braeburn`'s own mDNS
+re-resolution fails) is the intended way a future session catches a
+recurrence without repeating this multi-hour investigation; nothing in
+`braeburn`'s own log during this run's ~27-minute window triggered it.
+The `--peer braeburn:7440` workaround was not applied as a standing
+config change this session (matching `docs/acceptance/004-hardware.md`'s
+own note not to assume it is set without checking).
+
+## Full test suite
+
+`uv run pytest -q`: **776 passed, 2 skipped** (post-fix; the ticket's own
+pre-flight, pre-fix run was the 218-test scoped subset above). Scoped
+regression run for the `remote_api` fix,
+`tests/registry/remote_api/ tests/relay/`: 144 passed.
+
+## Summary
+
+| Scenario | Result |
+|---|---|
+| Relay + robot firmware flashed onto designated (spare/dedicated) boards | PASS |
+| `mbrelay connect` cross-host, confirmed `PING`→pong over radio | PASS (after correcting to the robot's own self-addressed channel/group — see Scenario 2) |
+| Remote relay reset over the remote stream | PASS |
+| robot-console compatibility (mDNS/TXT, pool-port reset-by-reconnect, `/names`) | PASS, verified by direct endpoint exercise against `robot-console`'s own source (full headless run not attempted — see Scenario 4) |
+| Non-root `mbdeploy`/`mbserial`, including idempotent re-install | PASS (4/4 Nolanet nodes) |
+| pyOCD fail-fast under a real permission failure | PASS (~1.4s) |
+| braeburn mDNS discovery without `--peer` | PASS at this session's (~27 min) uptime; multi-hour degradation neither reproduced nor newly ruled out |
+
+**One real bug found and fixed this ticket** (remote `stream` op rejected
+a `relay`-kind lock — see above, with a regression test). **One real bug
+found and documented, not fixed** (a relay mid-data-plane can have its
+registry identity corrupted by the radio traffic it's transparently
+forwarding, if a reprobe races it — see "New finding" above; recommend a
+follow-up ticket). Every other scenario passed on real hardware as
+designed. No changes were needed to `docs/wiki/` (this repository still
+has none — ticket 005/006/007/008's own Implementation Notes already
+established `docs/design/specification.md` and `docs/design/registry-api.md`
+as this project's documentation home in its absence) beyond the
+`registry-api.md` update accompanying the `stream` op fix above.

@@ -1,9 +1,21 @@
 ---
 id: '011'
 title: Real-hardware acceptance
-status: open
-use-cases: [SUC-001, SUC-002, SUC-003, SUC-004, SUC-005, SUC-006]
-depends-on: ['005', '006', '007', '008', '009', '010']
+status: in-progress
+use-cases:
+- SUC-001
+- SUC-002
+- SUC-003
+- SUC-004
+- SUC-005
+- SUC-006
+depends-on:
+- '005'
+- '006'
+- '007'
+- 008
+- 009
+- '010'
 github-issue: ''
 issue:
 - mbrelay-relay-protocol-client-over-mbregistry.md
@@ -81,24 +93,71 @@ project's CLAUDE.md rule on keeping docs current with behavior changes).
 
 ## Acceptance Criteria
 
-- [ ] Relay and robot firmware flashed onto the designated test boards
+- [x] Relay and robot firmware flashed onto the designated test boards
       (spare board only — no robot in active use disturbed).
-- [ ] `mbrelay connect <robot>@<host>` succeeds cross-host, with a
+- [x] `mbrelay connect <robot>@<host>` succeeds cross-host, with a
       confirmed `PING`→`pong` round trip over radio.
-- [ ] Remote relay reset confirmed working over the remote stream.
-- [ ] robot-console's actual compatibility endpoints (mDNS/TXT, pool
+- [x] Remote relay reset confirmed working over the remote stream.
+- [x] robot-console's actual compatibility endpoints (mDNS/TXT, pool
       port, `/names`) verified against robot-console's own source as the
       spec, with the outcome (including which of the two checkouts was
       used, per the confirmed-or-defaulted decision) recorded.
-- [ ] Non-root `mbdeploy`/`mbserial` access confirmed on a Nolanet node,
+- [x] Non-root `mbdeploy`/`mbserial` access confirmed on a Nolanet node,
       including the idempotent-reinstall case.
-- [ ] pyOCD fail-fast confirmed to report within seconds under a real or
+- [x] pyOCD fail-fast confirmed to report within seconds under a real or
       simulated permission failure.
-- [ ] braeburn's peering outcome (fixed, or workaround re-confirmed) is
+- [x] braeburn's peering outcome (fixed, or workaround re-confirmed) is
       recorded accurately — not claimed fixed unless actually observed
       working on real hardware.
-- [ ] `docs/acceptance/004-hardware.md` written, following the `001`-`003`
+- [x] `docs/acceptance/004-hardware.md` written, following the `001`-`003`
       format.
+
+## Implementation Notes
+
+Full story in `docs/acceptance/004-hardware.md`'s own "Ticket 011" section
+(appended below ticket 010's own section, per this ticket's scope note —
+not retroactively edited). Highlights for anyone picking up follow-on
+work:
+
+- **A real cross-module bug was found and fixed**: `registry.remote_api
+  .RemoteAPIServer._op_stream_precheck` (ticket 007) only ever accepted a
+  `serial`-kind lock, but `relay.channel.RemoteRelayChannel` (ticket 004)
+  was always built to call the same `stream` op after a `relay`-kind
+  lock — invisible to every existing test (both sides of that RPC are
+  tested against fakes), surfaced only by two real `mbregistry`s talking
+  to each other. Fixed to accept `serial` or `relay`-kind (not
+  `flash`/`debug`). Regression test:
+  `tests/registry/remote_api/test_remote_stream.py::
+  test_stream_with_a_relay_kind_lock_is_accepted`.
+- **A second real bug was found and documented, not fixed**: a relay
+  device mid-data-plane (transparently forwarding radio traffic) can have
+  its own registry row overwritten with the *robot's* identity if a
+  reprobe races it — `identity.probe()`'s HELLO+readline has no way to
+  tell a radio-forwarded fragment from the relay's own genuine banner.
+  Recommend a follow-up ticket: have the daemon's reprobe path BREAK a
+  device whose *stored* role is already a relay/bridge before trusting a
+  fresh HELLO reply, mirroring `relay.protocol.RelayControl.hello`'s own
+  already-proven BREAK-recovery mechanism. Not attempted here — the fix
+  touches the daemon's shared, heavily-tested attach/reprobe pipeline
+  (identical code path for every device) and this session had only one,
+  hard-to-reproduce observation to validate against.
+- **`mbrelay connect`'s `PING`→pong test needed the robot's own
+  *self-addressed* channel/group** (`naming.name_to_radio(name)` — e.g.
+  channel 21/group 185 for `gitev`), confirmed live via `mbserial
+  <name> STATUS`'s `radio=1 channel=... group=...` fields, **not** the
+  fixed channel/group `nezha-robot-template`'s own release notes state
+  ("channel 55 / group 114") — that value did not answer on either board
+  tested, for a reason not root-caused this session (see the acceptance
+  doc's Scenario 2 for the full account, including a red herring around
+  the relay's own RAW250-vs-MAKECODE framing that turned out not to be
+  the actual issue).
+- `robot-console`'s host package was **not** run headless this session
+  (no `node_modules`, two native-compiled deps, out of proportion to this
+  ticket's own scope) — compatibility was instead verified by directly
+  exercising `_mbrelay._tcp`/pool-port/`/names` the same way that
+  package's own source (`mdnsDiscovery.ts`, `relayBridger.ts`,
+  `mbrelayRegistry.ts`) does. A future ticket that touches robot-console
+  itself will need to do the `npm install` this one didn't.
 
 ## Testing
 

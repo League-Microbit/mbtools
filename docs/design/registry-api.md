@@ -561,27 +561,38 @@ ignored (and never acted on) until authentication succeeds on a
 handshake is skipped entirely and a connection's first line is
 dispatched as a normal op, exactly like the local Unix socket.
 
-### Stream sub-protocol (sprint 003, ticket 007)
+### Stream sub-protocol (sprint 003, ticket 007; widened sprint 004, ticket 011)
 
 `{"op": "stream", "uid": "..."}` is the one JSON-op request that does
 **not** get an ordinary JSON response and go on to the next line. It
-requires the calling connection to already hold a `serial`-kind lock on
-`uid` — acquired by *this same connection's* own `lock` call, checked
-the same "this connection's own holder, not merely some holder" way
-`flash` checks its own `flash`-kind precondition:
+requires the calling connection to already hold a `serial`- **or
+`relay`-kind** lock on `uid` — acquired by *this same connection's* own
+`lock` call, checked the same "this connection's own holder, not merely
+some holder" way `flash` checks its own `flash`-kind precondition:
 
 ```jsonc
 // request
 {"op": "stream", "uid": "..."}
 // response, success:
 {"ok": true}
-// or, no serial-kind lock held by this connection (or a different kind is held):
+// or, no serial/relay-kind lock held by this connection (or a different kind is held):
 {"ok": false, "code": "not_locked", "error": "..."}
 // or:
 {"ok": false, "code": "not_found", "error": "..."}
 // or, missing uid:
 {"ok": false, "code": "invalid_request", "error": "..."}
 ```
+
+`relay`-kind was added during ticket 011's real-hardware acceptance
+pass: `relay.channel.RemoteRelayChannel` (ticket 004) was always meant
+to open a remote relay's byte stream this same way, but this op's
+precheck only ever accepted `serial`-kind, so every `mbrelay connect
+<robot>@<host>` against a *different*-host relay raised an uncaught
+`RegistryClientError` server-side ("stream requires a serial-kind lock
+held by this connection") — invisible to every unit/integration test on
+both sides of this RPC, since they exercise it against fakes, not each
+other. `flash`/`debug`-kind locks remain excluded; neither has any
+legitimate reason to open a raw byte stream.
 
 On `{"ok": true}`, the connection **permanently** leaves newline-JSON
 framing — there is no op after `stream`, and no way back to JSON mode on

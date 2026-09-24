@@ -1,8 +1,8 @@
-"""Tests for mbtools.registry.remote_api's "stream" op (ticket 007) --
-the framed binary data+control sub-protocol
-(mbtools.registry.stream_frame) a TCP connection to RemoteAPIServer
-switches into once it holds a serial-kind lock and sends
-{"op": "stream", "uid": "..."}.
+"""Tests for mbtools.registry.remote_api's "stream" op (ticket 007;
+widened to accept a relay-kind lock too in ticket 011) -- the framed
+binary data+control sub-protocol (mbtools.registry.stream_frame) a TCP
+connection to RemoteAPIServer switches into once it holds a serial- or
+relay-kind lock and sends {"op": "stream", "uid": "..."}.
 
 Every test here drives a real RemoteAPIServer over a real AF_INET
 loopback socket, mirroring test_remote_api.py's own precedent, with the
@@ -21,7 +21,7 @@ import pytest
 
 from mbtools.common import CODE_INVALID_REQUEST, CODE_NOT_FOUND, CODE_NOT_LOCKED
 from mbtools.registry.identity import ProbeResult
-from mbtools.registry.locks import KIND_FLASH, KIND_SERIAL, LockManager
+from mbtools.registry.locks import KIND_FLASH, KIND_RELAY, KIND_SERIAL, LockManager
 from mbtools.registry.remote_api import RemoteAPIServer
 from mbtools.registry.store import Store
 from mbtools.registry.stream_frame import (
@@ -222,6 +222,29 @@ def test_stream_with_another_connections_serial_lock_is_not_locked(remote_server
     assert resp["code"] == CODE_NOT_LOCKED
     holder.close()
     contender.close()
+
+
+def test_stream_with_a_relay_kind_lock_is_accepted(remote_server):
+    """Regression test for ticket 011's real-hardware finding: this
+    precheck used to accept only ``KIND_SERIAL``, so
+    ``relay.channel.RemoteRelayChannel`` (ticket 004) -- which locks a
+    remote relay device ``relay``-kind before calling this exact op --
+    got an uncaught ``not_locked`` error the first time ``mbrelay
+    connect <robot>@<host>`` was run against a real, different-host
+    relay. Every unit test on both sides of this RPC used a fake peer
+    (``tests/relay/test_cli.py``'s ``FakeRemoteRegistryClient``), so
+    this never surfaced until real hardware. See remote_api.py's
+    ``_op_stream_precheck`` docstring and docs/design/registry-api.md's
+    "Stream sub-protocol" section for the full story."""
+    srv = remote_server()
+    client = _StreamClient(srv.bound_port)
+    resp = client.request({"op": "lock", "uid": LOCAL_UID, "kind": KIND_RELAY})
+    assert resp["ok"] is True
+
+    resp = client.request({"op": "stream", "uid": LOCAL_UID})
+
+    assert resp == {"ok": True}
+    client.close()
 
 
 def test_stream_requires_uid(remote_server):
