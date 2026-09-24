@@ -1,9 +1,15 @@
 # `mbregistry` API — wire protocol
 
-Implemented by `mbtools.registry.api.RegistryAPIServer` (sprint 001, ticket 008).
-Written down here — not only in code — per sprint.md's Open Question #1: this
-becomes a de facto contract sprint 002's client tools (`mbdeploy`, `mbserial`)
-must speak.
+Implemented by `mbtools.registry.api.RegistryAPIServer` (sprint 001, ticket 008)
+over a local Unix socket, and, since sprint 003 ticket 006, by
+`mbtools.registry.remote_api.RemoteAPIServer` over TCP for the same
+`list`/`find`/`lock`/`unlock`/`mark_flashed` ops (see "Remote TCP control
+plane" below) — the two share one dispatch implementation
+(`mbtools.registry._api_base.BaseAPIServer`). Written down here — not
+only in code — per sprint.md's Open Question #1: this becomes a de facto
+contract sprint 002's client tools (`mbdeploy`, `mbserial`) must speak.
+Except where noted, everything below describes the local Unix socket;
+"Remote TCP control plane" covers only where the TCP transport differs.
 
 ## Transport
 
@@ -53,11 +59,34 @@ Every non-streaming response is one of:
 
 | code | meaning |
 |---|---|
-| `not_found` | no device matches the given uid/short_uid/device_name |
-| `locked` | `lock` failed — device already held by someone else. The response also carries `"holder": {"kind": ..., "pid": ...}` |
+| `not_found` | no device matches the given uid/short_uid/device_name (or, on the remote TCP API, the device exists in this registry's cache but is peer-owned — see "Remote TCP control plane" below) |
+| `locked` | `lock` failed — device already held by someone else. The response also carries a `"holder"` object — see "Lock holder wire shape" below |
 | `not_locked` | `flash` or `mark_flashed` was requested without this connection already holding a `flash`-kind lock on that device |
 | `invalid_request` | malformed JSON, missing/bad fields, or an unknown `op` |
 | `internal_error` | reserved for an unexpected server-side failure (not raised by normal dispatch paths as of this ticket) |
+| `ambiguous_name` | sprint 003, ticket 006: a bare device-name token (no `@host` suffix) matches devices on more than one host — `store.find`'s `AmbiguousNameError` (ticket 001), translated here since `list`/`find`/`lock`/`unlock`/`mark_flashed` (both the local Unix API and the remote TCP API — they share one dispatch implementation, `registry._api_base`) are `store.find`'s first real API-layer callers. The response also carries `"hosts": [...]` (`null` for the local/`NULL` host), for a client to build a `name@host` suggestion from. |
+| `unauthorized` | sprint 003, ticket 006, remote TCP API only: `--auth-token`/`$MBREGISTRY_TOKEN` is configured and this connection's first message didn't carry a matching token |
+
+### Lock holder wire shape
+
+```jsonc
+// a local holder (unchanged since sprint 001):
+"holder": {"kind": "flash", "pid": 4821}
+// a remote (session-tied) holder (sprint 003, ticket 006) -- an additive
+// superset, never a breaking change to the local shape above:
+"holder": {"kind": "flash", "pid": null, "origin": "remote", "host": "loki"}
+```
+
+Since sprint 003 (ticket 002), a device's lock can be held by either a
+local (PID-tied) or a remote (session-tied) client — the local Unix API
+and the remote TCP API share one `LockManager` table (Decision 2), so a
+`locked` response on *either* API can name a holder of *either* origin.
+A local holder's wire shape is exactly the 2-key form shown above,
+unchanged since before this sprint. A remote holder adds `origin`/`host`
+and reports `pid: null` ("a PID means nothing across hosts") — a client
+that only ever checked `holder.kind`/`holder.pid` keeps working
+unmodified; only a client that wants to show "locked by loki" instead of
+"locked by pid 4821" needs to look at the new keys.
 
 ### `list`
 
@@ -252,16 +281,117 @@ for existing (Open Question #1).
   `device_name` match that is ambiguous across more than one `host`
   value (the local `NULL` host counts as one candidate) raises
   `mbtools.registry.store.AmbiguousNameError` instead of silently
-  picking one — a future `remote_api`/local-API error path will need a
-  `CODE_*` for this (not assigned by this ticket; `registry.remote_api`,
-  ticket 006+, is this module's first real caller of the ambiguity
-  path).
+  picking one — translated to the `ambiguous_name` wire code by
+  `registry._api_base` (ticket 006), this module's first real caller of
+  the ambiguity path. See "Responses" above and "Remote TCP control
+  plane" below.
 
 An updated device dict (once `registry.remote_api`/`render` surface it)
 is expected to add `host`/`remote_lock_kind`/`remote_lock_display` to
 the shape shown above, plus a `reachable` flag derived from the owning
 `peer` row for a remote-owned device — none of that wiring exists yet as
 of this ticket, which only touches `store.py`.
+
+## Remote TCP control plane (sprint 003, ticket 006)
+
+Implemented by `mbtools.registry.remote_api.RemoteAPIServer`, sharing the
+`list`/`find`/`lock`/`unlock`/`mark_flashed` dispatch implementation
+above with the local Unix-socket `api.RegistryAPIServer`
+(`mbtools.registry._api_base.BaseAPIServer`) — everything under
+"Framing"/"Requests"/"Responses" above applies unchanged to this
+transport too, for the five ops it supports. `flash` and the framed
+binary stream sub-protocol are **not yet supported here** — they are
+tickets 008 and 007 respectively; requesting either op on this server
+today gets `invalid_request`, same as any unrecognized op.
+
+### Transport
+
+A TCP socket (`AF_INET`, `SOCK_STREAM`), default port `7440`
+(`mbtools.registry.remote_api.DEFAULT_REMOTE_PORT`, sprint.md Decision
+7 — configurable). Framing is identical to the Unix socket: one
+newline-delimited JSON object per line, UTF-8, one response line per
+non-streaming request.
+
+### Scope: this registry's own devices only
+
+`list` and `find` (and, transitively, `lock`/`unlock`/`mark_flashed`,
+which resolve through the same visibility check) only ever see rows
+where `device.host IS NULL` on *this* registry (`Store.
+snapshot_local_devices`) — a token that resolves to a peer-owned row
+(this registry's own cached copy of some other host's device, written
+by `registry.peering`) gets `not_found`, exactly as if the device didn't
+exist here. This server never forwards a request to a third host
+(sprint.md Decision 8: "a remote client connects directly to the owning
+host's registry") — a client that wants peer B's device must connect to
+peer B's own `remote_api`, using the `endpoint` its own local registry's
+`find`/`list` response supplies (once `registry.peering`/`render`, later
+tickets, surface it).
+
+### Session identity, not PID identity
+
+Each accepted connection is issued a fresh, random session id
+(`uuid.uuid4`) rather than a PID — "a PID means nothing across hosts"
+(sprint.md brief open decision #3) — wrapped in a remote-origin
+`HolderRef(origin="remote", ref=<session id>, host=<client's source IP>)`
+(`mbtools.registry.locks`, ticket 002). `host` is the connecting client's
+own source IP, read from the kernel (`socket.getpeername()`) — never a
+client-declared value, mirroring the local API's own "never a
+client-supplied PID" precedent for the same reason: an identity used to
+grant or refuse a lock should not be something the client gets to assert
+for itself.
+
+`lock`/`unlock` acquire against the *same* `LockManager` instance the
+local Unix API and `daemon` already share (ticket 002's `HolderRef`
+generalization is what makes this safe) — a local and a remote request
+for the same uid correctly conflict through one table, regardless of
+which API either client used.
+
+### Locking and session lifetime
+
+Mirrors, without duplicating, the local API's own "PID dies *or* the
+connection closes" pattern (ASSUMPTION #3), generalized to sessions:
+
+- **Connection close** (clean or abrupt): this server releases exactly
+  the locks that session acquired (tracked per-connection), same as the
+  local API.
+- **Periodic liveness sweep**: independently, a background timer
+  (`sweep_interval_s`, default 5s, same default as the local API's own)
+  releases any remote-origin lock whose session id is no longer in this
+  server's own live-session set. This is what catches a session that
+  vanished without an observable connection close — a network
+  partition, not a graceful disconnect.
+- **TCP keepalive**: every accepted connection gets `SO_KEEPALIVE`
+  enabled, plus a shortened idle/interval/count where the platform
+  exposes the knobs (Linux: `TCP_KEEPIDLE`/`TCP_KEEPINTVL`/
+  `TCP_KEEPCNT`; macOS: `TCP_KEEPALIVE` for idle time only) — so a
+  half-dead session's blocked read eventually errors out and joins the
+  normal connection-close release path, instead of hanging forever and
+  never reaching the liveness sweep's "session id vanished" check either
+  (its connection would otherwise still look "live" from this server's
+  own point of view).
+
+### Auth (`--auth-token` / `$MBREGISTRY_TOKEN`, sprint.md Decision 6)
+
+Off by default, matching the local Unix socket's own trust model (no
+authentication beyond, there, filesystem permissions). When configured,
+a connection's first non-empty line must be:
+
+```jsonc
+// request
+{"token": "<the configured token>"}
+// response, on success:
+{"ok": true}
+// response, on a missing/mismatched token -- connection is then closed:
+{"ok": false, "code": "unauthorized", "error": "..."}
+```
+
+No op is ever dispatched for a connection that hasn't sent a matching
+token first — a request that packs both `"token"` and `"op"` into that
+first line is still treated purely as the auth check; the op field is
+ignored (and never acted on) until authentication succeeds on a
+*subsequent* line. When `auth_token` is unset (the default), this
+handshake is skipped entirely and a connection's first line is
+dispatched as a normal op, exactly like the local Unix socket.
 
 ## Exit codes
 
@@ -286,6 +416,14 @@ listed above, for the same one-place reason.
 
 ## Known limitations / forward notes for ticket 009 and sprint 002
 
+- **Shared dispatch base (sprint 003, ticket 006).** `list`/`find`/
+  `lock`/`unlock`/`mark_flashed` moved into `registry._api_base.
+  BaseAPIServer`, a mixin both `api.RegistryAPIServer` (Unix) and
+  `remote_api.RemoteAPIServer` (TCP) extend, parametrized on
+  `_holder_for_connection`/`_list_visible_devices`/`_device_visible`.
+  `flash` (ticket 008's remote-flash territory) and the framed binary
+  stream sub-protocol (ticket 007) stay out of the shared base —
+  neither is a JSON-op both transports support the same way yet.
 - **Threading model.** One OS thread per accepted connection, plus one
   sweep thread, serialized by a single `threading.RLock` around every call
   into `store`/`locks`/`flash_op` — **except** the `flash` op's own pyocd

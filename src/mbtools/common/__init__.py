@@ -64,6 +64,24 @@ CODE_NOT_LOCKED = "not_locked"
 CODE_INVALID_REQUEST = "invalid_request"
 CODE_INTERNAL_ERROR = "internal_error"
 
+# -- sprint 003 additions (ticket 006) ---------------------------------------
+#
+#: ``store.find()`` raises ``AmbiguousNameError`` (ticket 001) when a bare
+#: device name collides across more than one host; ticket 006's shared
+#: ``_api_base`` ops (the first API-layer callers of ``find()`` to translate
+#: exceptions into wire codes) return this for that case, on both the local
+#: Unix socket and the remote TCP control plane. The response also carries
+#: ``"hosts": [...]`` (``null`` for the local/``NULL`` host) so a client can
+#: build a ``name@host`` suggestion.
+CODE_AMBIGUOUS_NAME = "ambiguous_name"
+
+#: ``registry.remote_api``'s optional ``--auth-token``/``$MBREGISTRY_TOKEN``
+#: shared secret (sprint.md Decision 6): a connection's first message must
+#: carry a matching token when one is configured, or every op is refused
+#: with this code before any dispatch. Never returned by the local Unix
+#: socket, which has no auth concept (sprint 1's trust model, unchanged).
+CODE_UNAUTHORIZED = "unauthorized"
+
 
 @dataclass(frozen=True)
 class PortInfo:

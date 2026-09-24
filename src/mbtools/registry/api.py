@@ -102,25 +102,14 @@ import socket
 import struct
 import sys
 import threading
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable
 
-from mbtools.common import (
-    CODE_INVALID_REQUEST,
-    CODE_LOCKED,
-    CODE_NOT_FOUND,
-    CODE_NOT_LOCKED,
-)
+from mbtools.common import CODE_INVALID_REQUEST, CODE_NOT_FOUND, CODE_NOT_LOCKED
+from mbtools.registry._api_base import BaseAPIServer, _error
 from mbtools.registry.flash import FlashOp, HexValidationError
-from mbtools.registry.locks import (
-    KIND_FLASH,
-    LOCK_KINDS,
-    HolderRef,
-    LockHeldError,
-    LockManager,
-)
-from mbtools.registry.store import DeviceRecord, Store
+from mbtools.registry.locks import KIND_FLASH, HolderRef, LockManager
+from mbtools.registry.store import Store
 
 __all__ = [
     "RegistryAPIServer",
@@ -229,12 +218,6 @@ def default_is_pid_alive(pid: int) -> bool:
     return True
 
 
-def _error(code: str, message: str, **extra: Any) -> dict[str, Any]:
-    payload: dict[str, Any] = {"ok": False, "code": code, "error": message}
-    payload.update(extra)
-    return payload
-
-
 def _local_holder(pid: int) -> HolderRef:
     """Build the :class:`~mbtools.registry.locks.HolderRef` for a local,
     Unix-socket connection's own pid (ticket 002, sprint.md Decision 2) --
@@ -248,8 +231,22 @@ def _local_holder(pid: int) -> HolderRef:
     return HolderRef(origin="local", ref=str(pid), pid=pid)
 
 
-class RegistryAPIServer:
+class RegistryAPIServer(BaseAPIServer):
     """The Unix-socket query/control API server.
+
+    ``list``/``find``/``lock``/``unlock``/``mark_flashed`` dispatch
+    through :class:`~mbtools.registry._api_base.BaseAPIServer` (ticket
+    006) -- this class supplies :meth:`_holder_for_connection` (wraps
+    this connection's kernel-verified peer pid in a local
+    :class:`~mbtools.registry.locks.HolderRef`) and leaves
+    ``_list_visible_devices``/``_device_visible`` at their base
+    defaults (every device, local or remote-owned, visible -- see that
+    module's own docstring for why the local socket is not scoped the
+    way ``remote_api`` is). ``flash`` (this class's own
+    :meth:`_op_flash`, ticket 008's territory for the remote
+    equivalent) and the sweep/threading/connection-close mechanics below
+    are not shared -- they differ by transport in ways the shared base
+    does not need to know about.
 
     ``store``/``locks``/``flash_op`` are injected references -- the same
     instances a caller (ticket 009's ``mbregistry run`` assembly, or a
@@ -437,13 +434,18 @@ class RegistryAPIServer:
 
         Dispatches on ``holder.origin``: every lock this server's own
         ``lock`` op grants is local (see :func:`_local_holder`), so only
-        the ``"local"`` branch is exercised in this ticket's scope. The
-        ``"remote"`` branch is unreachable code today -- nothing in this
-        ticket constructs a remote holder -- added defensively so ticket
-        006's ``registry.remote_api`` liveness path has a safe default to
-        fall through to rather than crashing on an unhandled origin; a
-        remote holder is reported alive (never locally swept) until that
-        ticket wires its own remote liveness check.
+        the ``"local"`` branch is exercised by locks *this* server
+        acquired. A ``"remote"`` holder is reported alive unconditionally
+        -- this sweep is not the one responsible for remote-session
+        liveness (a remote holder's connection lives on
+        ``registry.remote_api``, a different socket this class knows
+        nothing about); ``remote_api.RemoteAPIServer`` runs its own,
+        symmetric sweep (``_is_holder_alive`` there reports a ``"local"``
+        holder alive unconditionally, for the same reason in reverse) --
+        see that module's docstring. Since ``lock``/``unlock`` share one
+        ``LockManager`` table (ticket 002, Decision 2), this server's
+        sweep and ``remote_api``'s can both run against the same table
+        without either one second-guessing the other's origin.
         """
         if holder.origin == "local":
             return self._is_pid_alive_fn(holder.pid)
@@ -451,13 +453,28 @@ class RegistryAPIServer:
 
     # -- connection handling ---------------------------------------------
 
+    def _holder_for_connection(self, conn: socket.socket) -> HolderRef:
+        """The :class:`~mbtools.registry._api_base.BaseAPIServer` hook
+        (ticket 006): wraps this connection's kernel-verified peer pid
+        (``SO_PEERCRED``/``LOCAL_PEERPID``, via ``self._peer_pid_fn``) in
+        a local :class:`~mbtools.registry.locks.HolderRef`. Replaces the
+        direct ``self._peer_pid_fn(conn)`` call that used to sit inline
+        in :meth:`_handle_connection`, with the same ``OSError`` ->
+        "drop the connection" handling left to that method's own
+        try/except (mirroring how it always worked, just relocated).
+        """
+        pid = self._peer_pid_fn(conn)
+        return _local_holder(pid)
+
     def _handle_connection(self, conn: socket.socket) -> None:
         try:
-            pid = self._peer_pid_fn(conn)
+            holder = self._holder_for_connection(conn)
         except OSError:
             logger.exception("api: could not read peer pid; dropping connection")
             conn.close()
             return
+        pid = holder.pid
+        assert pid is not None  # every holder this class builds carries one
 
         acquired_uids: set[str] = set()
         rfile = conn.makefile("r", encoding="utf-8", newline="\n")
@@ -467,7 +484,7 @@ class RegistryAPIServer:
                 line = raw_line.strip()
                 if not line:
                     continue
-                self._dispatch_line(line, pid, acquired_uids, wfile)
+                self._dispatch_line(line, pid, holder, acquired_uids, wfile)
         except (ConnectionError, OSError):
             pass
         finally:
@@ -475,7 +492,6 @@ class RegistryAPIServer:
             # the locks this connection acquired, never a blanket sweep
             # -- see the module docstring.
             with self._lock:
-                holder = _local_holder(pid)
                 for uid in list(acquired_uids):
                     self._locks.release(uid, holder)
             for f in (rfile, wfile):
@@ -489,7 +505,12 @@ class RegistryAPIServer:
                 pass
 
     def _dispatch_line(
-        self, line: str, pid: int, acquired_uids: set[str], wfile: Any
+        self,
+        line: str,
+        pid: int,
+        holder: HolderRef,
+        acquired_uids: set[str],
+        wfile: Any,
     ) -> None:
         try:
             req = json.loads(line)
@@ -506,89 +527,22 @@ class RegistryAPIServer:
         elif op in ("get", "find"):
             resp = self._op_find(req)
         elif op == "lock":
-            resp = self._op_lock(req, pid, acquired_uids)
+            resp = self._op_lock(req, holder, acquired_uids)
         elif op == "unlock":
-            resp = self._op_unlock(req, pid, acquired_uids)
+            resp = self._op_unlock(req, holder, acquired_uids)
         elif op == "flash":
             resp = self._op_flash(req, pid, acquired_uids, wfile)
         elif op == "mark_flashed":
-            resp = self._op_mark_flashed(req, pid)
+            resp = self._op_mark_flashed(req, holder)
         else:
             resp = _error(CODE_INVALID_REQUEST, f"unknown op {op!r}")
         self._write(wfile, resp)
 
-    @staticmethod
-    def _write(wfile: Any, message: dict[str, Any]) -> None:
-        wfile.write(json.dumps(message))
-        wfile.write("\n")
-        wfile.flush()
-
-    def _device_dict(self, record: DeviceRecord) -> dict[str, Any]:
-        """A device record, with its current lock status (kind + pid)
-        folded in -- ``list``/``get``/``find``'s acceptance criterion,
-        so ticket 009's STATE column needs no second round-trip.
-        Callers hold ``self._lock`` already.
-        """
-        holder = self._locks.status(record.uid)
-        d = asdict(record)
-        d["lock_kind"] = holder.kind if holder is not None else None
-        d["lock_pid"] = holder.pid if holder is not None else None
-        return d
-
     # -- ops --------------------------------------------------------------
-
-    def _op_list(self) -> dict[str, Any]:
-        with self._lock:
-            devices = [self._device_dict(r) for r in self._store.list_devices()]
-        return {"ok": True, "devices": devices}
-
-    def _op_find(self, req: dict[str, Any]) -> dict[str, Any]:
-        token = req.get("uid") or req.get("token")
-        if not token:
-            return _error(CODE_INVALID_REQUEST, "'get'/'find' requires 'uid'")
-        with self._lock:
-            record = self._store.find(str(token))
-            if record is None:
-                return _error(CODE_NOT_FOUND, f"no such device: {token!r}")
-            return {"ok": True, "device": self._device_dict(record)}
-
-    def _op_lock(
-        self, req: dict[str, Any], pid: int, acquired_uids: set[str]
-    ) -> dict[str, Any]:
-        token = req.get("uid")
-        kind = req.get("kind")
-        if not token or not kind:
-            return _error(CODE_INVALID_REQUEST, "'lock' requires 'uid' and 'kind'")
-        if kind not in LOCK_KINDS:
-            return _error(CODE_INVALID_REQUEST, f"unknown lock kind {kind!r}")
-        with self._lock:
-            record = self._store.find(str(token))
-            if record is None:
-                return _error(CODE_NOT_FOUND, f"no such device: {token!r}")
-            try:
-                self._locks.acquire(record.uid, kind, _local_holder(pid))
-            except LockHeldError as exc:
-                return _error(
-                    CODE_LOCKED,
-                    str(exc),
-                    holder={"kind": exc.holder.kind, "pid": exc.holder.pid},
-                )
-            acquired_uids.add(record.uid)
-            return {"ok": True}
-
-    def _op_unlock(
-        self, req: dict[str, Any], pid: int, acquired_uids: set[str]
-    ) -> dict[str, Any]:
-        token = req.get("uid")
-        if not token:
-            return _error(CODE_INVALID_REQUEST, "'unlock' requires 'uid'")
-        with self._lock:
-            record = self._store.find(str(token))
-            if record is None:
-                return _error(CODE_NOT_FOUND, f"no such device: {token!r}")
-            released = self._locks.release(record.uid, _local_holder(pid))
-            acquired_uids.discard(record.uid)
-            return {"ok": True, "released": released}
+    #
+    # list/find/lock/unlock/mark_flashed are inherited from BaseAPIServer
+    # (ticket 006) -- see this class's own docstring and that module's.
+    # Only `flash` (ticket 008's remote-flash territory) stays here.
 
     def _op_flash(
         self,
@@ -695,40 +649,8 @@ class RegistryAPIServer:
             "error": result.error,
         }
 
-    def _op_mark_flashed(self, req: dict[str, Any], pid: int) -> dict[str, Any]:
-        """``mark_flashed(uid)``: bookkeeping-only op for a flash that ran
-        *outside* this server's own ``flash`` op -- sprint 002's ``mbdeploy``
-        flashes locally by running pyocd directly (ticket 007) rather than
-        through ``flash``, per sprint.md's Design Rationale ("a new
-        ``mark_flashed`` wire-protocol op, rather than reusing ``unlock`` or
-        extending ``flash``"). Without this op, nothing calls
-        ``store.increment_flash_count`` for that path.
-
-        Same precondition as ``flash``: a ``flash``-kind lock already held
-        by *this connection's* own pid, checked via ``LockManager.status``
-        exactly like :meth:`_op_flash` does -- a lock held by a different
-        connection (or no lock at all) is ``not_locked``, same as ``flash``.
-        On success, increments ``store.flash_count`` for ``uid`` by one and
-        returns ``{"ok": true}``. No pyocd invocation here, and no re-probe
-        trigger of its own: this op never releases the lock, so it doesn't
-        need to -- any ``flash``-kind lock release already re-probes
-        (``LockManager``'s ``flash_release_callback``, unconditional on the
-        releasing caller), regardless of what ran before it.
-        """
-        token = req.get("uid")
-        if not token:
-            return _error(CODE_INVALID_REQUEST, "'mark_flashed' requires 'uid'")
-        with self._lock:
-            record = self._store.find(str(token))
-            if record is None:
-                return _error(CODE_NOT_FOUND, f"no such device: {token!r}")
-            uid = record.uid
-            holder = self._locks.status(uid)
-            if holder is None or holder.kind != KIND_FLASH or holder.pid != pid:
-                return _error(
-                    CODE_NOT_LOCKED,
-                    f"{uid}: mark_flashed requires a flash-kind lock held by "
-                    "this connection (call 'lock' first)",
-                )
-            self._store.increment_flash_count(uid)
-            return {"ok": True}
+    # `mark_flashed` is inherited from BaseAPIServer (ticket 006) -- see
+    # this class's own docstring. Its precondition/semantics (a
+    # flash-kind lock already held by *this connection's own* holder,
+    # checked via `LockManager.status`, exactly as `_op_flash` above
+    # checks) are unchanged from this method's pre-ticket-006 shape.
