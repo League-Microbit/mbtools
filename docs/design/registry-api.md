@@ -281,6 +281,62 @@ peer's `remote_api` the same question instead. A future ticket adding a
 remote caller would wire the same four `BaseAPIServer` methods into
 `remote_api.RemoteAPIServer`'s own dispatch, not re-port them.
 
+### The other caller: robot-console, over HTTP (sprint 004, ticket 007)
+
+`registry.console_compat.names_api.NamesAPI` serves `GET/PUT/DELETE
+/names/<name>` on its own TCP port
+(`registry.console_compat.relay_pool.RelayPool.DEFAULT_NAMES_API_PORT`,
+`7445` — the same port `RelayPool` advertises in its mDNS TXT
+`registry=` key), wired into `mbregistry run`'s assembly alongside
+`daemon`/`api`/`remote_api`/`peering`/`relay_pool`, sharing their one
+`threading.RLock`. This is a *different* surface from the
+`names_get`/`names_set`/`names_clear`/`names_list` ops documented
+above — plain HTTP/JSON, not the Unix-socket JSON-line protocol — for
+the one external consumer (`packages/host/src/mbrelayRegistry.ts` in
+`robot-console`) that has no other way to reach this daemon:
+
+```
+GET /names/tovez
+-> 200 {"channel": 20, "group": 30, "source": "registry"}
+-> 200 {"channel": 41, "group": 187, "source": "derived"}   -- unseen name: derives and persists
+
+PUT /names/tovez
+body: {"channel": 20, "group": 30}
+-> 200 {"channel": 20, "group": 30, "source": "registry"}
+-> 400 {"error": {"code": "bad_request", "message": "..."}}  -- malformed body, or channel/group
+                                                                 outside what !CG accepts (0-83 /
+                                                                 0-255) -- never silently clamped
+
+DELETE /names/tovez
+-> 200 {"channel": 41, "group": 187, "source": "derived"}   -- cleared, then immediately
+                                                                 re-derived (legacy mbrelay's own
+                                                                 NameRegistry.clear() -> resolve()
+                                                                 precedent)
+```
+
+Response shape is exactly `{"channel": int, "group": int, "source":
+str}` for all three verbs — cross-checked field-by-field against
+`mbrelayRegistry.ts`'s own `parseResolvedAddress`, not the fuller
+`name`/`updated`/`conflict`/`channel_conflict` shape the Unix-socket ops
+above return. `GET` is `Store.resolve`'s own write-on-read semantic
+(derives and persists a `source: "derived"` row the first time a
+well-formed but unseen name is asked about — there is no non-mutating
+"peek" over this route, matching `mbrelayRegistry.ts`'s own documented
+understanding of the contract); a repeat `GET` for an already-known name
+has no side effect at all, replication included. `PUT`/`DELETE` exist
+for parity with legacy `mbrelay`'s own HTTP contract (admin/tooling use)
+— `mbrelay names set`/`names clear` themselves still go through the
+local Unix-socket ops above, never this HTTP route. Every write here —
+a `PUT`, a `DELETE`, or a `GET`'s own derive-on-miss — replicates via
+`PeerDiscovery.publish_name_set`/`publish_name_clear`, the exact same
+two callables `registry.cli.assemble_registry` already hands to
+`RegistryAPIServer` for the Unix-socket ops' own replication. No
+`--auth-token` check on this listener, ever — robot-console has no
+mechanism to send one (sprint.md's Migration Concerns), matching legacy
+`mbrelay`'s own no-auth posture for this exact surface. See
+`registry.console_compat.names_api`'s own module docstring for the full
+per-request contract.
+
 ## Locking and connection lifetime
 
 Per sprint.md's Architecture ASSUMPTION #3 ("the lock releases when the PID

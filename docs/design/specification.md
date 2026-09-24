@@ -309,10 +309,21 @@ reset-by-reconnect, TXT `registry=`, and `GET /names/<name>`. Resolved
 [Open decisions §6](#6-where-does-the-relay-pool-live-and-what-about-robot-console-resolved-sprint-004)):
 hosted inside `mbregistry` as `registry.console_compat.relay_pool.
 RelayPool` (the pool port, ticket 006) and `registry.console_compat.
-names_api` (the `/names/<name>` HTTP endpoint, ticket 007). Neither
-listener checks `--auth-token` — robot-console has no mechanism to send
-one, matching legacy `mbrelay`'s own no-auth posture for this exact
-surface (sprint.md's Migration Concerns). See the full contract in
+names_api.NamesAPI` (ticket 007) — `GET/PUT/DELETE /names/<name>` on
+`RelayPool.DEFAULT_NAMES_API_PORT` (`7445`, the same port `RelayPool`
+advertises in its TXT `registry=` key). `GET` is robot-console's own
+call (write-on-read: derives and persists a `source: "derived"` entry
+on first ask, per `mbrelayRegistry.ts`'s own documented expectation);
+`PUT`/`DELETE` exist for parity with legacy `mbrelay`'s own HTTP
+contract, for admin/tooling use — `mbrelay names set`/`names clear`
+themselves go through the registry daemon's local Unix-socket API
+instead (§6.5), not this HTTP listener. Every write (a `PUT`, a
+`DELETE`, or a `GET`'s own derive-on-miss) replicates via
+`PeerDiscovery.publish_name_set`/`publish_name_clear`, the same two
+callables ticket 005's local-socket ops already use. Neither listener
+checks `--auth-token` — robot-console has no mechanism to send one,
+matching legacy `mbrelay`'s own no-auth posture for this exact surface
+(sprint.md's Migration Concerns). See the full contract in
 [robot-console compatibility contract](#7-robot-console-compatibility-contract)
 below — breaking it silently mistunes moved robots.
 
@@ -505,10 +516,14 @@ serves only this host's own local relays (Decision 5 — no cross-host
 relay proxying), on `RelayPool.DEFAULT_POOL_PORT` (`7444`, distinct from
 legacy `mbrelay`'s `8760` — Decision 6), and advertises
 `RelayPool.DEFAULT_NAMES_API_PORT` (`7445`) in its TXT `registry=` key
-for the `names_api` HTTP listener ticket 007 adds. See
+for `registry.console_compat.names_api.NamesAPI` (ticket 007), the
+`GET/PUT/DELETE /names/<name>` HTTP listener that serves that same
+port, also wired into `mbregistry run`'s assembly and sharing the same
+`threading.RLock`. See
 [cross-cutting §7](#7-robot-console-compatibility-contract) for the
-contract this satisfies, and `registry.console_compat.relay_pool`'s own
-module docstring for the full per-connection sequence.
+contract this satisfies, and `registry.console_compat.relay_pool`'s/
+`registry.console_compat.names_api`'s own module docstrings for the
+full per-connection/per-request sequence of each.
 - The name registry (robot → channel/group) also has a home: a
   `name_registry` table in the registry database (`registry.store`,
   sprint 004 ticket 001), replicated to peers over the existing ZMQ

@@ -71,6 +71,7 @@ from mbtools.registry.client import (
 )
 from mbtools.registry.client import SOCKET_ENV_VAR as _SOCKET_ENV_VAR
 from mbtools.registry.client import resolve_socket_path
+from mbtools.registry.console_compat.names_api import NamesAPI
 from mbtools.registry.console_compat.relay_pool import (
     DEFAULT_NAMES_API_PORT,
     DEFAULT_POOL_PORT,
@@ -97,6 +98,7 @@ __all__ = [
     "assemble_daemon_and_api",
     "assemble_registry",
     "assemble_relay_pool",
+    "assemble_names_api",
     "render_systemd_unit",
     "DEFAULT_UNIT_PATH",
 ]
@@ -510,6 +512,58 @@ def assemble_relay_pool(
     )
 
 
+def assemble_names_api(
+    *,
+    store: Store,
+    lock: threading.RLock,
+    host: str = "0.0.0.0",
+    port: int = DEFAULT_NAMES_API_PORT,
+    name_set_callback: Any = None,
+    name_clear_callback: Any = None,
+) -> NamesAPI:
+    """Sprint 004 ticket 007: build the ``console_compat.names_api.
+    NamesAPI`` that serves the ``GET/PUT/DELETE /names/<name>`` HTTP
+    contract robot-console already expects -- see that module's own
+    docstring for the full contract.
+
+    A separate assembly function, not folded into :func:`assemble_registry`
+    itself, for the same reason :func:`assemble_relay_pool` isn't --
+    that function's own 4-tuple return stays exactly as every existing
+    caller/test unpacks it. :func:`cmd_run` calls this function with
+    ``store`` and the same ``lock`` it passed to
+    :func:`assemble_registry`/:func:`assemble_relay_pool`, so a write this
+    listener makes is serialized against every other component sharing
+    that one ``threading.RLock``.
+
+    ``port`` defaults to :data:`~mbtools.registry.console_compat.
+    relay_pool.DEFAULT_NAMES_API_PORT` -- the exact port
+    :func:`assemble_relay_pool`'s own ``names_api_port`` (also defaulted
+    from the same constant) advertises in its mDNS TXT ``registry=`` key,
+    so the two never drift apart as long as neither caller overrides one
+    without the other (:func:`cmd_run` doesn't -- there is no
+    ``--names-api-port`` flag yet, deliberately out of this ticket's own
+    scope, same as :func:`assemble_relay_pool`'s own "no
+    ``--relay-pool-port``/``--names-api-port`` flags" note).
+
+    ``name_set_callback``/``name_clear_callback`` are forwarded verbatim
+    to :class:`~mbtools.registry.console_compat.names_api.NamesAPI` --
+    :func:`cmd_run` passes ``PeerDiscovery.publish_name_set``/
+    ``publish_name_clear`` here, the exact same two callables
+    :func:`assemble_registry` already hands to
+    :class:`~mbtools.registry.api.RegistryAPIServer` for ticket 005's
+    local-socket ``names_set``/``names_clear`` ops -- one write, from
+    either surface, always replicates the same way.
+    """
+    return NamesAPI(
+        store=store,
+        host=host,
+        port=port,
+        lock=lock,
+        name_set_callback=name_set_callback,
+        name_clear_callback=name_clear_callback,
+    )
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     """``mbregistry run`` -- the daemon's actual entry point. Constructs
     the real production pipeline (:class:`~mbtools.registry.usbwatch.PollingPortWatcher`,
@@ -574,6 +628,22 @@ def cmd_run(args: argparse.Namespace) -> int:
             lock=shared_lock,
         )
 
+    # Sprint 004 ticket 007: the robot-console-compatibility /names HTTP
+    # listener, sharing relay_pool's own DEFAULT_NAMES_API_PORT (the port
+    # relay_pool already advertises in its TXT registry= key, whether or
+    # not relay_pool itself is running on this host) and the same
+    # shared_lock every other component here uses. Unlike relay_pool,
+    # this listener has no local-hardware dependency to opt out of -- it
+    # only ever touches store -- so it is always started, matching
+    # peering's own "always started, never opt-in" precedent rather than
+    # relay_pool's own --no-relay-pool escape hatch.
+    names_api = assemble_names_api(
+        store=store,
+        lock=shared_lock,
+        name_set_callback=peering.publish_name_set,
+        name_clear_callback=peering.publish_name_clear,
+    )
+
     stop_event = threading.Event()
 
     def _handle_signal(signum: int, frame: Any) -> None:
@@ -594,6 +664,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     peering.start()
     if relay_pool is not None:
         relay_pool.start()
+    names_api.start()
 
     # --peer HOST[:PORT] (repeatable): explicit peers on top of whatever
     # mDNS finds on its own. This host's own resolved
@@ -614,25 +685,27 @@ def cmd_run(args: argparse.Namespace) -> int:
     pool_note = (
         f", relay pool on {relay_pool.bound_port}" if relay_pool is not None else ""
     )
+    names_api_note = f", names API on {names_api.bound_port}"
     print(
         f"mbregistry: listening on {socket_path} (local api), "
         f"{remote_api.bound_port} (remote api), store at {db_path}, "
         f"peering active (pub {peer_pub_port}, snapshot {peer_snapshot_port}"
-        f"{peer_note}){pool_note}",
+        f"{peer_note}){pool_note}{names_api_note}",
         file=sys.stderr,
     )
     try:
         daemon.run(interval_s=args.interval, stop=stop_event.is_set)
     finally:
         # Stop order matters (this ticket's own acceptance criterion):
-        # peering, remote_api, and the relay pool can each still touch
-        # store/locks up until they're stopped, so all three must be
-        # stopped -- and every thread they own joined -- before api.stop()
-        # and, last of all, store.close(). api.stop() already joins its
-        # own handler threads (unchanged from before this ticket);
-        # peering.stop()/remote_api.stop()/relay_pool.stop() do the same
-        # for their own threads (see each class's own "stoppable, every
-        # thread joined" docstring note).
+        # peering, remote_api, the relay pool, and the names API can each
+        # still touch store/locks up until they're stopped, so all four
+        # must be stopped -- and every thread they own joined -- before
+        # api.stop() and, last of all, store.close(). api.stop() already
+        # joins its own handler threads (unchanged from before this
+        # ticket); peering.stop()/remote_api.stop()/relay_pool.stop()/
+        # names_api.stop() do the same for their own threads (see each
+        # class's own "stoppable, every thread joined" docstring note).
+        names_api.stop()
         if relay_pool is not None:
             relay_pool.stop()
         peering.stop()
