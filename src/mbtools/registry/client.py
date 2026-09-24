@@ -99,6 +99,7 @@ from mbtools.common import (
 )
 from mbtools.registry.api import DEFAULT_SOCKET_PATH
 from mbtools.registry.api_windows import _PipeLineReader, _PipeWriter, _Win32PipeAPI
+from mbtools.registry.paths import default_pipe_name
 
 __all__ = [
     "RegistryClient",
@@ -110,6 +111,7 @@ __all__ = [
     "SOCKET_ENV_VAR",
     "DEFAULT_SOCKET_PATH",
     "resolve_socket_path",
+    "resolve_local_api_address",
 ]
 
 #: Mirrors ``registry.cli``'s pre-extraction ``_SOCKET_ENV_VAR`` exactly —
@@ -144,6 +146,58 @@ def resolve_socket_path(
     if env_value:
         return Path(env_value)
     return Path(default)
+
+
+def resolve_local_api_address(
+    flag_value: str | None, env_var: str = SOCKET_ENV_VAR
+) -> str | Path:
+    """``flag_value`` wins if given; else ``$env_var``; else this
+    platform's own production default for the local query/control API --
+    the platform-dispatching counterpart to :func:`resolve_socket_path`
+    above, and the one place every local-registry CLI (``mbregistry``,
+    ``mbdeploy``, ``mbserial``, ``mbrelay``) should resolve the address
+    it hands to :class:`RegistryClient`, rather than calling
+    :func:`resolve_socket_path` directly.
+
+    That distinction matters on Windows: :func:`resolve_socket_path`'s
+    own ``default`` parameter is :data:`DEFAULT_SOCKET_PATH`, which is
+    ``None`` on ``sys.platform == "win32"`` (see that constant's
+    docstring in ``registry.api`` -- there is no Unix-socket namespace to
+    have a default path for there). A caller that calls
+    :func:`resolve_socket_path` unconditionally, with no ``flag_value``/
+    ``$env_var`` override in effect, hits ``Path(None)`` and raises
+    ``TypeError`` before ever reaching :class:`RegistryClient`. This
+    function dispatches on ``sys.platform`` *first*, so that failure
+    mode never occurs: on ``"win32"`` the default (and any override) is
+    returned as a plain ``str`` pipe name
+    (:func:`~mbtools.registry.paths.default_pipe_name`) -- never routed
+    through :class:`pathlib.Path`, matching :class:`RegistryClient`'s own
+    "keep the pipe name as a plain str" contract (this module's
+    docstring, "Windows transport"). Everywhere else, this delegates to
+    :func:`resolve_socket_path` unchanged -- same flag > env var >
+    :data:`DEFAULT_SOCKET_PATH` precedence as before.
+
+    Originally sprint 005 ticket 005's private ``registry.cli
+    ._resolve_local_api_address`` (shared there by ``cmd_run``/
+    ``cmd_list``, the two ``mbregistry`` subcommands that need to know
+    the daemon's own local-API address). Moved here in ticket 006, since
+    ticket 005 only wired the platform dispatch into ``mbregistry``
+    itself -- ``deploy.cli``/``serial.cli``/``relay.cli`` each still
+    called :func:`resolve_socket_path` directly and would raise the
+    ``TypeError`` above on Windows with no ``--socket``/
+    ``$MBREGISTRY_SOCKET`` override given. ``registry.cli`` keeps
+    ``_resolve_local_api_address`` as a thin alias of this function (see
+    that module), so its own already-passing tests
+    (``tests/registry/cli/test_cli_run_windows.py``) need no changes.
+    """
+    if sys.platform == "win32":
+        if flag_value:
+            return flag_value
+        env_value = os.environ.get(env_var)
+        if env_value:
+            return env_value
+        return default_pipe_name()
+    return resolve_socket_path(flag_value, env_var, DEFAULT_SOCKET_PATH)
 
 
 # ---------------------------------------------------------------------------

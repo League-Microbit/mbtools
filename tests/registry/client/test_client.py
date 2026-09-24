@@ -398,6 +398,73 @@ def test_resolve_socket_path_default_when_neither_given(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# resolve_local_api_address: flag > env var > platform default (ticket 006 --
+# the shared helper every local-registry CLI now resolves its address
+# through, moved here from registry.cli's own private
+# _resolve_local_api_address so deploy.cli/serial.cli/relay.cli can use it
+# too; see this function's own docstring for why calling
+# resolve_socket_path directly, as those three did before this ticket, was
+# broken on Windows). Mirrors tests/registry/cli/test_cli_run_windows.py's
+# own _resolve_local_api_address coverage, monkeypatching this module's
+# `sys.platform` instead of registry.cli's -- the same real `sys` module
+# object either way, since `_resolve_local_api_address` in cli.py is now
+# just this function under another name.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_local_api_address_defaults_to_the_pipe_name_on_simulated_win32(
+    monkeypatch,
+):
+    import mbtools.registry.client as client
+
+    monkeypatch.setattr(client.sys, "platform", "win32")
+    monkeypatch.delenv("MBREGISTRY_SOCKET", raising=False)
+    result = client.resolve_local_api_address(None, "MBREGISTRY_SOCKET")
+    assert result == r"\\.\pipe\mbregistry"
+    assert isinstance(result, str)  # never routed through pathlib.Path
+
+
+def test_resolve_local_api_address_flag_wins_on_simulated_win32(monkeypatch):
+    import mbtools.registry.client as client
+
+    monkeypatch.setattr(client.sys, "platform", "win32")
+    result = client.resolve_local_api_address(r"\\.\pipe\custom", "MBREGISTRY_SOCKET")
+    assert result == r"\\.\pipe\custom"
+    assert isinstance(result, str)
+
+
+def test_resolve_local_api_address_env_var_wins_over_default_on_simulated_win32(
+    monkeypatch,
+):
+    import mbtools.registry.client as client
+
+    monkeypatch.setattr(client.sys, "platform", "win32")
+    monkeypatch.setenv("MBREGISTRY_SOCKET", r"\\.\pipe\from-env")
+    result = client.resolve_local_api_address(None, "MBREGISTRY_SOCKET")
+    assert result == r"\\.\pipe\from-env"
+
+
+def test_resolve_local_api_address_unaffected_off_windows(tmp_path):
+    from mbtools.registry.client import resolve_local_api_address
+
+    result = resolve_local_api_address(str(tmp_path / "api.sock"), "MBREGISTRY_SOCKET")
+    assert result == tmp_path / "api.sock"
+
+
+def test_resolve_local_api_address_off_windows_default_when_neither_given(monkeypatch):
+    """Off Windows, this delegates to resolve_socket_path with
+    DEFAULT_SOCKET_PATH -- a real, non-None default there (unlike
+    win32, where DEFAULT_SOCKET_PATH is None) -- so no override is
+    required and the production default path comes back unchanged.
+    """
+    from mbtools.registry.client import resolve_local_api_address
+
+    monkeypatch.delenv("MBREGISTRY_SOCKET", raising=False)
+    result = resolve_local_api_address(None, "MBREGISTRY_SOCKET")
+    assert result == Path("/run/mbregistry/api.sock")
+
+
+# ---------------------------------------------------------------------------
 # names_get / names_set / names_clear / names_list (sprint 004, ticket 005)
 # ---------------------------------------------------------------------------
 

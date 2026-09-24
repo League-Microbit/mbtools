@@ -597,3 +597,31 @@ def test_deploy_repo_end_to_end_reports_new_announcement(tmp_path, daemon_socket
         assert not thread.is_alive()
         api.stop()
         store.close()
+
+
+# ---------------------------------------------------------------------------
+# local-registry address resolution on Windows (ticket 006, team-lead scope)
+# ---------------------------------------------------------------------------
+
+
+def test_cli_resolves_windows_pipe_name_with_no_socket_override(monkeypatch):
+    """Regression test for the gap ticket 005 flagged and ticket 006 closed:
+    every ``mbdeploy`` call site that builds a :class:`RegistryClient`
+    (``cmd_deploy``/``cmd_list``/``cmd_debug``) used to call
+    ``resolve_socket_path(args.socket, _SOCKET_ENV_VAR, DEFAULT_SOCKET_PATH)``
+    directly -- ``DEFAULT_SOCKET_PATH`` is ``None`` on ``sys.platform ==
+    "win32"``, so with no ``--socket``/``$MBREGISTRY_SOCKET`` override that
+    call raised ``TypeError`` from ``Path(None)`` before ever reaching
+    ``RegistryClient``. ``cli.py`` now resolves through
+    ``registry.client.resolve_local_api_address`` (imported as
+    ``cli_mod.resolve_local_api_address``) instead, which dispatches on
+    ``sys.platform`` first and returns the Windows named-pipe default
+    rather than raising.
+    """
+    import sys
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.delenv("MBREGISTRY_SOCKET", raising=False)
+    result = cli_mod.resolve_local_api_address(None, cli_mod._SOCKET_ENV_VAR)
+    assert result == r"\\.\pipe\mbregistry"
+    assert isinstance(result, str)

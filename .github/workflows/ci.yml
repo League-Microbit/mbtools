@@ -1,0 +1,45 @@
+name: CI
+
+# Sprint 005 ticket 006: the project's baseline CI -- runs the full
+# mbtools test suite on ubuntu-latest, macos-latest, and windows-latest.
+# The windows-latest leg is this sprint's one piece of real,
+# non-hardware verification of the Windows-specific code from tickets
+# 002-005: it proves that code imports and runs correctly under actual
+# Windows/CPython (the ctypes/kernel32 calls in registry.api_windows,
+# the sc.exe-text rendering in registry.service_windows) against fakes,
+# without needing Windows hardware. See docs/acceptance/005-hardware.md
+# for what a green run here does NOT prove (no real USB micro:bit, no
+# real SCM restart-on-crash behavior).
+#
+# `push` has no branch filter so pushing any branch -- including a
+# sprint branch under active development -- triggers a run directly;
+# `pull_request` is scoped to the default branch, matching the standard
+# convention. Together these satisfy "triggers on push/PR to the
+# default branch" without blocking iteration on a feature branch before
+# it's merged.
+
+on:
+  push:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+
+      - name: Run the test suite
+        run: uv run pytest -q

@@ -637,3 +637,31 @@ def test_names_list_reports_when_empty(server, capsys):
         cli_mod.main(["names", "list", "--socket", str(server.socket_path)])
     assert excinfo.value.code == EXIT_OK
     assert "no names registered" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# local-registry address resolution on Windows (ticket 006, team-lead scope)
+# ---------------------------------------------------------------------------
+
+
+def test_cli_resolves_windows_pipe_name_with_no_socket_override(monkeypatch):
+    """Regression test for the gap ticket 005 flagged and ticket 006 closed:
+    every ``mbrelay`` call site that builds a :class:`RegistryClient`
+    (``cmd_connect``/``_with_client``) used to call ``resolve_socket_path(
+    args.socket, _SOCKET_ENV_VAR, DEFAULT_SOCKET_PATH)`` directly --
+    ``DEFAULT_SOCKET_PATH`` is ``None`` on ``sys.platform == "win32"``, so
+    with no ``--socket``/``$MBREGISTRY_SOCKET`` override that call raised
+    ``TypeError`` from ``Path(None)`` before ever reaching
+    ``RegistryClient``. ``cli.py`` now resolves through
+    ``registry.client.resolve_local_api_address`` (imported as
+    ``cli_mod.resolve_local_api_address``) instead, which dispatches on
+    ``sys.platform`` first and returns the Windows named-pipe default
+    rather than raising.
+    """
+    import sys
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.delenv("MBREGISTRY_SOCKET", raising=False)
+    result = cli_mod.resolve_local_api_address(None, cli_mod._SOCKET_ENV_VAR)
+    assert result == r"\\.\pipe\mbregistry"
+    assert isinstance(result, str)

@@ -73,7 +73,7 @@ from mbtools.registry.client import (
     RegistryUnavailable,
 )
 from mbtools.registry.client import SOCKET_ENV_VAR as _SOCKET_ENV_VAR
-from mbtools.registry.client import resolve_socket_path
+from mbtools.registry.client import resolve_local_api_address
 from mbtools.registry.console_compat.names_api import NamesAPI
 from mbtools.registry.console_compat.relay_pool import (
     DEFAULT_NAMES_API_PORT,
@@ -82,7 +82,6 @@ from mbtools.registry.console_compat.relay_pool import (
 )
 from mbtools.registry.daemon import DEFAULT_INTERVAL_S, Daemon
 from mbtools.registry.flash import FlashOp
-from mbtools.registry.paths import default_pipe_name
 from mbtools.registry.peering import (
     DEFAULT_PUB_PORT,
     DEFAULT_SNAPSHOT_PORT,
@@ -158,11 +157,12 @@ _TOKEN_ENV_VAR = "MBREGISTRY_TOKEN"
 # path/value resolution -- flag > env var > module default (ticket 009's own
 # "socket/DB paths overridable by flags or env" acceptance criterion,
 # extended by ticket 009 itself to the new port/token flags below).
-# Socket-path precedence itself now lives in ``registry.client`` (ticket
-# 001's extraction, imported above as ``resolve_socket_path``) since that
-# module is also what sprint 002's ``mbdeploy``/``mbserial`` will use to
-# resolve it identically; ``_resolve_path`` stays here only for the db
-# path, which is this daemon's own concern, not the client library's.
+# Socket-path precedence itself lives in ``registry.client`` (ticket
+# 001's extraction as ``resolve_socket_path``, and ticket 006's
+# ``resolve_local_api_address``, imported above), since that module is
+# also what ``deploy.cli``/``serial.cli``/``relay.cli`` use to resolve it
+# identically; ``_resolve_path`` stays here only for the db path, which
+# is this daemon's own concern, not the client library's.
 # ---------------------------------------------------------------------------
 
 
@@ -179,31 +179,18 @@ def _resolve_path(flag_value: str | None, env_var: str, default: Path) -> Path:
     return default
 
 
-def _resolve_local_api_address(flag_value: str | None, env_var: str) -> str | Path:
-    """``flag_value`` wins if given; else ``$env_var``; else this
-    platform's own production default for the local query/control API
-    -- sprint 005 ticket 005's platform dispatch, shared by
-    :func:`cmd_run` and :func:`cmd_list` (the two ``mbregistry``
-    subcommands that need to know the daemon's own local-API address).
-
-    On ``sys.platform == "win32"``, the default (and any ``flag_value``/
-    ``$env_var`` override) is returned as a plain ``str`` pipe name
-    (``registry.paths.default_pipe_name()``) -- never routed through
-    ``pathlib.Path``, matching ``registry.client.RegistryClient``'s own
-    "keep the pipe name as a plain str" contract (see that module's
-    docstring, "Windows transport"). Everywhere else, this delegates to
-    :func:`~mbtools.registry.client.resolve_socket_path` unchanged --
-    same flag > env var > :data:`DEFAULT_SOCKET_PATH` precedence as
-    before this ticket.
-    """
-    if sys.platform == "win32":
-        if flag_value:
-            return flag_value
-        env_value = os.environ.get(env_var)
-        if env_value:
-            return env_value
-        return default_pipe_name()
-    return resolve_socket_path(flag_value, env_var, DEFAULT_SOCKET_PATH)
+#: Sprint 005 ticket 005's platform dispatch for the local query/control
+#: API address -- shared by :func:`cmd_run` and :func:`cmd_list` (the two
+#: ``mbregistry`` subcommands that need to know the daemon's own
+#: local-API address). Ticket 006 moved the actual logic to
+#: :func:`mbtools.registry.client.resolve_local_api_address` so
+#: ``deploy.cli``/``serial.cli``/``relay.cli`` can share it too (each of
+#: those three was still calling ``resolve_socket_path`` directly and
+#: raising ``TypeError`` on Windows -- see that function's docstring for
+#: the full story). This name stays as a thin alias, unchanged in
+#: signature and behavior, so every existing caller/test here
+#: (``tests/registry/cli/test_cli_run_windows.py``) needs no changes.
+_resolve_local_api_address = resolve_local_api_address
 
 
 def _resolve_int(flag_value: int | None, env_var: str, default: int) -> int:
