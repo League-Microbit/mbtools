@@ -41,6 +41,7 @@ from typing import Callable
 
 import intelhex
 
+from mbtools.registry.universal_hex import UniversalHexError, normalized_hex
 from mbtools.registry.locks import KIND_FLASH, LockManager
 from mbtools.registry.store import Store
 
@@ -497,6 +498,16 @@ class FlashOp:
         if holder is None or holder.kind != KIND_FLASH:
             raise FlashLockNotHeldError(uid)
 
+        # A Universal Hex (V1 + V2 images) is reduced to this target's
+        # image first; see mbtools.registry.universal_hex.
+        try:
+            with normalized_hex(hex_path, self._target_mcu) as flash_path:
+                return self._flash_locked(uid, flash_path, log)
+        except UniversalHexError as exc:
+            raise HexValidationError(str(exc)) from exc
+
+    def _flash_locked(self, uid: str, hex_path: str, log: Callable[[str], None]) -> FlashResult:
+        """Steps 2-6 of :meth:`flash_hex`, on a plain Intel hex."""
         _validate_hex(hex_path)
 
         record = self._store.find(uid)

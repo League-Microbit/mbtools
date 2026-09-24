@@ -38,6 +38,7 @@ from typing import Callable
 
 import intelhex
 
+from mbtools.registry.universal_hex import UniversalHexError, normalized_hex
 from mbtools.registry.flash import (
     DEFAULT_MCU,
     DEFAULT_NO_PROGRESS_TIMEOUT_S,
@@ -189,6 +190,34 @@ def _run_streamed(
 
 
 def flash_hex(
+    uid: str,
+    hex_path: str,
+    target_mcu: str = DEFAULT_MCU,
+    log: Callable[[str], None] | None = None,
+    board_name: str | None = None,
+    port: str | None = None,
+    no_progress_timeout: float = DEFAULT_NO_PROGRESS_TIMEOUT_S,
+) -> int:
+    """Flash ``hex_path`` to the board behind ``uid``; see :func:`_flash_hex`.
+
+    A micro:bit Universal Hex (V1 + V2 images in one file, as the
+    micro:bit Foundation ships its firmware) is first reduced to the image
+    for ``target_mcu`` (:mod:`mbtools.registry.universal_hex`), since
+    neither ``intelhex`` nor pyOCD understands its block records.
+    """
+    try:
+        with normalized_hex(hex_path, target_mcu) as flash_path:
+            if flash_path != hex_path:
+                _log(log, f"{hex_path} is a Universal Hex; flashing its {target_mcu} image.")
+            return _flash_hex(
+                uid, flash_path, target_mcu, log, board_name, port, no_progress_timeout
+            )
+    except UniversalHexError as exc:
+        _log(log, f"Error: {exc}")
+        return 1
+
+
+def _flash_hex(
     uid: str,
     hex_path: str,
     target_mcu: str = DEFAULT_MCU,
