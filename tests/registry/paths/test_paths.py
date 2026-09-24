@@ -14,11 +14,18 @@ import pytest
 
 import mbtools.registry.paths as paths_module
 from mbtools.registry.paths import (
+    LINUX_SYSTEM_UNIT_PATH,
+    LINUX_UDEV_RULE_PATH,
     client_socket_candidates,
     default_db_path,
     default_pipe_name,
     default_socket_path,
     find_client_socket,
+    linux_user_unit_path,
+    macos_launch_agent_path,
+    macos_launch_daemon_path,
+    macos_system_log_path,
+    macos_user_log_path,
 )
 
 
@@ -191,3 +198,60 @@ def test_find_client_socket_names_first_candidate_when_none_exist(as_platform):
 def test_default_pipe_name_fixed_and_callable_on_any_platform(monkeypatch, platform):
     monkeypatch.setattr(paths_module.sys, "platform", platform)
     assert default_pipe_name() == r"\\.\pipe\mbregistry"
+
+
+# -- service artifacts (ticket 006-001) ---------------------------------------
+
+
+def test_macos_launch_agent_path(as_platform):
+    home = as_platform("darwin", root=False)
+    assert macos_launch_agent_path() == (
+        home / "Library" / "LaunchAgents" / "org.jointheleague.mbregistry.plist"
+    )
+
+
+def test_macos_launch_daemon_path(as_platform):
+    as_platform("darwin", root=True)
+    assert macos_launch_daemon_path() == Path(
+        "/Library/LaunchDaemons/org.jointheleague.mbregistry.plist"
+    )
+
+
+def test_macos_user_log_path(as_platform):
+    home = as_platform("darwin", root=False)
+    assert macos_user_log_path() == home / "Library" / "Logs" / "mbregistry.log"
+
+
+def test_macos_system_log_path(as_platform):
+    as_platform("darwin", root=True)
+    assert macos_system_log_path() == Path("/Library/Logs/mbregistry.log")
+
+
+def test_linux_user_unit_path(as_platform):
+    home = as_platform("linux", root=False)
+    assert linux_user_unit_path() == (
+        home / ".config" / "systemd" / "user" / "mbregistry.service"
+    )
+
+
+def test_linux_system_unit_path_matches_cli_default_unit_path():
+    """Not a new value -- LINUX_SYSTEM_UNIT_PATH must equal
+    registry.cli's own DEFAULT_UNIT_PATH (ticket 008) exactly, so the
+    two never silently drift apart before ticket 006-004 unifies them
+    into a single definition (see paths.py's "service artifacts"
+    module comment)."""
+    from mbtools.registry.cli import DEFAULT_UNIT_PATH
+
+    assert LINUX_SYSTEM_UNIT_PATH == DEFAULT_UNIT_PATH == Path(
+        "/etc/systemd/system/mbregistry.service"
+    )
+
+
+def test_linux_udev_rule_path_matches_cli_default_udev_rule_path():
+    """Same guarantee as test_linux_system_unit_path_matches_cli_default_unit_path,
+    for the udev rule path."""
+    from mbtools.registry.cli import DEFAULT_UDEV_RULE_PATH
+
+    assert LINUX_UDEV_RULE_PATH == DEFAULT_UDEV_RULE_PATH == Path(
+        "/etc/udev/rules.d/99-mbregistry-cmsis-dap.rules"
+    )

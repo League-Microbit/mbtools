@@ -1,8 +1,10 @@
 ---
 id: '001'
 title: Service artifact paths + command-runner foundation
-status: open
-use-cases: [SUC-001, SUC-002]
+status: done
+use-cases:
+- SUC-001
+- SUC-002
 depends-on: []
 github-issue: ''
 issue: mbregistry-service-install-uninstall-user-system.md
@@ -70,22 +72,22 @@ behavior changes yet.
 
 ## Acceptance Criteria
 
-- [ ] `paths.py`'s darwin branches for db/socket paths are unchanged and
+- [x] `paths.py`'s darwin branches for db/socket paths are unchanged and
       covered by an added comment/docstring note closing the
       "is macOS supported" decision.
-- [ ] New scope-parameterized helpers exist for: macOS LaunchAgent path,
+- [x] New scope-parameterized helpers exist for: macOS LaunchAgent path,
       macOS LaunchDaemon path, macOS user log path, macOS system log path,
       Linux user unit path. (System unit path and udev rule path are
       reused from their existing constants, not redefined.)
-- [ ] Every new helper has a unit test asserting its exact returned path
+- [x] Every new helper has a unit test asserting its exact returned path
       on each relevant platform (mocking `sys.platform`/`os.path.expanduser`
       the same way existing `paths.py` tests do — check
       `tests/registry/` for the existing pattern first).
-- [ ] `registry/service.py` exists with a `CommandRunner`-shaped
+- [x] `registry/service.py` exists with a `CommandRunner`-shaped
       abstraction, a real implementation, and a dry-run mode/double, each
       with its own unit test — no test in this ticket invokes a real
       external command.
-- [ ] No existing test in the repo changes behavior (this ticket adds new
+- [x] No existing test in the repo changes behavior (this ticket adds new
       code, it does not yet wire anything into `cli.py`).
 
 ## Implementation Plan
@@ -114,3 +116,22 @@ files.
 
 **Documentation updates**: None yet — `docs/service.md`/`README.md`
 updates land in ticket 004, once the CLI surface they document exists.
+
+## Implementation Notes (as built)
+
+`cli.py` was **not** touched, confirming the plan's "no interaction
+with `cli.py` at all". For "exactly one definition" of the Linux system
+unit path / udev rule path: `paths.py` gained `LINUX_SYSTEM_UNIT_PATH`/
+`LINUX_UDEV_RULE_PATH` module constants holding the *same* values as
+`cli.py`'s existing `DEFAULT_UNIT_PATH`/`DEFAULT_UDEV_RULE_PATH` (not a
+second formula for them — moving/importing them into `cli.py` was
+considered and rejected: `cli.py` already imports `api.py`/`store.py`,
+both of which import `paths.py`, so `paths.py` importing *from* `cli.py`
+would be a real circular import, and would also invert the dependency
+direction sprint.md's Design Rationale establishes). Two new tests in
+`test_paths.py` (`test_linux_system_unit_path_matches_cli_default_unit_path`,
+`test_linux_udev_rule_path_matches_cli_default_udev_rule_path`)
+cross-check the values against `cli.py`'s constants so they cannot
+silently drift before ticket 006-004 does the actual unification (make
+`cli.py` import these two constants from `paths.py` instead of defining
+its own copies) as part of its cli.py rewiring work.
