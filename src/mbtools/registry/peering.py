@@ -99,6 +99,38 @@ hardware by ``mbdeploy``'s own spike
 needed here as a result; this module uses plain ``python-zeroconf``
 throughout, no ``avahi-publish`` fallback.
 
+**Name registry replication (sprint 004 ticket 002)**: extends this same
+event bus and snapshot exchange to ``name_registry`` rows (sprint 004
+sprint.md Decision 2 and Architecture module table entry for
+``registry.peering``), the same way ``device``/``peer`` rows already
+converge. A caller that writes through ``Store.set()``/``Store.resolve()``
+(on derive)/``Store.clear()`` -- ticket 005's ``mbrelay`` CLI, ticket 007's
+``names_api``, not built by this ticket -- publishes the matching
+``EVENT_NAME_SET``/``EVENT_NAME_CLEAR`` event via
+:meth:`PeerDiscovery.publish_name_set`/:meth:`PeerDiscovery.publish_name_clear`
+right after the local write succeeds, mirroring
+``publish_daemon_event``/``publish_lock_event``'s existing
+"adapter method a caller invokes after its own local store write"
+convention. The REP handler's snapshot reply changes shape from a bare
+device list to ``{"devices": [...], "names": [...]}`` so a newly-joining
+peer catches up on both tables in the one existing snapshot round-trip
+(no separate name-registry snapshot call) -- see
+:func:`_snapshot_name_payload`/:func:`_apply_snapshot_name`. Applying an
+incoming name row or event always goes through ``Store.set()`` regardless
+of the origin row's own ``source`` (``derived`` vs ``registry``): per
+sprint.md's Decision 2/this ticket's own Approach, ``naming.name_to_radio``
+is a pure deterministic function of ``name``, so two hosts independently
+deriving the same unseen name always agree on ``(channel, group)`` --
+nothing here needs to arbitrate a conflict, and the applied row simply
+carries the same value the origin host has, with ``source`` reduced to
+``SOURCE_REGISTRY`` on the receiving side (a metadata/provenance
+distinction only; the fleet-wide, single-source-of-truth pair for that
+name is unaffected). A peer-link drop degrades name-registry replication
+exactly like it already degrades device-state replication: only
+``store.mark_peer_unreachable(host)`` fires (see "Peer-vanish detection"
+above) -- no ``name_registry`` row is ever touched by that path, so
+existing rows are neither deleted nor reverted.
+
 **Injectability**: the ``zeroconf`` constructor parameter takes anything
 exposing the three names this module calls (``Zeroconf``, ``ServiceInfo``,
 ``ServiceBrowser``) -- defaults to the real ``zeroconf`` package. A test
@@ -136,6 +168,7 @@ from mbtools.registry.store import (
     STATE_CONNECTED,
     STATE_CONNECTED_NO_FIRMWARE,
     DeviceRecord,
+    Entry,
     Store,
 )
 
@@ -152,6 +185,8 @@ __all__ = [
     "EVENT_DETACH",
     "EVENT_IDENTITY",
     "EVENT_LOCK_STATE",
+    "EVENT_NAME_SET",
+    "EVENT_NAME_CLEAR",
 ]
 
 logger = logging.getLogger(__name__)
@@ -189,6 +224,11 @@ EVENT_ATTACH = "attach"
 EVENT_DETACH = "detach"
 EVENT_IDENTITY = "identity"
 EVENT_LOCK_STATE = "lock_state"
+
+# ticket 002 (sprint 004): name_registry row replication, added to the same
+# event bus -- see the module docstring's "sprint 004 ticket 002" note.
+EVENT_NAME_SET = "name_set"
+EVENT_NAME_CLEAR = "name_clear"
 
 #: How long a snapshot REQ waits for its peer's REP reply before giving up.
 _DEFAULT_SNAPSHOT_TIMEOUT_MS = 5000
@@ -341,6 +381,34 @@ def _snapshot_payload(store: Store) -> list[dict[str, Any]]:
     ]
 
 
+def _snapshot_name_payload(store: Store) -> list[dict[str, Any]]:
+    """Every ``name_registry`` row (``store.listing()``), shaped for the
+    wire -- the ``"names"`` half of the REP handler's combined snapshot
+    reply (ticket 002), alongside :func:`_snapshot_payload`'s
+    ``"devices"`` half.
+
+    Unlike a device row, ``name_registry`` has no per-host ownership
+    column (sprint.md's ERD: "no foreign key to ``device``") -- every row
+    is sent, not just ones this host happens to have derived/set itself,
+    so a newly-joining peer's *entire* fleet-wide name view is caught up
+    in this one exchange. ``listing()``'s ``conflict``/``channel_conflict``
+    annotations are left off the wire -- they're a derived view the
+    receiving side can recompute for itself from the same rows, not part
+    of the persisted row shape :func:`_apply_snapshot_name`/``Store.set``
+    expects back.
+    """
+    return [
+        {
+            "name": entry.name,
+            "channel": entry.channel,
+            "group": entry.group,
+            "source": entry.source,
+            "updated": entry.updated,
+        }
+        for entry in store.listing()
+    ]
+
+
 def _probe_result_from_dict(data: dict[str, Any]) -> ProbeResult:
     """Reconstruct a :class:`~mbtools.registry.identity.ProbeResult` from
     a snapshot/event dict's announcement fields -- shared by
@@ -382,11 +450,29 @@ def _apply_snapshot_device(store: Store, host: str, data: dict[str, Any]) -> Non
     # "attached_unprobed": upsert_remote_attached above already covers it.
 
 
+def _apply_snapshot_name(store: Store, data: dict[str, Any]) -> None:
+    """Apply one ``name_registry`` dict from a peer's snapshot reply into
+    ``store`` -- ticket 002's acceptance criterion "a peer joining after
+    entries already exist receives the current ``name_registry`` rows via
+    the existing snapshot exchange".
+
+    Always applied via ``Store.set()``, regardless of whether the origin
+    row's own ``source`` was ``derived`` or ``registry`` -- see the module
+    docstring's "Name registry replication" note for why collapsing that
+    distinction on the receiving side doesn't lose any fleet-relevant
+    information (the ``(channel, group)`` pair is what every consumer
+    actually reads; ``source`` is provenance on the *origin* host only).
+    """
+    store.set(data["name"], data["channel"], data["group"])
+
+
 def _apply_event(store: Store, host: str, event: dict[str, Any]) -> None:
     """Apply one live event dict (from a peer's PUB stream) into
     ``store``, tagged with ``host`` -- ticket 005's acceptance criterion
     "applies each subsequent attach/detach/identity/lock_state event the
-    same way [as the snapshot]".
+    same way [as the snapshot]", extended by ticket 002 to also cover
+    ``name_set``/``name_clear`` (see the module docstring's "Name registry
+    replication" note).
 
     A reference to a uid this store has never heard of (an "identity"/
     "detach"/"lock_state" event arriving before the "attach" that should
@@ -396,7 +482,11 @@ def _apply_event(store: Store, host: str, event: dict[str, Any]) -> None:
     logged and dropped rather than raised: a single missed/reordered
     event must not crash the receive loop it arrived on, and the peer's
     next full snapshot (a fresh discovery, or a reconnect after a vanish)
-    naturally repairs any resulting gap.
+    naturally repairs any resulting gap. ``name_set``/``name_clear`` have
+    no such ordering dependency (``name_registry`` has no "attach"
+    precursor a row can arrive ahead of), so a malformed one (missing
+    ``name``/``channel``/``group``) is checked explicitly rather than
+    left to raise -- logged and dropped the same way, for the same reason.
     """
     event_type = event.get("type")
     uid = event.get("uid")
@@ -415,6 +505,22 @@ def _apply_event(store: Store, host: str, event: dict[str, Any]) -> None:
                 store.apply_remote_probe(uid, None)
         elif event_type == EVENT_LOCK_STATE:
             store.apply_remote_lock_state(uid, event.get("kind"), event.get("display"))
+        elif event_type == EVENT_NAME_SET:
+            name, channel, group = event.get("name"), event.get("channel"), event.get("group")
+            if name is None or channel is None or group is None:
+                logger.warning(
+                    "peering: malformed %s event from %s: %r", event_type, host, event
+                )
+            else:
+                store.set(name, channel, group)
+        elif event_type == EVENT_NAME_CLEAR:
+            name = event.get("name")
+            if name is None:
+                logger.warning(
+                    "peering: malformed %s event from %s: %r", event_type, host, event
+                )
+            else:
+                store.clear(name)
         else:
             logger.warning("peering: unknown event type %r from %s", event_type, host)
     except KeyError:
@@ -692,32 +798,45 @@ class _PeerLink:
             req.close(linger=0)
 
         try:
-            devices = json.loads(reply.decode("utf-8"))
+            reply_obj = json.loads(reply.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
             logger.exception("peering: malformed snapshot reply from %s", self._host)
             return
 
-        if isinstance(devices, dict):
-            # {"error": "unauthorized"} (ticket 009) or any other
-            # object-shaped reply -- never a valid snapshot (always a
-            # list, see _snapshot_payload) -- treated like a timeout:
-            # logged, no on_reachable, no peer row left half-updated.
+        # ticket 002: a valid reply is now ``{"devices": [...], "names":
+        # [...]}`` (see _rep_loop/_snapshot_payload/_snapshot_name_payload)
+        # rather than ticket 005's bare device list -- so an ``{"error":
+        # "unauthorized"}`` refusal (ticket 009) is no longer distinguished
+        # by "reply is a dict at all" but by the presence of "error".
+        # Anything else that isn't the expected object shape is treated
+        # the same way: logged, no on_reachable, no peer row left
+        # half-updated.
+        if not isinstance(reply_obj, dict) or "error" in reply_obj:
             logger.warning(
                 "peering: snapshot request to %s (%s) refused: %r",
                 self._host,
                 self._snapshot_address,
-                devices,
+                reply_obj,
             )
             return
 
         with self._lock:
-            for device in devices:
+            for device in reply_obj.get("devices", []):
                 try:
                     _apply_snapshot_device(self._store, self._host, device)
                 except Exception:
                     logger.exception(
                         "peering: failed applying snapshot device %r from %s",
                         device.get("uid"),
+                        self._host,
+                    )
+            for name_entry in reply_obj.get("names", []):
+                try:
+                    _apply_snapshot_name(self._store, name_entry)
+                except Exception:
+                    logger.exception(
+                        "peering: failed applying snapshot name %r from %s",
+                        name_entry.get("name"),
                         self._host,
                     )
 
@@ -973,10 +1092,13 @@ class PeerDiscovery:
 
     def _rep_loop(self) -> None:
         """Answer every snapshot request with this host's own current
-        devices (:func:`_snapshot_payload`) -- or, when ``auth_token``
-        (ticket 009) is set and the request's token is missing/wrong, an
-        ``{"error": "unauthorized"}`` reply instead (see the module
-        docstring's "Peering handshake auth" note).
+        devices and name-registry rows (``{"devices": _snapshot_payload(...),
+        "names": _snapshot_name_payload(...)}`` -- ticket 002 folded the
+        latter into this same reply so a newly-joining peer catches up on
+        both tables in the one existing round-trip) -- or, when
+        ``auth_token`` (ticket 009) is set and the request's token is
+        missing/wrong, an ``{"error": "unauthorized"}`` reply instead (see
+        the module docstring's "Peering handshake auth" note).
 
         Runs on its own thread against its own socket -- never the PUB
         socket -- so a slow or stalled requester can never block this
@@ -997,7 +1119,12 @@ class PeerDiscovery:
                 payload = json.dumps({"error": "unauthorized"}).encode("utf-8")
             else:
                 with self._lock:
-                    payload = json.dumps(_snapshot_payload(self._store)).encode("utf-8")
+                    payload = json.dumps(
+                        {
+                            "devices": _snapshot_payload(self._store),
+                            "names": _snapshot_name_payload(self._store),
+                        }
+                    ).encode("utf-8")
             self._rep_socket.send(payload)
 
     def _token_ok(self, message: bytes) -> bool:
@@ -1160,3 +1287,40 @@ class PeerDiscovery:
         lock_display_callback=peering.publish_lock_event)``).
         """
         self.publish_event(EVENT_LOCK_STATE, {"uid": uid, "kind": kind, "display": display})
+
+    def publish_name_set(self, entry: Entry) -> None:
+        """Publish a ``name_registry`` ``set`` event for ``entry`` (ticket
+        002) -- called by a caller that just wrote ``entry`` via a local
+        ``Store.set()`` (explicit assignment) or ``Store.resolve()`` (on
+        derive) call, immediately after that write succeeds. Not wired to
+        any such call site by this ticket -- ``mbrelay``'s CLI (ticket
+        005) and the ``/names`` HTTP service (ticket 007) are the callers
+        that will invoke this, the same way ``Daemon``'s
+        ``event_callback``/``LockManager``'s ``lock_display_callback``
+        already invoke :meth:`publish_daemon_event`/:meth:`publish_lock_event`
+        after their own local writes.
+
+        Every field of ``entry`` the receiving side's ``_apply_event``/
+        ``_apply_snapshot_name`` read is included; ``source`` is carried
+        for wire completeness even though applying always ends up
+        ``SOURCE_REGISTRY`` on the receiving side (see the module
+        docstring's "Name registry replication" note).
+        """
+        self.publish_event(
+            EVENT_NAME_SET,
+            {
+                "name": entry.name,
+                "channel": entry.channel,
+                "group": entry.group,
+                "source": entry.source,
+                "updated": entry.updated,
+            },
+        )
+
+    def publish_name_clear(self, name: str) -> None:
+        """Publish a ``name_registry`` ``clear`` event for ``name``
+        (ticket 002) -- called by a caller immediately after its own
+        local ``Store.clear(name)`` call succeeds. Same "not wired to a
+        call site by this ticket" note as :meth:`publish_name_set`.
+        """
+        self.publish_event(EVENT_NAME_CLEAR, {"name": name})
