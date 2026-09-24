@@ -1,5 +1,8 @@
 ---
-status: pending
+status: in-progress
+sprint: '006'
+tickets:
+- 006-002
 ---
 
 # macOS: the default socket path is /run/mbregistry/api.sock, which doesn't exist
