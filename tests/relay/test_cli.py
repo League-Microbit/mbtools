@@ -49,11 +49,16 @@ from mbtools.common import (
     EXIT_USAGE,
 )
 from mbtools.registry.api import RegistryAPIServer
-from mbtools.registry.client import DeviceLockedError, RegistryClientError
+from mbtools.registry.client import (
+    DeviceLockedError,
+    DeviceNotFoundError,
+    RegistryClientError,
+)
 from mbtools.registry.flash import FlashOp
 from mbtools.registry.locks import KIND_RELAY, LockManager
 from mbtools.registry.store import Store
 from mbtools.relay import cli as cli_mod
+from mbtools.relay import naming
 
 # ---------------------------------------------------------------------------
 # FakeByteChannel -- a synchronous, in-memory ByteChannel (same shape as
@@ -423,21 +428,30 @@ def test_no_free_relay_is_reported_distinctly(capsys):
     assert ("names_get", "tovez") not in client.calls
 
 
-def test_robot_not_in_name_registry_is_reported_distinctly(capsys):
+def test_unregistered_robot_connects_on_its_derived_link(monkeypatch, capsys):
+    channel, group = naming.name_to_radio("vevov")
+    fake_channel = FakeByteChannel(full_script(channel, group))
+    monkeypatch.setattr(cli_mod, "_open_local_channel", lambda port: fake_channel)
     client = FakeRegistryClient(devices=[LOCAL_RELAY], names={})
 
-    code = cli_mod._run_connect(client, cli_mod.parse_target("tovez"), _connect_args("tovez"))
+    code = cli_mod._run_connect(client, cli_mod.parse_target("vevov"), _connect_args("vevov"))
 
-    assert code == EXIT_ERROR
-    err = capsys.readouterr().err
-    assert "not in the name registry" in err
-    # The lock was never taken -- no free relay was consumed for a robot
-    # that can't be tuned to anything yet.
-    assert not any(call[0] == "lock" for call in client.calls)
+    assert code == EXIT_OK
+    assert f"!CG {channel} {group}\n".encode() in fake_channel.written
+    assert "source: derived" in capsys.readouterr().err
+    # Deriving is a read: connect never writes a name-registry row.
+    assert not any(call[0] == "names_set" for call in client.calls)
 
 
-def test_no_free_relay_and_unregistered_robot_are_different_exit_codes_and_text():
-    assert EXIT_NO_DEVICE != EXIT_ERROR
+def test_resolve_entry_prefers_the_registered_link():
+    client = FakeRegistryClient(names={"tovez": NAME_ENTRY_TOVEZ})
+    assert cli_mod.resolve_entry(client, "tovez") == NAME_ENTRY_TOVEZ
+
+
+def test_resolve_entry_derives_an_unregistered_name():
+    channel, group = naming.name_to_radio("vevov")
+    entry = cli_mod.resolve_entry(FakeRegistryClient(), "vevov")
+    assert entry == {"name": "vevov", "channel": channel, "group": group, "source": "derived"}
 
 
 def test_already_locked_reports_holder(capsys):
@@ -492,6 +506,80 @@ def test_send_expect_scripting_mode_times_out_reports_error(monkeypatch, capsys)
 
     assert code == EXIT_ERROR
     assert "never saw" in capsys.readouterr().err
+
+
+def test_send_without_expect_prints_the_reply(monkeypatch, capsys):
+    script = full_script(20, 30)
+    script[b"SPEED?\n"] = b"speed 50\n"
+    fake_channel = FakeByteChannel(script)
+    monkeypatch.setattr(cli_mod, "_open_local_channel", lambda port: fake_channel)
+    monkeypatch.setattr(cli_mod, "SCRIPT_IDLE_GAP_S", 0.0)
+    client = FakeRegistryClient(devices=[LOCAL_RELAY], names={"tovez": NAME_ENTRY_TOVEZ})
+    args = _connect_args("tovez", ["--send", "SPEED?", "--timeout", "2"])
+
+    code = cli_mod._run_connect(client, cli_mod.parse_target("tovez"), args)
+
+    assert code == EXIT_OK
+    assert "speed 50" in capsys.readouterr().out
+
+
+def test_send_without_expect_and_no_reply_is_an_error(monkeypatch, capsys):
+    fake_channel = FakeByteChannel(full_script(20, 30))
+    monkeypatch.setattr(cli_mod, "_open_local_channel", lambda port: fake_channel)
+    client = FakeRegistryClient(devices=[LOCAL_RELAY], names={"tovez": NAME_ENTRY_TOVEZ})
+    args = _connect_args("tovez", ["--send", "SPEED?", "--timeout", "0.2"])
+
+    code = cli_mod._run_connect(client, cli_mod.parse_target("tovez"), args)
+
+    assert code == EXIT_ERROR
+    assert "no response" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# mbserial <robot>: no attached device by that name -> through a relay
+# ---------------------------------------------------------------------------
+
+
+class _NoAttachedDeviceClient(FakeRegistryClient):
+    def find(self, uid):
+        self.calls.append(("find", uid))
+        raise DeviceNotFoundError("not_found", f"no such device: {uid!r}")
+
+
+def _mbserial_args(argv):
+    from mbtools.serial import cli as serial_cli
+    return serial_cli, serial_cli.build_parser().parse_args(argv)
+
+
+def test_mbserial_falls_back_to_a_relay_for_a_robot_name(monkeypatch, capsys):
+    channel, group = naming.name_to_radio("vevov")
+    script = full_script(channel, group)
+    script[b"GREET\n"] = b"hi from vevov\n"
+    fake_channel = FakeByteChannel(script)
+    monkeypatch.setattr(cli_mod, "_open_local_channel", lambda port: fake_channel)
+    monkeypatch.setattr(cli_mod, "SCRIPT_IDLE_GAP_S", 0.0)
+    client = _NoAttachedDeviceClient(devices=[LOCAL_RELAY], names={})
+    serial_cli, args = _mbserial_args(["vevov", "GREET"])
+
+    code = serial_cli._run_connect(client, args)
+
+    assert code == EXIT_OK
+    assert f"!CG {channel} {group}\n".encode() in fake_channel.written
+    out, err = capsys.readouterr()
+    assert "hi from vevov" in out
+    assert "radio relay" in err
+    assert ("unlock", "uid-local-relay") in client.calls
+
+
+def test_mbserial_keeps_no_such_device_for_a_non_name(capsys):
+    client = _NoAttachedDeviceClient(devices=[LOCAL_RELAY], names={})
+    serial_cli, args = _mbserial_args(["robot1", "HELLO"])
+
+    code = serial_cli._run_connect(client, args)
+
+    assert code == EXIT_NO_DEVICE
+    assert "no such device" in capsys.readouterr().err
+    assert not any(call[0] == "lock" for call in client.calls)
 
 
 # ---------------------------------------------------------------------------

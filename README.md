@@ -71,9 +71,14 @@ common invocation.
 - `mbserial <name>` — open an interactive serial session to the named
   device (add one or more words after `<name>` to send a single one-shot
   command instead of opening a session; `--reset` deliberately resets the
-  board as part of connecting, which plain connecting does not do).
+  board as part of connecting, which plain connecting does not do). If no
+  attached device has that name but it is a robot's micro:bit name,
+  `mbserial` reaches the robot over a free radio relay instead.
 - `mbrelay connect <robot>[@host]` — connect to a robot over any free
-  radio relay (local or, with `@host`, a specific peer's).
+  radio relay (local or, with `@host`, a specific peer's). The robot's
+  channel/group come from the name registry if it has an entry, otherwise
+  from the name itself — `mbrelay names set` is only needed to override
+  that.
 
 ### Peering and remote access
 

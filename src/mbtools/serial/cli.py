@@ -57,6 +57,7 @@ from mbtools.common import (
 from mbtools.registry.client import (
     DEFAULT_SOCKET_PATH,
     DeviceLockedError,
+    DeviceNotFoundError,
     RegistryClient,
     RegistryClientError,
     RegistryUnavailable,
@@ -64,6 +65,7 @@ from mbtools.registry.client import (
 from mbtools.registry.client import SOCKET_ENV_VAR as _SOCKET_ENV_VAR
 from mbtools.registry.client import find_local_api_address
 from mbtools.registry.remote_client import RemoteRegistryClient
+from mbtools.relay import cli as relay_cli
 from mbtools.serial import remote_connect
 from mbtools.serial.connect import (
     BAUD_RATE,
@@ -188,6 +190,37 @@ def _run_connect_remote(device: dict, host: str, args: argparse.Namespace) -> in
         return EXIT_NO_DAEMON
 
 
+def _run_connect_relay(client: RegistryClient, args: argparse.Namespace,
+                       not_found: DeviceNotFoundError) -> int:
+    """No attached device answers to ``args.target``: if it is a robot's
+    micro:bit name, reach the robot over the radio instead, through any
+    free relay -- ``mbrelay connect``'s own flow (its registered link, or
+    the one its name derives). A one-shot message becomes a single
+    ``--send`` line; no message, the relay's interactive terminal.
+    Anything that isn't a well-formed name keeps the original "no such
+    device" error.
+    """
+    try:
+        target = relay_cli.parse_target(args.target)
+    except ValueError:
+        print(f"mbserial: {not_found.message}", file=sys.stderr)
+        return not_found.exit_code
+
+    print(
+        f"mbserial: no attached device named {target.robot!r} -- "
+        "reaching it through a radio relay",
+        file=sys.stderr,
+    )
+    relay_args = argparse.Namespace(
+        send=[" ".join(args.message)] if args.message else [],
+        expect=None,
+        timeout=args.timeout,
+        no_probe=False,
+        escape="]",
+    )
+    return relay_cli._run_connect(client, target, relay_args)
+
+
 def _run_connect(client: RegistryClient, args: argparse.Namespace) -> int:
     """``mbserial``'s actual body, run against an already-connected local
     ``client`` -- see :func:`cmd_connect` for the socket-path resolution
@@ -202,6 +235,8 @@ def _run_connect(client: RegistryClient, args: argparse.Namespace) -> int:
     """
     try:
         device = client.find(args.target)
+    except DeviceNotFoundError as exc:
+        return _run_connect_relay(client, args, exc)
     except RegistryClientError as exc:
         print(f"mbserial: {exc.message}", file=sys.stderr)
         return exc.exit_code

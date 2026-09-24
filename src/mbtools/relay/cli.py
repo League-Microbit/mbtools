@@ -115,7 +115,7 @@ from mbtools.relay import naming
 from mbtools.relay.channel import LocalRelayChannel, RemoteRelayChannel
 from mbtools.relay.protocol import ByteChannel, Reader, RelayControl, RelayError
 
-__all__ = ["main", "build_parser", "cmd_connect", "cmd_names_get",
+__all__ = ["main", "build_parser", "cmd_connect", "resolve_entry", "cmd_names_get",
            "cmd_names_set", "cmd_names_clear", "cmd_names_list"]
 
 # -- !CG/!GO/PING sequencing -------------------------------------------------
@@ -138,6 +138,11 @@ _PONG_RE = re.compile(rb"\bpong\b")
 #: test_cli.py``'s own fast-tests convention, mirroring ``serial.cli``
 #: tests zeroing out ``serial.connect``'s ``OPEN_SETTLE``/``RESET_SETTLE``).
 TUNE_SETTLE_S = 0.5
+
+#: Script mode without ``--expect``: once the robot has said something,
+#: stop after this long with nothing more (``serial.connect.IDLE_GAP``'s
+#: counterpart); until then, wait out the whole ``--timeout``.
+SCRIPT_IDLE_GAP_S = 0.4
 
 
 @dataclass(frozen=True)
@@ -344,6 +349,7 @@ def _run_script(channel: ByteChannel, data_queue: "queue.Queue[bytes | None]",
     pattern = re.compile(expect.encode(), re.MULTILINE) if expect else None
     buf = bytearray()
     deadline = time.monotonic() + timeout
+    quiet_after = deadline
 
     for line in sends:
         payload = line.encode().decode("unicode_escape").encode("latin-1")
@@ -356,12 +362,13 @@ def _run_script(channel: ByteChannel, data_queue: "queue.Queue[bytes | None]",
         try:
             item = data_queue.get(timeout=min(0.2, max(remaining, 0.0)))
         except queue.Empty:
-            if pattern is None:
+            if pattern is None and buf and time.monotonic() >= quiet_after:
                 break
             continue
         if item is None:
             break
         buf.extend(item)
+        quiet_after = time.monotonic() + SCRIPT_IDLE_GAP_S
         if pattern is not None and pattern.search(buf):
             sys.stdout.write(buf.decode("utf-8", "replace"))
             sys.stdout.flush()
@@ -371,6 +378,9 @@ def _run_script(channel: ByteChannel, data_queue: "queue.Queue[bytes | None]",
     sys.stdout.flush()
     if pattern is not None:
         print(f"\nmbrelay: never saw {expect!r} within {timeout:g}s", file=sys.stderr)
+        return EXIT_ERROR
+    if not buf:
+        print(f"mbrelay: no response within {timeout:g}s", file=sys.stderr)
         return EXIT_ERROR
     return EXIT_OK
 
@@ -548,6 +558,20 @@ def _run_connect_remote(device: dict[str, Any], host: str, entry: dict[str, Any]
         return EXIT_NO_DAEMON
 
 
+def resolve_entry(client: RegistryClient, robot: str) -> dict[str, Any]:
+    """``robot``'s link: its name-registry row if it has one, otherwise the
+    ``(channel, group)`` its name derives (:func:`naming.name_to_radio` --
+    the same pair the board computes for itself at boot), tagged
+    ``source="derived"``. Registration is only needed to override the
+    derived link; this never writes a row.
+    """
+    entry = client.names_get(robot)
+    if entry is not None:
+        return entry
+    channel, group = naming.name_to_radio(robot)
+    return {"name": robot, "channel": channel, "group": group, "source": "derived"}
+
+
 def _run_connect(client: RegistryClient, target: ConnectTarget,
                  args: argparse.Namespace) -> int:
     device = _find_free_relay(client, target.host)
@@ -557,21 +581,10 @@ def _run_connect(client: RegistryClient, target: ConnectTarget,
         return EXIT_NO_DEVICE
 
     try:
-        entry = client.names_get(target.robot)
+        entry = resolve_entry(client, target.robot)
     except RegistryClientError as exc:
         print(f"mbrelay: {exc.message}", file=sys.stderr)
         return exc.exit_code
-    if entry is None:
-        # SUC-001's error flow: distinct from "no free relay" above, and
-        # never silently derived the way robot-console's own endpoint
-        # derives on miss -- an operator has to say what this robot's
-        # link is (`mbrelay names set`) before `connect` will use it.
-        print(
-            f"mbrelay: {target.robot!r} is not in the name registry -- "
-            f"run 'mbrelay names set {target.robot} <channel> <group>' first",
-            file=sys.stderr,
-        )
-        return EXIT_ERROR
 
     control = _make_control()
     host = device.get("host")
@@ -720,7 +733,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=8.0,
         metavar="SEC",
-        help="script mode: how long to wait for --expect (default 8)",
+        help="script mode: how long to wait for --expect, or for any reply "
+        "without it (default 8)",
     )
     connect.add_argument(
         "--no-probe",
