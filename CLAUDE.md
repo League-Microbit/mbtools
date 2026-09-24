@@ -136,32 +136,25 @@ cross-checking `dmesg` and/or `mbregistry list --json`'s `lock_kind`/
 `remote_lock_kind` fields, which aren't subject to the table's same
 "gone wins" precedence.
 
-**Known real bug, found during sprint 005 ticket 007's torture hardware
-pass, not fixed by that ticket (out of its scope — `registry.store`/
-`registry.peering`, not deployment tooling):** when a physical board's
-uid was previously known to *another* peer host (e.g. it was tested there
-in an earlier sprint, then physically moved), that peer keeps
-re-broadcasting its own stale `disconnected`, `host=<peer>` row for the
-uid, and `Store._upsert_device`'s remote path (`upsert_remote_attached`,
-called from `registry.peering`'s `_apply_snapshot_device`/`_apply_event`)
-unconditionally overwrites `host`/`state` on every incoming sync — even
-when *this* host's own daemon has that same uid physically attached and
-has just written a local (`host IS NULL`) row for it. The result: the
-uid flaps between a local, properly-probed row and the peer's stale
-remote one, and anything reading only `store.snapshot_local_devices()`
-(`WHERE host IS NULL`) — including `console_compat.relay_pool`, per its
-own module docstring — can see it as permanently peer-owned and never
-locally available, even though `mbregistry list`'s merged view and the
-board itself are both fine. Confirmed on `torture`: three of its four
-physical relays (uids `4f02a351`/`52f41cc6`/`f92f913d`) were previously
-tested on `hodr` in an earlier sprint; `hodr`'s own stale rows for them
-keep winning the race, and `torture`'s relay-pool port (7444) reports
-"0 devices" despite the boards being attached and reachable. No existing
-ticket owns this — the protocol has no "a peer's remote upsert must not
-clobber a uid this host has just scanned as physically local" rule at
-all. Needs its own issue/ticket (a `registry.store`/`registry.peering`
-fix, e.g. local-wins arbitration or a freshness/precedence rule) before
-`torture`'s relay pool can be trusted to reflect its own hardware.
+**Fixed, sprint 005 ticket 011** (was: "known real bug, found during
+ticket 007's torture hardware pass"): a physical board's uid previously
+known to *another* peer host (e.g. tested there in an earlier sprint,
+then physically moved) used to keep losing local ownership to that
+peer's stale re-broadcast row — `Store._upsert_device` now rejects a
+remote claim against a row this host owns locally and has connected
+(logged and dropped), `snapshot_local_devices`/`publish_daemon_event`
+no longer advertise a disconnected local row as an active claim, and
+`Daemon.run_once`'s own attach/detach diff is now scoped to
+locally-owned rows so a uid merely mirrored from a peer can never block
+this host from reclaiming a board it has physically attached. Verified
+on `torture` after deploying the fix to all six hosts: all three of its
+physical relays (uids `4f02a351`/`52f41cc6`/`f92f913d`) show
+`host=local` in `torture`'s own `mbregistry list`, `host=torture` on
+every other host's, and the relay pool (port 7444) hands out all three
+on connect instead of "0 devices". See the ticket's Implementation
+Notes (`clasi/sprints/005-mbregistry-windows-platform-support-and-fleet-migration/tickets/done/011-fix-local-ownership-wins-over-stale-peer-sync.md`)
+for the full root-cause trace, including a second gap (daemon.py's
+`previously_attached` set) found only by this hardware pass.
 
 ## Firmware for tests (GitHub release assets — use `MICROBIT.hex`)
 

@@ -1,7 +1,7 @@
 ---
 id: '011'
 title: 'Fix: local ownership wins over stale peer sync'
-status: in-progress
+status: done
 use-cases: []
 depends-on: []
 github-issue: ''
@@ -159,7 +159,7 @@ column.
       DB editing or deletion (fix point 5) — traced and confirmed (or a
       minimal explicit recovery step added if tracing shows it's
       actually needed).
-- [ ] **Hardware verification on `torture`**: after deploying the fix,
+- [x] **Hardware verification on `torture`**: after deploying the fix,
       `torture`'s relay pool (`console_compat.relay_pool`) offers its own
       physically attached relays, and every host's `mbregistry list`
       shows those boards as `host=torture` (not `host=hodr` or any other
@@ -245,44 +245,46 @@ by some other peer". Covered by
 `test_apply_event_identity_does_not_overwrite_local_connected_row`, and the
 positive-case `test_apply_event_detach_applies_when_attributed_to_sender`.
 
-**Fix point 5** (recovery, traced not implemented): confirmed no separate
-migration/backfill step is needed. `Daemon.run_once` (`src/mbtools/
-registry/daemon.py`) always calls `store.upsert_attached(uid, ...)` for any
-uid `usbwatch.scan()` reports that isn't already in its `previously_attached`
-set (`state != STATE_DISCONNECTED`). Tracing the actual `torture`/`hodr`
-production shape: `hodr`'s own stale row is itself `disconnected`, so its
-(pre-fix) unfiltered snapshot carries `state: "disconnected"` for it; on
-`torture`, `_apply_snapshot_device` applied that via the (pre-fix)
-unconditional `mark_remote_detached`, leaving `torture`'s hijacked row as
-`host="hodr", state="disconnected"`. That state means the uid is *not* in
-`previously_attached` on `torture`'s next daemon cycle, so `usbwatch`'s
-rescan calls `upsert_attached(uid, ..., host=None)` →
-`_upsert_device`'s existing `state == STATE_DISCONNECTED` branch (unchanged
-by this fix) does the unconditional reattach, restoring `host = NULL` and
-resetting `state`. No explicit recovery pass was added — a plain daemon
-restart on `torture`/`hodr` running this fix is sufficient.
+**Fix point 5** (recovery): initially traced as "no separate migration
+step needed" from the `torture`/`hodr` production shape alone (`hodr`'s
+own stale row is itself `disconnected`, so its pre-fix unfiltered
+snapshot carried `state: "disconnected"`, which `_apply_snapshot_device`
+applied via the pre-fix unconditional `mark_remote_detached`, leaving the
+hijacked row as `host="hodr", state="disconnected"` — a state that *is*
+excluded from `previously_attached`, so `usbwatch`'s rescan reattaches it
+locally via the existing `state == STATE_DISCONNECTED` branch, no code
+change needed). **Hardware verification proved that trace incomplete**:
+one of `torture`'s three relays (`f92f913d`) had a *non*-disconnected
+remote row (`host="hodr", state="connected"` — a legitimately-probed
+mirror, not a stale-disconnected one), which does *not* fall out of
+`previously_attached` on its own. Tracing that case found a second,
+real gap — see below — which *was* fixed as part of this ticket, in
+`daemon.py`, once hardware evidence showed it directly blocked this
+ticket's own hardware-verification acceptance criterion.
 
-**Separate pre-existing defect found, out of this ticket's scope — flagged
-for a follow-up ticket, not fixed here**: `Daemon.run_once`'s
-`previously_attached` set (`store.list_devices()` filtered only by `state
-!= STATE_DISCONNECTED`) does not filter by `host`, so it includes
-*remote*-owned rows too. Any remote-owned uid not physically attached to
-*this* host (i.e. essentially all of them) falls into `previously_attached
-- current.keys()` every cycle, so the daemon calls `store.mark_disconnected`
-on it and fires a bogus `EVENT_DETACH` claiming `host=<this host>` for a
-uid it doesn't own — `_apply_event`'s `EVENT_DETACH` handling had no
-ownership check before this ticket either, so every peer (including the
-uid's actual owner) applied it. This ticket's new `_attributed_to` guard in
-`_apply_event` now stops that bogus detach from being *applied* by
-receivers, and the ownership-holding daemon's own next `run_once` cycle
-self-heals (reattach branch, same as point 5's trace) — so it is a source
-of continuous background churn (repeated spurious disconnect/reattach
-cycles logged, and brief incorrect `state` flapping on receivers' mirrored
-copies of foreign devices) rather than a lasting ownership bug, and it does
-not affect this ticket's `host=`-column acceptance criteria. Not fixed here:
-`daemon.py` is not in this ticket's listed files, and the ticket's
-root-cause chain doesn't implicate it — recommend a new ticket to scope
-`previously_attached` to `record.host is None`.
+**Second gap, found by hardware verification and fixed in this ticket
+(not left for a follow-up)**: `Daemon.run_once`'s `previously_attached`
+set (`store.list_devices()` filtered only by `state != STATE_DISCONNECTED`)
+did not filter by `host`, so it included *remote*-owned rows too. A uid
+physically attached to this host but mirrored here under a peer's
+still-`connected` ownership claim (`torture`'s `f92f913d`, kept alive by
+`hodr`'s own ongoing peering events) already counted as "previously
+attached" and so never reached `store.upsert_attached` — this host could
+never reclaim local ownership of its own physically-attached board no
+matter how many daemon cycles ran. The same lack of filtering also meant
+a remote-owned uid never physically present on this host fell into
+`previously_attached - current.keys()` every cycle, so the daemon called
+`store.mark_disconnected` on it and fired a bogus `EVENT_DETACH` claiming
+`host=<this host>` for a uid it doesn't own (this ticket's new
+`_attributed_to` guard in `_apply_event` stops receivers from *applying*
+that bogus detach, but the sending host's own daemon was still generating
+it every cycle). Fixed by scoping `previously_attached` to `record.host is
+None` — `src/mbtools/registry/daemon.py`'s `run_once`, see its updated
+docstring. Covered by
+`test_physically_attached_uid_reclaims_local_ownership_from_stale_remote_row`
+and
+`test_remote_owned_row_not_physically_present_is_never_marked_disconnected`
+in `tests/registry/daemon/test_daemon.py`.
 
 **Doc touch outside the listed files**:
 `src/mbtools/registry/console_compat/relay_pool.py`'s
@@ -291,3 +293,23 @@ every local row regardless of state" — corrected to describe the new
 disconnected-row exclusion, since it directly describes behavior of a
 method this ticket changed. No logic change in that file; its existing
 `state != STATE_CONNECTED` filter was already correct and unaffected.
+
+**Hardware verification results**: deployed to all six hosts
+(`scripts/deploy-host.sh <host>` for `torture`, `meili`, `loki`, `magni`,
+`braeburn`; `hodr` needed its documented offline-install workaround —
+`uv pip install --offline` from its warm cache, since it still has no
+default route — followed by the same `install-service`/systemctl/udevadm
+follow-ups the script runs, then a marker write so a future idempotent
+run recognizes the state). Before the fix, torture's pool (port 7444)
+returned `# ERROR: no relay available (0 devices, 0 in use)` and
+`mbregistry list` on torture showed all three relays (`4f02a351`/
+`52f41cc6`/`f92f913d`) as `host=hodr`. After deploying both this ticket's
+store/peering fix and the daemon.py fix it led to: torture's pool hands
+out all three relays on connect (three concurrent connections each got a
+distinct `DEVICE:RADIOBRIDGE:relay:...` banner; a fourth was correctly
+rejected with "3 devices, 3 in use"), and `mbregistry list` on torture
+itself and on every other host (`hodr`, `loki`, `meili`, `magni`,
+`braeburn`) shows all three as `host=torture`/`host=local` respectively.
+Verified stable (re-checked after the initial convergence, no flapping
+back to a stale owner). `CLAUDE.md`'s "Known real bug" note (added
+during ticket 007's hardware pass) is updated to record the fix.
