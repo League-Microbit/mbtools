@@ -1,7 +1,7 @@
 ---
 id: 008
 title: 'Non-root USB access: udev rule install'
-status: in-progress
+status: done
 use-cases:
 - SUC-005
 depends-on: []
