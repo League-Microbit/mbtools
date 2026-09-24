@@ -57,21 +57,25 @@ from __future__ import annotations
 import sqlite3
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable
 
 from mbtools.registry.identity import ProbeResult, short_uid
+from mbtools.relay import naming
 
 __all__ = [
     "AmbiguousNameError",
     "DeviceRecord",
+    "Entry",
     "PeerRecord",
     "Store",
     "STATE_ATTACHED_UNPROBED",
     "STATE_CONNECTED",
     "STATE_CONNECTED_NO_FIRMWARE",
     "STATE_DISCONNECTED",
+    "SOURCE_DERIVED",
+    "SOURCE_REGISTRY",
     "DEFAULT_DB_PATH",
     "format_vid_pid",
 ]
@@ -138,6 +142,32 @@ CREATE TABLE IF NOT EXISTS peer (
     reachable INTEGER NOT NULL DEFAULT 0
 )
 """
+
+#: Sprint 004, ticket 001: the robot name -> (channel, group) mapping, ported
+#: from ``microbit-radio-relay``'s ``names.json``-backed ``NameRegistry`` to a
+#: table alongside ``device``/``peer`` -- a brand new table, so (like
+#: ``_PEER_SCHEMA``) ``CREATE TABLE IF NOT EXISTS`` alone is idempotent on
+#: both a fresh database and an existing sprint-1/2/3-shape one; no per-column
+#: migration is needed (contrast ``_NEW_DEVICE_COLUMNS``, which adds columns
+#: to an *existing* table). The column is named ``radio_group`` rather than
+#: ``group`` only to keep every call site a plain, unquoted identifier --
+#: ``group`` is a SQL keyword; the :class:`Entry` field stays ``group``, per
+#: sprint.md's ERD and this ticket's Approach.
+_NAME_REGISTRY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS name_registry (
+    name TEXT PRIMARY KEY,
+    channel INTEGER NOT NULL,
+    radio_group INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    updated REAL NOT NULL
+)
+"""
+
+#: ``name_registry.source`` values -- sprint.md Decision 7 keeps only these
+#: two tiers, dropping ``microbit-radio-relay``'s third ``pins`` (TOML)
+#: tier: no per-host config-pin concept exists in ``mbtools``.
+SOURCE_DERIVED = "derived"
+SOURCE_REGISTRY = "registry"
 
 
 def format_vid_pid(vid: int, pid: int) -> str:
@@ -247,6 +277,44 @@ def _row_to_peer_record(row: sqlite3.Row) -> PeerRecord:
     )
 
 
+@dataclass(frozen=True)
+class Entry:
+    """One ``name_registry`` row -- a robot name's ``(channel, group)``,
+    per sprint.md's ERD and this ticket's Approach.
+
+    ``source`` is :data:`SOURCE_DERIVED` (computed from ``name`` by
+    :mod:`mbtools.relay.naming` and persisted on first ask -- see
+    :meth:`Store.resolve`) or :data:`SOURCE_REGISTRY` (explicitly set via
+    :meth:`Store.set`).
+
+    ``conflict``/``channel_conflict`` are populated only by
+    :meth:`Store.listing` -- every other method that returns an
+    :class:`Entry` leaves them at their default, empty tuple. They name the
+    *other* robots sharing this entry's exact link (error severity) or its
+    channel in a different group (warning severity); see
+    :meth:`Store.conflicts`/:meth:`Store.channel_conflicts` for the
+    fleet-wide view these are drawn from.
+    """
+
+    name: str
+    channel: int
+    group: int
+    source: str
+    updated: float
+    conflict: tuple[str, ...] = ()
+    channel_conflict: tuple[str, ...] = ()
+
+
+def _row_to_entry(row: sqlite3.Row) -> Entry:
+    return Entry(
+        name=row["name"],
+        channel=row["channel"],
+        group=row["radio_group"],
+        source=row["source"],
+        updated=row["updated"],
+    )
+
+
 class AmbiguousNameError(Exception):
     """Raised by :meth:`Store.find` when a bare ``device_name`` token (no
     ``@host`` suffix) matches more than one distinct ``host`` value --
@@ -342,10 +410,11 @@ class Store:
         self._conn.commit()
 
     def _migrate_schema(self) -> None:
-        """Add the sprint-003 ``device`` columns and the ``peer`` table, in
-        place -- never a destructive rebuild, per this module's "never
-        delete, always update in place" precedent (module docstring;
-        sprint.md's Migration Concerns).
+        """Add the sprint-003 ``device`` columns, the ``peer`` table, and
+        (sprint 004, ticket 001) the ``name_registry`` table, in place --
+        never a destructive rebuild, per this module's "never delete,
+        always update in place" precedent (module docstring; sprint.md's
+        Migration Concerns).
 
         Runs unconditionally, every construction, right after ``_SCHEMA``'s
         ``CREATE TABLE IF NOT EXISTS device`` -- which only ever creates
@@ -368,6 +437,10 @@ class Store:
             if column not in existing_columns:
                 self._conn.execute(f"ALTER TABLE device ADD COLUMN {column} {decl}")
         self._conn.execute(_PEER_SCHEMA)
+        # Sprint 004, ticket 001: another brand-new table, same idempotent
+        # CREATE TABLE IF NOT EXISTS path as _PEER_SCHEMA above -- no
+        # per-column migration needed.
+        self._conn.execute(_NAME_REGISTRY_SCHEMA)
 
     def close(self) -> None:
         """Close the underlying SQLite connection."""
@@ -828,3 +901,207 @@ class Store:
                 "SELECT * FROM peer WHERE host = ?", (host,)
             ).fetchone()
             return _row_to_peer_record(row) if row is not None else None
+
+    # -- name registry (sprint 004, ticket 001) ----------------------------
+    #
+    # Conceptually ports ``microbit-radio-relay/server/src/mbrelay/
+    # registry.py``'s ``NameRegistry`` query/conflict-detection semantics
+    # onto this table, with the old ``pins`` (TOML) precedence tier dropped
+    # (sprint.md Decision 7 -- only SOURCE_DERIVED/SOURCE_REGISTRY exist
+    # here). ``mbtools.relay.naming`` is the pure address-derivation module
+    # both this class and (ticket 003's) ``relay.protocol`` depend on.
+    #
+    # Named ``get_name``/``resolve``/``set``/``clear`` rather than a literal
+    # ``get`` -- this class already has a ``get(uid)`` for the *device*
+    # table, and a method can't be keyed by one argument's runtime type in
+    # Python; reusing ``get`` here would silently shadow the device lookup.
+    # ``resolve``/``set``/``clear``/``name_for``/``conflicts``/
+    # ``channel_conflicts``/``listing`` don't collide with anything already
+    # on this class, so those keep the ticket's literal names.
+
+    def resolve(self, name: str) -> Entry:
+        """Where is this robot? Always answers for a well-formed name.
+
+        Returns the existing row unchanged if ``name`` is already on
+        record (either source). Otherwise derives ``(channel, group)`` via
+        :func:`mbtools.relay.naming.name_to_radio`, persists it with
+        ``source=SOURCE_DERIVED``, and returns the new row.
+
+        The insert uses ``INSERT OR IGNORE``: two calls for the same
+        unseen name always derive the identical pair (a pure function of
+        ``name``), so a race that loses the insert simply reads back the
+        row the winner just wrote -- no crash, no divergent value.
+
+        Raises ``ValueError`` if ``name`` is not a well-formed micro:bit
+        name (:func:`mbtools.relay.naming.validate`).
+        """
+        with self._lock:
+            name = naming.validate(name)
+            existing = self._get_name_row(name)
+            if existing is not None:
+                return existing
+            channel, group = naming.name_to_radio(name)
+            now = self._now()
+            self._conn.execute(
+                "INSERT OR IGNORE INTO name_registry "
+                "(name, channel, radio_group, source, updated) VALUES (?, ?, ?, ?, ?)",
+                (name, channel, group, SOURCE_DERIVED, now),
+            )
+            self._conn.commit()
+            record = self._get_name_row(name)
+            assert record is not None  # just written (or raced and lost, same row)
+            return record
+
+    def get_name(self, name: str) -> Entry | None:
+        """Like :meth:`resolve`, but does not create. ``None`` if ``name``
+        has no row yet.
+
+        Raises ``ValueError`` if ``name`` is not a well-formed micro:bit
+        name.
+        """
+        with self._lock:
+            name = naming.validate(name)
+            return self._get_name_row(name)
+
+    def _get_name_row(self, name: str) -> Entry | None:
+        """Exact lookup by already-validated ``name``. Callers hold
+        ``self._lock``."""
+        row = self._conn.execute(
+            "SELECT * FROM name_registry WHERE name = ?", (name,)
+        ).fetchone()
+        return _row_to_entry(row) if row is not None else None
+
+    def set(self, name: str, channel: int, group: int) -> Entry:
+        """Explicitly assign ``name`` to ``(channel, group)``, persisted
+        with ``source=SOURCE_REGISTRY`` -- overwrites any existing row
+        (derived or previously registered).
+
+        Raises ``ValueError`` if ``name`` is not a well-formed micro:bit
+        name.
+        """
+        with self._lock:
+            name = naming.validate(name)
+            now = self._now()
+            if self._get_name_row(name) is None:
+                self._conn.execute(
+                    "INSERT INTO name_registry "
+                    "(name, channel, radio_group, source, updated) VALUES (?, ?, ?, ?, ?)",
+                    (name, channel, group, SOURCE_REGISTRY, now),
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE name_registry SET channel = ?, radio_group = ?, "
+                    "source = ?, updated = ? WHERE name = ?",
+                    (channel, group, SOURCE_REGISTRY, now, name),
+                )
+            self._conn.commit()
+            record = self._get_name_row(name)
+            assert record is not None
+            return record
+
+    def clear(self, name: str) -> None:
+        """Drop ``name``'s row, if any. A later :meth:`resolve` re-derives
+        it from scratch (``source=SOURCE_DERIVED`` again).
+
+        Raises ``ValueError`` if ``name`` is not a well-formed micro:bit
+        name. Clearing a name with no row is not an error -- a plain
+        ``DELETE`` on an absent primary key is already a no-op.
+        """
+        with self._lock:
+            name = naming.validate(name)
+            self._conn.execute("DELETE FROM name_registry WHERE name = ?", (name,))
+            self._conn.commit()
+
+    def name_for(self, channel: int, group: int) -> str | None:
+        """Which robot is on this link? The inverse of :meth:`resolve`.
+
+        An explicit (``source=SOURCE_REGISTRY``) row on this exact pair
+        wins. Failing that, the derived bijection answers via
+        :func:`mbtools.relay.naming.radio_to_name` -- a name maps to its
+        own pair for free -- but NOT when that name's own row has since
+        moved it elsewhere, since the address it vacated no longer belongs
+        to it. ``None`` if nothing answers.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT name FROM name_registry WHERE channel = ? AND radio_group = ? "
+                "AND source = ?",
+                (channel, group, SOURCE_REGISTRY),
+            ).fetchone()
+            if row is not None:
+                return row["name"]
+            try:
+                derived_name = naming.radio_to_name(channel, group)
+            except ValueError:
+                return None
+            moved = self._get_name_row(derived_name)
+            if moved is not None and (moved.channel, moved.group) != (channel, group):
+                return None
+            return derived_name
+
+    def conflicts(self) -> dict[tuple[int, int], list[str]]:
+        """Pairs held by more than one name -- error severity (each robot
+        receives the other's packets and acts on the other's commands).
+        Reported, never enforced -- a survey is allowed to make a mess
+        halfway through."""
+        with self._lock:
+            return self._conflicts_of(self._all_name_entries())
+
+    def channel_conflicts(self) -> dict[int, list[str]]:
+        """Channels holding names in more than one group -- warning
+        severity (the group byte filters each other's packets, but both
+        still transmit on one frequency and collide). A channel whose
+        names all share one group is a :meth:`conflicts` error instead,
+        never reported twice."""
+        with self._lock:
+            return self._channel_conflicts_of(self._all_name_entries())
+
+    def listing(self) -> list[Entry]:
+        """Every row, each annotated with its ``conflict``/
+        ``channel_conflict`` names (see :class:`Entry`).
+
+        Per-entry, not a filter of :meth:`conflicts`/:meth:`channel_conflicts`
+        (those answer a different, fleet-wide question -- "is this channel
+        used by more than one group at all?" -- which is not the same set as
+        "which *other* names sit on *this* entry's channel in a different
+        group"). Ported from ``NameRegistry._annotate``: for each entry,
+        every other entry sharing its channel is either on the exact same
+        link (``conflict``) or the same channel in a different group
+        (``channel_conflict``).
+        """
+        with self._lock:
+            entries = self._all_name_entries()
+            annotated = []
+            for entry in entries:
+                others = [
+                    e for e in entries
+                    if e.channel == entry.channel and e.name != entry.name
+                ]
+                same_link = tuple(e.name for e in others if e.group == entry.group)
+                same_channel = tuple(e.name for e in others if e.group != entry.group)
+                annotated.append(
+                    replace(entry, conflict=same_link, channel_conflict=same_channel)
+                )
+            return annotated
+
+    def _all_name_entries(self) -> list[Entry]:
+        """Every ``name_registry`` row, unannotated. Callers hold
+        ``self._lock``."""
+        rows = self._conn.execute("SELECT * FROM name_registry ORDER BY name").fetchall()
+        return [_row_to_entry(row) for row in rows]
+
+    @staticmethod
+    def _conflicts_of(entries: list[Entry]) -> dict[tuple[int, int], list[str]]:
+        seen: dict[tuple[int, int], list[str]] = {}
+        for entry in entries:
+            seen.setdefault((entry.channel, entry.group), []).append(entry.name)
+        return {pair: names for pair, names in seen.items() if len(names) > 1}
+
+    @staticmethod
+    def _channel_conflicts_of(entries: list[Entry]) -> dict[int, list[str]]:
+        names: dict[int, list[str]] = {}
+        groups: dict[int, set[int]] = {}
+        for entry in entries:
+            names.setdefault(entry.channel, []).append(entry.name)
+            groups.setdefault(entry.channel, set()).add(entry.group)
+        return {ch: names[ch] for ch in names if len(groups[ch]) > 1}

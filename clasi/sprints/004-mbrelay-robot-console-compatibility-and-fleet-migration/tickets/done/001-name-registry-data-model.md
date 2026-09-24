@@ -1,8 +1,11 @@
 ---
 id: '001'
 title: Name registry data model
-status: open
-use-cases: [SUC-001, SUC-003, SUC-004]
+status: done
+use-cases:
+- SUC-001
+- SUC-003
+- SUC-004
 depends-on: []
 github-issue: ''
 issue: mbrelay-relay-protocol-client-over-mbregistry.md
@@ -56,23 +59,71 @@ shape.
 
 ## Acceptance Criteria
 
-- [ ] `name_registry` table is created idempotently on both a fresh
+- [x] `name_registry` table is created idempotently on both a fresh
       database and an existing sprint-1/2/3-shape `devices.db`.
-- [ ] `Store.resolve()` derives and persists a `source="derived"` entry
+- [x] `Store.resolve()` derives and persists a `source="derived"` entry
       on first ask for an unseen, well-formed name, and returns the
       existing entry unchanged on a repeat ask.
-- [ ] `Store.set()`/`Store.clear()` correctly move an entry between
+- [x] `Store.set()`/`Store.clear()` correctly move an entry between
       `source="registry"` and re-derivable (post-clear, the next
       `resolve()` re-derives).
-- [ ] `Store.conflicts()` flags two names sharing the same
+- [x] `Store.conflicts()` flags two names sharing the same
       (channel, group) as an error-severity conflict;
       `Store.channel_conflicts()` flags two names sharing the same
       channel with different groups as a warning-severity conflict.
-- [ ] `relay.naming`'s ported functions pass the original repo's
+- [x] `relay.naming`'s ported functions pass the original repo's
       canonical-form sha256 test vector unchanged.
-- [ ] `Store.resolve()` is idempotent under concurrent/duplicate calls
+- [x] `Store.resolve()` is idempotent under concurrent/duplicate calls
       for the same unseen name (same deterministic derived value each
       time, no crash on a race to insert).
+
+## Implementation Notes
+
+Interface decisions later tickets (002 replication, 003 relay.protocol, 005
+mbrelay CLI, 006/007 console-compat) depend on:
+
+- `mbtools.relay.naming` is the exact port location (module docstring
+  updated to point at `tests/relay/radio-address-vectors.json` instead of
+  the old repo's `server/tests/`; code is byte-identical). `relay.protocol`
+  (ticket 003) should import from here, not re-port.
+- `Store`'s new name-registry methods are `resolve`, `get_name`, `set`,
+  `clear`, `name_for`, `conflicts`, `channel_conflicts`, `listing` — **not**
+  a literal `get`, because `Store.get(uid)` already exists for the `device`
+  table and both would take a single string argument; reusing `get` would
+  silently shadow it. Every other name from the ticket's Approach section
+  was free and is used as written.
+- `Entry` (not `NameEntry`/`NameRecord`) has fields `name, channel, group,
+  source, updated` plus two annotation-only fields, `conflict` and
+  `channel_conflict` (both `tuple[str, ...]`, default `()`). Only
+  `Store.listing()` populates them; `resolve`/`get_name`/`set` always
+  return an `Entry` with both at their empty default. `conflicts()`/
+  `channel_conflicts()` return the fleet-wide dict form
+  (`dict[tuple[int,int], list[str]]` / `dict[int, list[str]]`) — a
+  different, coarser question ("is this channel/pair shared at all") than
+  `listing()`'s per-entry annotation ("which specific other names").
+  `SOURCE_DERIVED = "derived"` / `SOURCE_REGISTRY = "registry"` are the only
+  two source values (Decision 7 — no `pins`/`config` tier).
+- The `name_registry` table's column is `radio_group` (SQLite doesn't
+  reserve `group`, but every call site staying an unquoted identifier
+  seemed worth it) while the `Entry` field stays `group`; `_row_to_entry`
+  is the only place that translates between them.
+- `name_for()` and `listing()`'s conflict pairing are ported verbatim from
+  `NameRegistry.name_for`/`_annotate` (minus the dropped `pins` tier) —
+  `name_for` answers from the derived bijection even for a name nobody has
+  ever `resolve()`'d, as long as that name's own row (if any) hasn't moved
+  it elsewhere. `listing()`'s per-entry `channel_conflict` is **not** a
+  filter of `channel_conflicts()`'s aggregate dict (that method flags every
+  name on a channel that has multiple groups in use at all); `listing()`
+  instead lists, per entry, only the *other* names on its channel in a
+  *different* group than that entry's own — the two are genuinely
+  different questions and were briefly (incorrectly) conflated during
+  implementation before the test suite caught it.
+- `resolve()`'s idempotency under concurrent calls relies on two things
+  together: `Store`'s existing per-instance `self._lock` (already
+  serializes every public method) and an `INSERT OR IGNORE`, so a second
+  writer racing the same unseen name never raises `IntegrityError` and
+  always reads back the one row that won (same deterministic pair either
+  way, since derivation is a pure function of `name`).
 
 ## Testing
 

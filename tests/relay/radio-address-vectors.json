@@ -1,0 +1,62 @@
+{
+  "$comment": "Transcribed from radio-robot-lib docs/design/radio-addressing.md (wiki: 'Radio addressing', updated 2026-09-13). That document is normative; if they disagree, it wins and this file is wrong. Replaces the earlier mirror of pxt-nezha-diffdrive's vectors for the channel = 25 + 2*(n % 25) map. Key names under properties are kept so scripts/radio_address_conformance.py reads either file.",
+  "spec": "radio-robot-lib docs/design/radio-addressing.md",
+  "version": "2.0.0",
+  "algorithm": {
+    "consonants_at_positions_0_2_4": "zvgpt",
+    "vowels_at_positions_1_3": "uoiea",
+    "decode": "n = 0; for p in 0..4: n = n*5 + index_in_alphabet(name[p])",
+    "channel": "11 + (n % 73)",
+    "group": "15 + (n % 241)",
+    "reverse": "reject unless 11 <= channel <= 83 and 15 <= group <= 255; c = channel - 11; g = group - 15; n = c + 73 * (((g - c + 241) * 208) % 241); reject unless n < 3125; encode(n)",
+    "normalize": "trim ASCII whitespace; map A-Z to a-z",
+    "accept": "^[zvgpt][uoiea][zvgpt][uoiea][zvgpt]$",
+    "encode": "n -> name, the inverse of decode: for p = 4 down to 0: name[p] = alphabet(p)[n % 5]; n = n / 5"
+  },
+  "ranges": {
+    "n": [0, 3124],
+    "channel": {"min": 11, "max": 83, "count": 73},
+    "group": {"min": 15, "max": 255, "count": 241}
+  },
+  "properties": {
+    "total_names": 3125,
+    "distinct_pairs": 3125,
+    "names_per_channel": {"11-69": 43, "70-83": 42},
+    "names_per_group": {"15-247": 13, "248-255": 12},
+    "full_space_sha256": "c22691f1c47bed3ac5317119487a30ea8fd0224d61c50bba551b1e624b548a84",
+    "full_space_sha256_note": "D1 -- forward only: '<name>,<channel>,<group>\\n' for n = 0..3124. Never calls decode or reverse; a bisector only.",
+    "conformance_sha256": "305d6ee08cfae978fe13e1179c6047a56e1b0b1abe23c2cb757f01461cf2d35f",
+    "conformance_sha256_note": "D2 -- the gate: '<name>,<channel>,<group>,<decode(name)>,<reverse(channel,group)>\\n' for n = 0..3124.",
+    "conformance_sha256_broken_decode": {
+      "digest": "df3d1db0a2a8298ac6de1c118570e990221f0861b7b028e6f3947acb748ef1ba",
+      "use": "If D2 equals this, only the decoder is little-endian."
+    },
+    "endianness_probe": {
+      "vector": "zotuz",
+      "reversed_encoder_digest": "3ce51760e5f7f692c86a83af02a87a537e0de318b94fe0c73259612e68a8867b",
+      "reversed_encoder_digest_note": "If D1 equals this, the encoder is little-endian."
+    }
+  },
+  "reject": ["gauti", "vevo", "vevovv", "aeiou", "", "TOVEZZ"],
+  "normalize_equivalent": {"VEVOV": "vevov", " vevov ": "vevov"},
+  "no_name_pairs": [[11, 16]],
+  "vectors": [
+    {"name": "zeguz", "n": 425, "channel": 71, "group": 199, "role": "robot", "device_id": 4227700425, "evidence": "silicon"},
+    {"name": "zetuv", "n": 476, "channel": 49, "group": 250, "role": "robot", "device_id": 1468666101, "evidence": "silicon"},
+    {"name": "vevov", "n": 1031, "channel": 20, "group": 82, "role": "robot", "device_id": 1198504156, "evidence": "silicon"},
+    {"name": "tovez", "n": 2665, "channel": 48, "group": 29, "role": "robot", "device_id": 2314287040, "evidence": "silicon"},
+    {"name": "togov", "n": 2681, "channel": 64, "group": 45, "role": "robot", "device_id": null, "evidence": "label-only"},
+    {"name": "vevav", "n": 1046, "channel": 35, "group": 97, "role": "robot", "device_id": null, "evidence": "label-only"},
+    {"name": "gopiv", "n": 1461, "channel": 12, "group": 30, "role": "bench rig", "device_id": 2175407711, "evidence": "silicon"},
+    {"name": "getez", "n": 1740, "channel": 72, "group": 68, "role": "relay", "device_id": 1784514240, "evidence": "silicon"},
+    {"name": "zavaz", "n": 545, "channel": 45, "group": 78, "role": "relay", "device_id": 4076631795, "evidence": "silicon"},
+    {"name": "zuzuz", "n": 0, "channel": 11, "group": 15, "evidence": "synthetic"},
+    {"name": "zuzuv", "n": 1, "channel": 12, "group": 16, "evidence": "synthetic"},
+    {"name": "zugag", "n": 72, "channel": 83, "group": 87, "evidence": "synthetic"},
+    {"name": "zugap", "n": 73, "channel": 11, "group": 88, "evidence": "synthetic"},
+    {"name": "zotuz", "n": 225, "channel": 17, "group": 240, "evidence": "synthetic"},
+    {"name": "zotez", "n": 240, "channel": 32, "group": 255, "evidence": "synthetic"},
+    {"name": "zotev", "n": 241, "channel": 33, "group": 15, "evidence": "synthetic"},
+    {"name": "tatat", "n": 3124, "channel": 69, "group": 247, "evidence": "synthetic"}
+  ]
+}
