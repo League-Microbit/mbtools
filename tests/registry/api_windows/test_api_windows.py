@@ -174,7 +174,16 @@ def test_no_pywin32_import():
     import ast
     import inspect
 
-    allowed_stdlib = {"__future__", "ctypes", "json", "logging", "sys", "threading", "typing"}
+    allowed_stdlib = {
+        "__future__",
+        "ctypes",
+        "json",
+        "logging",
+        "sys",
+        "threading",
+        "time",
+        "typing",
+    }
     source = inspect.getsource(api_windows)
     tree = ast.parse(source)
     imported_roots: set[str] = set()
@@ -505,17 +514,22 @@ def test_pipe_writer_batches_write_write_flush_into_one_write_file_call():
 class _ScriptedLifecycleWin32:
     """A scripted double covering the whole
     `create_named_pipe`/`connect_named_pipe`/`read_file`/`write_file`/
-    `disconnect_named_pipe`/`close_handle`/`get_client_process_id`
-    surface `WindowsPipeAPIServer` uses end-to-end -- mirrors
-    `FakeSerial`'s role for pyserial identity probing, but for this
-    module's named-pipe transport.
+    `disconnect_named_pipe`/`close_handle`/`get_client_process_id`/
+    `cancel_pending_connect` surface `WindowsPipeAPIServer` uses
+    end-to-end -- mirrors `FakeSerial`'s role for pyserial identity
+    probing, but for this module's named-pipe transport.
 
     Serves exactly one scripted client connection (``request_lines``,
     attributed to ``pid``) on the first `create_named_pipe`/
     `connect_named_pipe` pair; every subsequent pipe instance's
     `connect_named_pipe` blocks (mirroring a real pending
-    `ConnectNamedPipe`) until `stop()` closes that handle, at which
-    point it raises -- exactly how `_accept_loop` is meant to unwind.
+    `ConnectNamedPipe`) until `cancel_pending_connect` is called, at
+    which point it raises -- exactly how `_accept_loop`'s own
+    `stop()`-triggered unwind is meant to work (ticket 006: this used
+    to model `close_handle` as the unblocking call, which is what real
+    Windows does *not* reliably honor for a synchronous pending
+    `ConnectNamedPipe` -- see `_Win32PipeAPI.cancel_pending_connect`'s
+    own docstring for the real deadlock this replaced).
     """
 
     def __init__(self, pid, request_lines):
@@ -526,16 +540,18 @@ class _ScriptedLifecycleWin32:
         self._served = False
         self._next_handle = 1
         self._state: dict[int, dict] = {}
+        self._cancelled = threading.Event()
         self.written: list[bytes] = []
         self.create_calls: list[str] = []
         self.disconnect_calls: list[int] = []
         self.close_calls: list[int] = []
+        self.cancel_calls: list[int] = []
 
     def create_named_pipe(self, name):
         self.create_calls.append(name)
         handle = self._next_handle
         self._next_handle += 1
-        self._state[handle] = {"inbound": b"", "closed": threading.Event()}
+        self._state[handle] = {"inbound": b""}
         return handle
 
     def connect_named_pipe(self, handle):
@@ -543,9 +559,11 @@ class _ScriptedLifecycleWin32:
             self._served = True
             self._state[handle]["inbound"] = self._inbound
             return
-        if not self._state[handle]["closed"].wait(timeout=5.0):
-            raise TimeoutError("test: stop() never closed the pending pipe handle")
-        raise OSError("api_windows: pipe closed")
+        if not self._cancelled.wait(timeout=5.0):
+            raise TimeoutError(
+                "test: stop() never cancelled the pending pipe handle"
+            )
+        raise OSError("api_windows: pipe connect cancelled")
 
     def read_file(self, handle, size):
         state = self._state[handle]
@@ -560,7 +578,10 @@ class _ScriptedLifecycleWin32:
 
     def close_handle(self, handle):
         self.close_calls.append(handle)
-        self._state[handle]["closed"].set()
+
+    def cancel_pending_connect(self, thread_id):
+        self.cancel_calls.append(thread_id)
+        self._cancelled.set()
 
     def get_client_process_id(self, handle):
         return self._pid

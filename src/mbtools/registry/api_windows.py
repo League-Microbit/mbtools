@@ -105,6 +105,7 @@ import json
 import logging
 import sys
 import threading
+import time
 from typing import Any, Callable
 
 from mbtools.common import CODE_INVALID_REQUEST
@@ -158,6 +159,20 @@ _PIPE_UNLIMITED_INSTANCES = 255
 _ERROR_PIPE_CONNECTED = 535
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _STILL_ACTIVE = 259
+
+#: Windows CI ticket 006 addition -- see :meth:`_Win32PipeAPI
+#: .cancel_pending_connect`'s own docstring for the full story: a
+#: pending *synchronous* ``ConnectNamedPipe`` must be interrupted with
+#: ``CancelSynchronousIo`` (which needs a thread handle opened with this
+#: access right), never with a cross-thread ``CloseHandle`` on the pipe
+#: handle itself (that was the windows-latest CI job's first real
+#: failure -- a genuine deadlock, not a flaky slowdown).
+_THREAD_TERMINATE = 0x0001
+#: ``CancelSynchronousIo``'s own "nothing was pending right now" result
+#: -- a benign race with the accept loop's create/connect sequence, not
+#: a real failure (see :meth:`WindowsPipeAPIServer
+#: ._cancel_accept_thread_pending_io`).
+_ERROR_NOT_FOUND = 1168
 
 #: ``CreateFileW`` flags for :meth:`_Win32PipeAPI.open_client_pipe` --
 #: sprint 005 ticket 005's addition, the *client* side's own open call
@@ -259,6 +274,15 @@ if sys.platform == "win32":  # pragma: no cover - real binding only exists on Wi
         _wintypes.HANDLE,
     ]
     _kernel32.CreateFileW.restype = _wintypes.HANDLE
+
+    # Windows CI ticket 006: cancelling a pending synchronous
+    # ConnectNamedPipe from another thread -- see
+    # _Win32PipeAPI.cancel_pending_connect's own docstring.
+    _kernel32.OpenThread.argtypes = [_wintypes.DWORD, _wintypes.BOOL, _wintypes.DWORD]
+    _kernel32.OpenThread.restype = _wintypes.HANDLE
+
+    _kernel32.CancelSynchronousIo.argtypes = [_wintypes.HANDLE]
+    _kernel32.CancelSynchronousIo.restype = _wintypes.BOOL
 else:
     _kernel32 = None
     _advapi32 = None
@@ -405,6 +429,66 @@ class _Win32PipeAPI:
         if handle is None or handle == _INVALID_HANDLE_VALUE:
             raise OSError(f"api_windows: CreateFileW failed for {name!r}")
         return handle
+
+    def cancel_pending_connect(self, thread_id: int) -> None:
+        """Cancel a pending *synchronous* Win32 I/O call (in practice,
+        always a pending ``ConnectNamedPipe``) blocked on another
+        thread -- the safe way for :meth:`WindowsPipeAPIServer.stop`
+        (running on a *different* thread from the accept loop) to
+        unblock :meth:`WindowsPipeAPIServer._accept_loop`.
+
+        **Windows CI ticket 006's own bug fix**: closing a handle from
+        one thread while a *synchronous* (non-overlapped) operation is
+        pending on it from another thread is not a safe way to
+        interrupt that call on Windows, unlike ``socket.close()``
+        waking a blocked ``accept()``/``recv()`` on POSIX (this
+        module's original assumption, per the historical comment this
+        replaced on :class:`WindowsPipeAPIServer`'s own
+        ``_accept_gate``). The documented and *observed* behavior
+        instead: ``CloseHandle`` itself can block until the pending
+        synchronous I/O completes -- which, for a ``ConnectNamedPipe``
+        nobody will ever satisfy once the daemon is shutting down, is a
+        genuine, permanent deadlock. This is exactly what the
+        ``windows-latest`` CI job (ticket 006) first caught: the accept
+        thread sat blocked inside ``ConnectNamedPipe`` while the
+        ``stop()``-calling thread sat blocked *inside its own*
+        ``CloseHandle`` call on that same handle, well past
+        pytest-timeout's 60s default.
+
+        The documented fix is ``CancelSynchronousIo``
+        (``synchapi.h``/``Kernel32.dll``, stdlib-``ctypes``-reachable,
+        no ``pywin32`` needed -- sprint.md Decision 1), which cancels
+        pending synchronous I/O for a given *thread* rather than a given
+        *handle*, and needs a handle to that thread opened with the
+        ``THREAD_TERMINATE`` access right (the access
+        ``CancelSynchronousIo`` itself requires, per its own MSDN
+        page -- an odd-looking but documented requirement, nothing to
+        do with actually terminating the thread).
+
+        ``ERROR_NOT_FOUND`` (no synchronous I/O was pending on that
+        thread right now) is not an error here -- a benign, expected
+        race with :meth:`WindowsPipeAPIServer._accept_loop`'s own
+        create-then-connect sequence (there is a narrow window between
+        creating a pipe instance and actually calling
+        ``ConnectNamedPipe`` on it during which there is nothing yet to
+        cancel); see :meth:`WindowsPipeAPIServer
+        ._cancel_accept_thread_pending_io`, which retries this call
+        across that race rather than assuming a single call is always
+        enough.
+        """
+        thread_handle = _kernel32.OpenThread(_THREAD_TERMINATE, False, thread_id)
+        if not thread_handle:
+            return  # thread already gone -- nothing left to cancel
+        try:
+            ok = _kernel32.CancelSynchronousIo(thread_handle)
+            if not ok:
+                err = _kernel32.GetLastError()
+                if err != _ERROR_NOT_FOUND:
+                    raise OSError(
+                        f"api_windows: CancelSynchronousIo failed (error {err})"
+                    )
+        finally:
+            _kernel32.CloseHandle(thread_handle)
 
 
 def default_is_pid_alive_windows(pid: int) -> bool:
@@ -587,11 +671,19 @@ class WindowsPipeAPIServer(BaseAPIServer):
         self._accept_thread: threading.Thread | None = None
         self._sweep_thread: threading.Thread | None = None
         self._conn_threads: list[threading.Thread] = []
-        # Guards `_pending_handle` -- the handle currently blocked in
-        # `connect_named_pipe`, so `stop()` can close it from another
-        # thread to unblock the accept loop (a named pipe has no
-        # `socket.close()`-from-another-thread equivalent to interrupt a
-        # blocking call other than closing the handle itself).
+        # Guards `_pending_handle` -- the handle the accept loop has
+        # just created and is about to (or currently does) block on in
+        # `connect_named_pipe`, so a `stop_event`-set check and this
+        # bookkeeping stay atomic within `_accept_loop` itself. NOTE
+        # (ticket 006 correction of a stale comment this replaced):
+        # `stop()` no longer reads `_pending_handle` to close it from
+        # another thread -- that was this module's original, incorrect
+        # assumption (a named pipe has no `socket.close()`-from-another-
+        # thread equivalent; unlike a socket, closing a Win32 handle
+        # with synchronous I/O pending on it from another thread is not
+        # a safe/reliable way to interrupt that call -- see
+        # `_Win32PipeAPI.cancel_pending_connect`'s own docstring for the
+        # real fix and the deadlock this replaced).
         self._accept_gate = threading.Lock()
         self._pending_handle: int | None = None
 
@@ -625,22 +717,55 @@ class WindowsPipeAPIServer(BaseAPIServer):
         rationale (a caller that closes ``store`` immediately after
         ``stop()`` returns must not race a not-yet-finished handler
         thread).
+
+        **Ticket 006 fix**: unblocking the accept thread's own pending
+        ``ConnectNamedPipe`` is now :meth:`_cancel_accept_thread_pending_io`
+        (``CancelSynchronousIo``, targeting the accept *thread*) --
+        never a cross-thread ``CloseHandle`` on the pipe handle itself,
+        which this method used to do and which is exactly what produced
+        a genuine deadlock under the ``windows-latest`` CI job (see that
+        method's own docstring, and ``_Win32PipeAPI
+        .cancel_pending_connect``'s, for the full story).
         """
         self._stop_event.set()
-        with self._accept_gate:
-            pending = self._pending_handle
-            self._pending_handle = None
-        if pending is not None:
-            try:
-                self._win32.close_handle(pending)
-            except OSError:
-                pass
+        self._cancel_accept_thread_pending_io()
         if self._accept_thread is not None:
             self._accept_thread.join(timeout=2.0)
         if self._sweep_thread is not None:
             self._sweep_thread.join(timeout=2.0)
         for thread in self._conn_threads:
             thread.join(timeout=2.0)
+
+    def _cancel_accept_thread_pending_io(self) -> None:
+        """Repeatedly cancel any synchronous ``ConnectNamedPipe`` pending
+        on the accept thread, until that thread exits or a 2s deadline
+        elapses -- the unblocking half of :meth:`stop`'s ticket-006 fix.
+
+        A single :meth:`_Win32PipeAPI.cancel_pending_connect` call is not
+        reliable enough on its own: there is a narrow window in
+        :meth:`_accept_loop` between creating a new pipe instance and
+        actually entering the blocking ``ConnectNamedPipe`` call, during
+        which a cancel has nothing to cancel yet
+        (``ERROR_NOT_FOUND``, silently ignored by that method) and the
+        accept thread is about to block anyway. Polling -- cancel, then
+        wait briefly for the thread to exit, then cancel again if it
+        hasn't -- closes that race without needing a second
+        synchronization primitive shared with :meth:`_accept_loop`. In
+        the overwhelmingly common case (the accept thread is already
+        blocked in ``ConnectNamedPipe`` when ``stop()`` runs, since that
+        is where it spends nearly all of its time) the very first cancel
+        succeeds and this returns within a few milliseconds.
+        """
+        thread = self._accept_thread
+        if thread is None or thread.ident is None:
+            return
+        deadline = time.monotonic() + 2.0
+        while thread.is_alive() and time.monotonic() < deadline:
+            try:
+                self._win32.cancel_pending_connect(thread.ident)
+            except OSError:
+                pass
+            thread.join(timeout=0.05)
 
     def __enter__(self) -> "WindowsPipeAPIServer":
         self.start()

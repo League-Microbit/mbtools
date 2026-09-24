@@ -49,4 +49,9 @@ jobs:
           python-version: "3.13"
 
       - name: Run the test suite
-        run: uv run pytest -q -v --timeout=60
+        # -v (not -q -v together -- pytest's verbosity is additive/
+        # subtractive across -v/-q, and the two cancel back out to the
+        # grouped-dots-per-file default, which hid every failing test's
+        # actual name behind an unlabeled `F`/`E` in the windows-latest
+        # investigation this fixed) so a failure names its own test.
+        run: uv run pytest -v --tb=short -ra --timeout=60
