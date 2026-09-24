@@ -2,7 +2,7 @@
 id: '007'
 title: 'registry.remote_api: framed binary stream sub-protocol (data + BREAK/DTR/RTS
   control)'
-status: in-progress
+status: done
 use-cases:
 - SUC-004
 depends-on:
