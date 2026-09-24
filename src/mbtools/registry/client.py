@@ -41,6 +41,42 @@ switching on ``code`` itself. :class:`DeviceLockedError` additionally
 carries ``holder`` (``{"kind": ..., "pid": ...}``, per the wire protocol's
 own ``locked`` response shape) so a caller can format UC-006's "locked for
 ``<kind>`` by pid ``<pid>``" without a second lookup.
+
+**Windows transport (sprint 005 ticket 005)**: ticket 003 left this class's
+Windows side as a documented seam -- see the historical note on
+:meth:`RegistryClient.connect` below. This ticket closes it:
+:meth:`RegistryClient.connect` dispatches on ``sys.platform`` exactly like
+``registry.cli``'s own ``run``/``install-service`` branches do, and on
+``"win32"`` opens ``registry.api_windows.WindowsPipeAPIServer``'s named
+pipe from the client side via ``api_windows._Win32PipeAPI
+.open_client_pipe`` (``CreateFileW``) instead of ``socket.AF_UNIX``. It
+then reuses that same module's ``_PipeLineReader``/``_PipeWriter``
+newline-JSON framing classes unchanged -- they only need an object with
+``read_file``/``write_file`` methods and a handle, which
+``_Win32PipeAPI`` already provides identically for a client-opened handle
+as for a server-accepted one, so :meth:`RegistryClient._request` (below)
+needed zero changes: ``_PipeLineReader.readline()``/``_PipeWriter
+.write``/``.flush`` present the exact same interface
+``socket.makefile()`` already gave it. The pipe name itself is kept as a
+plain ``str``, deliberately never routed through :class:`pathlib.Path`
+(unlike ``self.socket_path`` on every other platform) -- ``Path``'s own
+normalization of a UNC-shaped string (``registry.paths
+.default_pipe_name()``'s ``r"\\\\.\\pipe\\mbregistry"``) on a real
+``WindowsPath`` is exactly the kind of thing this project cannot verify
+without Windows hardware, the same caveat ticket 003 originally flagged
+this gap with. Every lock this session acquires is still released when
+the pipe closes -- :class:`~mbtools.registry.api_windows
+.WindowsPipeAPIServer`'s own ``_handle_connection`` releases a
+connection's locks in its own ``finally`` block exactly like
+``api.RegistryAPIServer`` does, unaffected by which side (Unix socket or
+named pipe) closed first.
+
+Proven with fakes on macOS/Linux (``tests/registry/client
+/test_client_windows.py``, an injected ``win32=`` double mirroring
+``api_windows``'s own test precedent) -- a real pipe round-trip (server
+*and* client both for real) needs actual Windows and is
+``skipif(sys.platform != "win32")`` there, first exercised by ticket
+006's ``windows-latest`` CI job.
 """
 
 from __future__ import annotations
@@ -48,6 +84,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -61,6 +98,7 @@ from mbtools.common import (
     EXIT_USAGE,
 )
 from mbtools.registry.api import DEFAULT_SOCKET_PATH
+from mbtools.registry.api_windows import _PipeLineReader, _PipeWriter, _Win32PipeAPI
 
 __all__ = [
     "RegistryClient",
@@ -205,49 +243,68 @@ class RegistryClient:
     dicts, or a dict) on success and raises a typed exception on failure
     -- no raw socket or JSON leaks past this class's boundary.
 
-    **Windows gap (sprint 005)**: :meth:`connect` only ever constructs an
-    ``AF_UNIX`` socket -- there is no ``sys.platform == "win32"`` branch
-    here that speaks to ``registry.api_windows.WindowsPipeAPIServer``'s
-    named pipe, even though this module now *imports* cleanly on Windows
-    (ticket 003's import-safety fix -- see ``api.py``'s own docstring on
-    ``DEFAULT_SOCKET_PATH``). Calling :meth:`connect` on real Windows
-    still raises (``socket.AF_UNIX`` construction fails there). Wiring
-    this class to reach the named pipe -- reusing
-    ``api_windows._Win32PipeAPI``'s ``read_file``/``write_file`` and
-    adding a client-side ``CreateFileW`` open call, then the matching
-    ``_PipeLineReader``/``_PipeWriter`` framing that module already has
-    -- is a natural, self-contained follow-up, but is deliberately left
-    undone here: this class's ``socket_path: str | Path`` constructor
-    parameter round-trips a pipe-name string (``registry.paths
-    .default_pipe_name()``'s ``r"\\\\.\\pipe\\mbregistry"``) through
-    ``pathlib.Path`` today, and ``Path``'s own normalization of a UNC-
-    shaped string on a real ``WindowsPath`` is exactly the kind of thing
-    this project cannot verify without Windows hardware (no Windows
-    hardware exists for this project -- same caveat
-    ``registry.api_windows``'s own module docstring makes throughout).
-    No ticket in this sprint currently owns this gap (ticket 005's own
-    scope is ``cmd_run``/``cmd_install_service`` -- the daemon side, not
-    this client) -- flagged here as a clear seam for whichever ticket
-    picks it up next, rather than guessed at blind.
+    **Windows transport (sprint 005 ticket 005)**: on ``sys.platform ==
+    "win32"``, :meth:`connect` opens ``registry.api_windows
+    .WindowsPipeAPIServer``'s named pipe instead of an ``AF_UNIX`` socket
+    -- see the module docstring's "Windows transport" section for the
+    full rationale, and the historical note this replaced (ticket 003
+    originally left this class's Windows side as a documented seam).
+    ``win32`` (constructor-injectable, mirroring every other Windows
+    module's own ``win32=`` test seam in this package) is the pipe
+    transport double: production code leaves it ``None`` (constructs a
+    real ``api_windows._Win32PipeAPI``, which only works on real
+    Windows); tests inject a fake implementing the same
+    ``open_client_pipe``/``read_file``/``write_file``/``close_handle``
+    surface.
     """
 
-    def __init__(self, socket_path: str | Path) -> None:
-        self.socket_path = Path(socket_path)
+    def __init__(self, socket_path: str | Path, *, win32: Any | None = None) -> None:
+        # On Windows, `socket_path` is actually a pipe name
+        # (`registry.paths.default_pipe_name()`'s
+        # r"\\.\pipe\mbregistry") -- kept as a plain str, deliberately
+        # never routed through pathlib.Path (see module docstring's
+        # "Windows transport"). Everywhere else, unchanged: a real
+        # filesystem path to the AF_UNIX socket.
+        if sys.platform == "win32":
+            self.socket_path: str | Path = str(socket_path)
+        else:
+            self.socket_path = Path(socket_path)
         self._sock: socket.socket | None = None
+        self._pipe_handle: int | None = None
         self._rfile: Any = None
         self._wfile: Any = None
+        self._win32 = win32 if win32 is not None else _Win32PipeAPI()
 
     # -- connection lifecycle --------------------------------------------
 
     def connect(self) -> None:
-        """Open the underlying socket connection, if not already open.
-        Raises :class:`RegistryUnavailable` if the socket file is absent
-        or the daemon refuses the connection -- mirrors
-        ``registry.cli``'s pre-extraction ``_connect``/``cmd_list``
-        behavior exactly (same ``OSError`` catch, same ``EXIT_NO_DAEMON``
-        trigger one level up).
+        """Open the underlying connection, if not already open. Raises
+        :class:`RegistryUnavailable` if the daemon can't be reached --
+        mirrors ``registry.cli``'s pre-extraction ``_connect``/
+        ``cmd_list`` behavior exactly (same ``OSError`` catch, same
+        ``EXIT_NO_DAEMON`` trigger one level up) on every platform,
+        including the Windows named-pipe branch below (``CreateFileW``
+        failure -- no listener, or the pipe name is wrong -- raises
+        :class:`OSError`, caught here exactly like a refused
+        ``AF_UNIX`` connect).
         """
-        if self._sock is not None:
+        if self._sock is not None or self._pipe_handle is not None:
+            return
+        if sys.platform == "win32":
+            try:
+                handle = self._win32.open_client_pipe(str(self.socket_path))
+            except OSError as exc:
+                raise RegistryUnavailable(
+                    f"registry unavailable at {self.socket_path}: {exc}"
+                ) from exc
+            self._pipe_handle = handle
+            # _PipeLineReader/_PipeWriter (api_windows.py) only need an
+            # object with read_file/write_file and a handle -- the same
+            # interface _Win32PipeAPI gives a client-opened handle as a
+            # server-accepted one, so this framing is unchanged from the
+            # server side (see module docstring).
+            self._rfile = _PipeLineReader(self._win32, handle)
+            self._wfile = _PipeWriter(self._win32, handle)
             return
         try:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -263,7 +320,12 @@ class RegistryClient:
     def close(self) -> None:
         """Close the underlying connection, if open. Idempotent -- safe
         to call more than once, and safe to call on a never-connected
-        instance.
+        instance. Releases every lock this session acquired -- on the
+        Windows named-pipe branch this happens exactly the same way as
+        on ``AF_UNIX``: ``WindowsPipeAPIServer._handle_connection``'s own
+        ``finally`` block releases them when it observes the handle
+        close, mirroring ``RegistryAPIServer``'s identical behavior (see
+        module docstring).
         """
         for f in (self._rfile, self._wfile):
             if f is not None:
@@ -271,6 +333,12 @@ class RegistryClient:
                     f.close()
                 except OSError:
                     pass
+        if self._pipe_handle is not None:
+            try:
+                self._win32.close_handle(self._pipe_handle)
+            except OSError:
+                pass
+            self._pipe_handle = None
         if self._sock is not None:
             try:
                 self._sock.close()

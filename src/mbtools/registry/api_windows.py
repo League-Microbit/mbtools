@@ -24,6 +24,15 @@ Approach, but needed for this module's sweep to mean anything real on
 Windows; flagged here as an implementer addition, same "needs real-
 Windows confirmation" caveat as everything else in this module.
 
+**Sprint 005 ticket 005 addition**: :meth:`_Win32PipeAPI.open_client_pipe`
+(``CreateFileW``) is the named-pipe *client*'s own open call, added so
+``registry.client.RegistryClient`` can reuse this same class (and its
+already-bound ``read_file``/``write_file``/``close_handle``) as its own
+Windows transport rather than duplicating those bindings a second time
+in ``registry.client`` -- see that method's own docstring and
+``registry.client``'s module docstring for the full rationale. Every
+other export here remains server-side only.
+
 **Import-safety** (mirrors ``usbwatch.py``/``identity.py``'s existing
 ``pyserial`` guard): this module must import cleanly on macOS/Linux so
 the test suite can exercise its op-dispatch logic and so ``registry.cli``
@@ -150,6 +159,14 @@ _ERROR_PIPE_CONNECTED = 535
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _STILL_ACTIVE = 259
 
+#: ``CreateFileW`` flags for :meth:`_Win32PipeAPI.open_client_pipe` --
+#: sprint 005 ticket 005's addition, the *client* side's own open call
+#: (see that method's own docstring for why it lives on this class
+#: rather than a second ctypes binding block in ``registry.client``).
+_GENERIC_READ = 0x80000000
+_GENERIC_WRITE = 0x40000000
+_OPEN_EXISTING = 3
+
 #: ``INVALID_HANDLE_VALUE``, computed via plain ``ctypes`` (no ``windll``
 #: needed) so it is available off Windows too — ``c_void_p(-1)``'s
 #: unsigned representation, not literal ``-1`` (a raw ``HANDLE`` compare
@@ -229,6 +246,19 @@ if sys.platform == "win32":  # pragma: no cover - real binding only exists on Wi
         ctypes.POINTER(_wintypes.ULONG),
     ]
     _advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = _wintypes.BOOL
+
+    # sprint 005 ticket 005: the named-pipe *client*'s own open call --
+    # see _Win32PipeAPI.open_client_pipe's own docstring.
+    _kernel32.CreateFileW.argtypes = [
+        _wintypes.LPCWSTR,
+        _wintypes.DWORD,
+        _wintypes.DWORD,
+        ctypes.c_void_p,
+        _wintypes.DWORD,
+        _wintypes.DWORD,
+        _wintypes.HANDLE,
+    ]
+    _kernel32.CreateFileW.restype = _wintypes.HANDLE
 else:
     _kernel32 = None
     _advapi32 = None
@@ -341,6 +371,41 @@ class _Win32PipeAPI:
             raise OSError("api_windows: GetNamedPipeClientProcessId failed")
         return pid.value
 
+    def open_client_pipe(self, name: str) -> int:
+        """``CreateFileW`` -- the named-pipe *client*'s own open call,
+        the counterpart to :meth:`create_named_pipe`/
+        :meth:`connect_named_pipe` on the server side. Added for sprint
+        005 ticket 005's ``registry.client.RegistryClient`` Windows
+        transport (ticket 003's own documented seam, left for "whichever
+        ticket picks it up next" -- see that class's own docstring).
+
+        Deliberately added to *this* class rather than a second ctypes
+        binding block in ``registry.client`` -- ``read_file``/
+        ``write_file``/``close_handle`` above already work unchanged
+        against a client-opened handle (a named pipe handle behaves the
+        same for I/O regardless of which side opened it), so
+        ``RegistryClient`` constructs this same class as its own
+        transport (real on Windows, a test fake with the same method
+        surface elsewhere) and calls this one additional method to get
+        a handle, rather than duplicating the ``ReadFile``/``WriteFile``/
+        ``CloseHandle`` bindings a second time. Keeps every real Win32
+        binding for this named-pipe transport in this one module, per
+        ``registry.paths``'s own "centralize platform dispatch in one
+        place" precedent.
+        """
+        handle = _kernel32.CreateFileW(
+            name,
+            _GENERIC_READ | _GENERIC_WRITE,
+            0,
+            None,
+            _OPEN_EXISTING,
+            0,
+            None,
+        )
+        if handle is None or handle == _INVALID_HANDLE_VALUE:
+            raise OSError(f"api_windows: CreateFileW failed for {name!r}")
+        return handle
+
 
 def default_is_pid_alive_windows(pid: int) -> bool:
     """The production ``is_pid_alive_fn``: ``OpenProcess``/
@@ -421,6 +486,18 @@ class _PipeLineReader:
         if not line:
             raise StopIteration
         return line
+
+    def close(self) -> None:
+        """No-op -- there is nothing to flush on the read side, and this
+        class never owns the underlying handle (the caller does, per
+        every ``WindowsPipeAPIServer``/``RegistryClient`` use of this
+        class). Present only so callers that treat this object like
+        ``socket.makefile("r", ...)`` (which *does* have ``.close()``)
+        -- e.g. ``registry.client.RegistryClient.close()``, sprint 005
+        ticket 005 -- can call ``.close()`` on both halves uniformly,
+        mirroring :meth:`_PipeWriter.close`'s own symmetry with that
+        same interface.
+        """
 
 
 class _PipeWriter:

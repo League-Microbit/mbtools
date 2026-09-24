@@ -66,6 +66,7 @@ from typing import Any
 
 from mbtools.common import EXIT_ERROR, EXIT_NO_DAEMON, EXIT_OK
 from mbtools.registry.api import DEFAULT_SOCKET_PATH, RegistryAPIServer
+from mbtools.registry.api_windows import WindowsPipeAPIServer
 from mbtools.registry.client import (
     RegistryClient,
     RegistryClientError,
@@ -81,6 +82,7 @@ from mbtools.registry.console_compat.relay_pool import (
 )
 from mbtools.registry.daemon import DEFAULT_INTERVAL_S, Daemon
 from mbtools.registry.flash import FlashOp
+from mbtools.registry.paths import default_pipe_name
 from mbtools.registry.peering import (
     DEFAULT_PUB_PORT,
     DEFAULT_SNAPSHOT_PORT,
@@ -88,6 +90,10 @@ from mbtools.registry.peering import (
 )
 from mbtools.registry.remote_api import DEFAULT_REMOTE_PORT, RemoteAPIServer
 from mbtools.registry.render import render_json, render_table
+from mbtools.registry.service_windows import (
+    cmd_install_service_windows,
+    run_as_windows_service,
+)
 from mbtools.registry.store import DEFAULT_DB_PATH, Store
 from mbtools.registry.usbwatch import PollingPortWatcher, PortWatcher
 
@@ -171,6 +177,33 @@ def _resolve_path(flag_value: str | None, env_var: str, default: Path) -> Path:
     if env_value:
         return Path(env_value)
     return default
+
+
+def _resolve_local_api_address(flag_value: str | None, env_var: str) -> str | Path:
+    """``flag_value`` wins if given; else ``$env_var``; else this
+    platform's own production default for the local query/control API
+    -- sprint 005 ticket 005's platform dispatch, shared by
+    :func:`cmd_run` and :func:`cmd_list` (the two ``mbregistry``
+    subcommands that need to know the daemon's own local-API address).
+
+    On ``sys.platform == "win32"``, the default (and any ``flag_value``/
+    ``$env_var`` override) is returned as a plain ``str`` pipe name
+    (``registry.paths.default_pipe_name()``) -- never routed through
+    ``pathlib.Path``, matching ``registry.client.RegistryClient``'s own
+    "keep the pipe name as a plain str" contract (see that module's
+    docstring, "Windows transport"). Everywhere else, this delegates to
+    :func:`~mbtools.registry.client.resolve_socket_path` unchanged --
+    same flag > env var > :data:`DEFAULT_SOCKET_PATH` precedence as
+    before this ticket.
+    """
+    if sys.platform == "win32":
+        if flag_value:
+            return flag_value
+        env_value = os.environ.get(env_var)
+        if env_value:
+            return env_value
+        return default_pipe_name()
+    return resolve_socket_path(flag_value, env_var, DEFAULT_SOCKET_PATH)
 
 
 def _resolve_int(flag_value: int | None, env_var: str, default: int) -> int:
@@ -268,8 +301,14 @@ def cmd_list(args: argparse.Namespace) -> int:
     caller too -- ``mbdeploy list`` (ticket 008) is its second, sharing
     the same functions rather than a parallel rendering implementation
     (spec §4.3, SUC-003).
+
+    Sprint 005 ticket 005: :func:`_resolve_local_api_address` resolves
+    to the Windows named pipe (a plain ``str``) on ``sys.platform ==
+    "win32"``, so this is also the first Windows-aware caller of
+    :class:`~mbtools.registry.client.RegistryClient`'s own new pipe
+    transport -- everywhere else, unchanged.
     """
-    socket_path = resolve_socket_path(args.socket, _SOCKET_ENV_VAR, DEFAULT_SOCKET_PATH)
+    socket_path = _resolve_local_api_address(args.socket, _SOCKET_ENV_VAR)
 
     try:
         with RegistryClient(socket_path) as client:
@@ -313,16 +352,30 @@ def assemble_daemon_and_api(
     lock_display_callback: Any = None,
     name_set_callback: Any = None,
     name_clear_callback: Any = None,
-) -> tuple[Daemon, RegistryAPIServer]:
-    """Build one :class:`Daemon` and one :class:`RegistryAPIServer` that
-    share a single ``threading.RLock`` -- ticket 009's fix for the
-    cross-module concurrency gap ``docs/design/registry-api.md`` flagged
-    (see the module docstring). This is the one place production code
+) -> tuple[Daemon, RegistryAPIServer | WindowsPipeAPIServer]:
+    """Build one :class:`Daemon` and one local-API server that share a
+    single ``threading.RLock`` -- ticket 009's fix for the cross-module
+    concurrency gap ``docs/design/registry-api.md`` flagged (see the
+    module docstring). This is the one place production code
     (:func:`assemble_registry`, and through it :func:`cmd_run`) and tests
     (the run-then-list smoke test) construct that pairing, so the two can
     never drift apart -- a test never hand-builds its own
-    ``Daemon``/``RegistryAPIServer`` pair with two separate locks by
-    mistake.
+    ``Daemon``/local-API-server pair with two separate locks by mistake.
+
+    **Sprint 005 ticket 005**: the local-API server is
+    :class:`RegistryAPIServer` (a Unix socket) on every platform except
+    ``sys.platform == "win32"``, where it is
+    :class:`~mbtools.registry.api_windows.WindowsPipeAPIServer`
+    (a named pipe) instead -- the one piece of this function's assembly
+    that differs on Windows; ``Daemon``, its shared ``threading.RLock``,
+    and every other parameter here are built identically on every
+    platform. ``socket_path`` doubles as the pipe name on Windows
+    (:func:`cmd_run`/:func:`assemble_registry` resolve it via
+    :func:`_resolve_local_api_address`, which already returns a plain
+    ``str`` pipe name there -- see that function's own docstring).
+    :class:`WindowsPipeAPIServer` has no ``flash`` op (ticket 003's own
+    scope -- ``flash`` is ``RegistryAPIServer``'s own addition), so no
+    :class:`~mbtools.registry.flash.FlashOp` is constructed for it.
 
     ``store``/``usbwatch`` are injected (a real :class:`Store` and
     :class:`~mbtools.registry.usbwatch.PollingPortWatcher` in production,
@@ -374,17 +427,29 @@ def assemble_daemon_and_api(
         event_callback=event_callback,
         lock_display_callback=lock_display_callback,
     )
-    flash_op = FlashOp(locks=daemon.locks, store=store, runner=flash_runner)
-    api = RegistryAPIServer(
-        socket_path=socket_path,
-        store=store,
-        locks=daemon.locks,
-        flash_op=flash_op,
-        peer_pid_fn=peer_pid_fn,
-        lock=shared_lock,
-        name_set_callback=name_set_callback,
-        name_clear_callback=name_clear_callback,
-    )
+    api: RegistryAPIServer | WindowsPipeAPIServer
+    if sys.platform == "win32":
+        api = WindowsPipeAPIServer(
+            pipe_name=str(socket_path),
+            store=store,
+            locks=daemon.locks,
+            peer_pid_fn=peer_pid_fn,
+            lock=shared_lock,
+            name_set_callback=name_set_callback,
+            name_clear_callback=name_clear_callback,
+        )
+    else:
+        flash_op = FlashOp(locks=daemon.locks, store=store, runner=flash_runner)
+        api = RegistryAPIServer(
+            socket_path=socket_path,
+            store=store,
+            locks=daemon.locks,
+            flash_op=flash_op,
+            peer_pid_fn=peer_pid_fn,
+            lock=shared_lock,
+            name_set_callback=name_set_callback,
+            name_clear_callback=name_clear_callback,
+        )
     return daemon, api
 
 
@@ -409,7 +474,7 @@ def assemble_registry(
     zmq: Any = None,
     stream_serial_factory: Any = None,
     lock: threading.RLock | None = None,
-) -> tuple[Daemon, RegistryAPIServer, RemoteAPIServer, PeerDiscovery]:
+) -> tuple[Daemon, RegistryAPIServer | WindowsPipeAPIServer, RemoteAPIServer, PeerDiscovery]:
     """Ticket 009's real assembly: everything :func:`assemble_daemon_and_api`
     already builds, *plus* a :class:`~mbtools.registry.remote_api.RemoteAPIServer`
     and a :class:`~mbtools.registry.peering.PeerDiscovery`, all four
@@ -421,6 +486,14 @@ def assemble_registry(
     any caller/test that only wants the pre-ticket-009 daemon+local-api
     pairing -- see that function's own "Existing tests... must keep
     passing" note.
+
+    **Sprint 005 ticket 005**: the local-API server's own Windows branch
+    (:class:`~mbtools.registry.api_windows.WindowsPipeAPIServer` in
+    place of :class:`RegistryAPIServer`) lives entirely inside
+    :func:`assemble_daemon_and_api` above, which this function calls
+    unchanged -- ``remote_api``/``peering``/``console_compat.*`` are
+    TCP-based already and need no platform branch of their own here
+    (sprint.md's Impact section).
 
     Construction order: :class:`PeerDiscovery` is built first (but never
     started here -- see below), so its
@@ -619,18 +692,28 @@ def assemble_names_api(
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    """``mbregistry run`` -- the daemon's actual entry point. Constructs
-    the real production pipeline (:class:`~mbtools.registry.usbwatch.PollingPortWatcher`,
-    a real :class:`Store`) via :func:`assemble_registry`, starts the local
-    Unix-socket api, the TCP remote api, and mDNS/ZeroMQ peering (ticket
-    009), connects any explicit ``--peer`` targets, and runs the daemon's
-    poll loop in the foreground until a signal asks it to stop. This is
-    what a systemd ``ExecStart=`` invokes (see :func:`render_systemd_unit`),
-    and also what a developer runs directly on macOS (module docstring,
-    "macOS foreground dev use") -- peering/remote_api need no elevated
-    privilege beyond what ``--socket``/``--db`` already require, since
-    every new port (7440/7442/7443 by default) is a plain unprivileged
-    TCP/UDP port.
+    """``mbregistry run`` -- the daemon's actual entry point. Dispatches
+    to :func:`_run_registry` (the real production pipeline), either
+    directly -- run in the foreground until a POSIX signal asks it to
+    stop, exactly as before this ticket -- or, when ``--windows-service``
+    is given, through
+    :func:`~mbtools.registry.service_windows.run_as_windows_service`
+    (sprint 005 ticket 005).
+
+    **``--windows-service`` (ticket 005)**: this is the flag the
+    ``sc.exe create`` command :func:`~mbtools.registry.service_windows
+    .render_windows_service_install` renders actually invokes (see
+    :func:`cmd_install_service`'s own Windows branch) -- *not* meant for
+    interactive use. ``service_windows.py``'s own module docstring, "A
+    plain console app is not a real service", is why this indirection
+    exists at all: the Windows SCM kills a plain console process that
+    never calls ``StartServiceCtrlDispatcherW``, so the SCM-launched
+    entry point must go through :func:`run_as_windows_service`, which
+    calls :func:`_run_registry` as its own ``main(stop_event)`` --
+    ``run_as_windows_service`` sets that ``stop_event`` when the SCM
+    delivers ``SERVICE_CONTROL_STOP``, the exact same "poll loop notices
+    a stop signal" shape the non-service branch below gives
+    :func:`_run_registry` via a POSIX-signal-set ``threading.Event``.
 
     Per this ticket's own Testing note, peering (mDNS advertise/browse +
     the ZeroMQ event bus) is always started, never opt-in -- matching
@@ -639,7 +722,52 @@ def cmd_run(args: argparse.Namespace) -> int:
     flag-gated extra. ``--peer`` only adds *explicit* peers on top of
     whatever mDNS already finds; it never replaces mDNS discovery.
     """
-    socket_path = resolve_socket_path(args.socket, _SOCKET_ENV_VAR, DEFAULT_SOCKET_PATH)
+    if args.windows_service:
+        return run_as_windows_service(lambda stop_event: _run_registry(args, stop_event))
+
+    stop_event = threading.Event()
+
+    def _handle_signal(signum: int, frame: Any) -> None:
+        stop_event.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _handle_signal)
+        except (ValueError, OSError):
+            # Not the main thread of the main interpreter (e.g. embedded
+            # in a test harness), or the platform doesn't support this
+            # signal -- best-effort only; mbregistry run's real,
+            # production invocation is always the main thread.
+            pass
+
+    return _run_registry(args, stop_event)
+
+
+def _run_registry(args: argparse.Namespace, stop_event: threading.Event) -> int:
+    """The real production pipeline behind ``mbregistry run``: constructs
+    (:class:`~mbtools.registry.usbwatch.PollingPortWatcher`, a real
+    :class:`Store`) via :func:`assemble_registry`, starts the local api
+    (a Unix socket, or a named pipe on ``sys.platform == "win32"`` --
+    see :func:`assemble_daemon_and_api`'s own docstring), the TCP remote
+    api, and mDNS/ZeroMQ peering (ticket 009), connects any explicit
+    ``--peer`` targets, and runs the daemon's poll loop until
+    ``stop_event`` is set. This is what a systemd ``ExecStart=`` invokes
+    (see :func:`render_systemd_unit`), what a developer runs directly on
+    macOS (module docstring, "macOS foreground dev use"), and (sprint
+    005 ticket 005) what
+    :func:`~mbtools.registry.service_windows.run_as_windows_service`
+    calls as its own ``main`` on Windows -- peering/remote_api need no
+    elevated privilege beyond what ``--socket``/``--db`` already
+    require, since every new port (7440/7442/7443 by default) is a
+    plain unprivileged TCP/UDP port.
+
+    Split out of :func:`cmd_run` itself by this ticket so that function
+    can call this same pipeline either directly (the POSIX-signal-driven
+    foreground path, unchanged from before this ticket) or wrapped in
+    :func:`run_as_windows_service` -- ``stop_event`` is owned by
+    whichever of those two callers constructs it, not by this function.
+    """
+    socket_path = _resolve_local_api_address(args.socket, _SOCKET_ENV_VAR)
     db_path = _resolve_path(args.db, _DB_ENV_VAR, DEFAULT_DB_PATH)
     remote_port = _resolve_int(args.remote_port, _REMOTE_PORT_ENV_VAR, DEFAULT_REMOTE_PORT)
     peer_pub_port = _resolve_int(args.peer_pub_port, _PEER_PUB_PORT_ENV_VAR, DEFAULT_PUB_PORT)
@@ -697,21 +825,6 @@ def cmd_run(args: argparse.Namespace) -> int:
         name_set_callback=peering.publish_name_set,
         name_clear_callback=peering.publish_name_clear,
     )
-
-    stop_event = threading.Event()
-
-    def _handle_signal(signum: int, frame: Any) -> None:
-        stop_event.set()
-
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        try:
-            signal.signal(sig, _handle_signal)
-        except (ValueError, OSError):
-            # Not the main thread of the main interpreter (e.g. embedded
-            # in a test harness), or the platform doesn't support this
-            # signal -- best-effort only; mbregistry run's real,
-            # production invocation is always the main thread.
-            pass
 
     api.start()
     remote_api.start()
@@ -921,6 +1034,19 @@ def cmd_install_service(args: argparse.Namespace) -> int:
     sprint.md's Test Strategy ("installing it into a real systemd is out
     of scope for automated tests").
 
+    **``sys.platform == "win32"`` (sprint 005 ticket 005)**: dispatches
+    to :func:`~mbtools.registry.service_windows.cmd_install_service_windows`
+    instead -- the ``sc.exe create``/``sc.exe failure`` commands (no
+    udev/systemd at all on Windows), with ``exec_path`` explicitly
+    including ``--windows-service`` so the rendered ``binPath=`` invokes
+    exactly the SCM-aware entry point :func:`cmd_run`'s own
+    ``--windows-service`` branch provides (see that function's own
+    docstring, "A plain console app is not a real service") -- never the
+    bare ``mbregistry run`` :func:`~mbtools.registry.service_windows
+    .render_windows_service_install`'s own *default* still renders for
+    ticket 004's own (unchanged) golden-file tests. The systemd-unit/
+    udev-rule code below this branch is never reached on Windows.
+
     Both files are written unconditionally on every call, each to its own
     fixed default path (:data:`DEFAULT_UNIT_PATH`/
     :data:`DEFAULT_UDEV_RULE_PATH`, each independently overridable via
@@ -932,6 +1058,10 @@ def cmd_install_service(args: argparse.Namespace) -> int:
     ``mbregistry.service`` is currently running, and this function never
     itself starts, stops, or restarts it.
     """
+    if sys.platform == "win32":
+        exec_path = f"{sys.executable} -m mbtools.registry.cli run --windows-service"
+        return cmd_install_service_windows(exec_path)
+
     unit_path = Path(args.output) if args.output else DEFAULT_UNIT_PATH
     unit_text = render_systemd_unit()
 
@@ -1052,6 +1182,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "shared secret required of remote-api/peering connections "
             f"(default unset -- no auth, or ${_TOKEN_ENV_VAR})"
+        ),
+    )
+    run_p.add_argument(
+        "--windows-service",
+        action="store_true",
+        help=(
+            "run under the Windows Service Control Manager "
+            "(StartServiceCtrlDispatcher) -- set by the sc.exe create "
+            "binPath= mbregistry install-service renders on Windows; "
+            "not for interactive use"
         ),
     )
     run_p.add_argument(
