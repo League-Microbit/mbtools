@@ -33,6 +33,21 @@ On Windows, `mbregistry install-service` registers it with the Service
 Control Manager (`mbregistry run --windows-service` is what that service
 invokes); Windows support has not been verified on real hardware.
 
+`mbregistry run` needs no flags. It keeps its database and local API socket
+in the right place for the platform and the user running it:
+
+| | database | socket |
+|---|---|---|
+| Linux, root (the systemd service) | `/var/lib/mbregistry/` | `/run/mbregistry/` |
+| Linux, normal user | `~/.local/state/mbregistry/` (`$XDG_STATE_HOME`) | `$XDG_RUNTIME_DIR/mbregistry/`, else `~/.cache/mbregistry/` |
+| macOS, root | `/Library/Application Support/mbregistry/` | `/var/run/mbregistry/` |
+| macOS, normal user | `~/Library/Application Support/mbregistry/` | same directory |
+| Windows | `%ProgramData%\mbregistry\` | named pipe `\\.\pipe\mbregistry` |
+
+Client commands find whichever daemon is running: your own first, then the
+system one. `--db`/`--socket` and `$MBREGISTRY_DB`/`$MBREGISTRY_SOCKET` still
+override the defaults.
+
 ### The four programs
 
 Each program prints full usage with `--help`; below is each one's most
