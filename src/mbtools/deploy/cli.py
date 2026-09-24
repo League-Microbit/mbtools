@@ -120,6 +120,7 @@ from mbtools.common import (
     EXIT_NO_DAEMON,
     EXIT_OK,
     EXIT_USAGE,
+    format_locked_message,
 )
 from mbtools.deploy.flash import flash_hex
 from mbtools.deploy.release import GithubReleaseError, resolve_hex
@@ -249,31 +250,6 @@ def _wait_for_reprobe(
         time.sleep(min(poll_interval_s, remaining))
 
 
-def _format_locked(name: str, holder: dict[str, Any]) -> str:
-    """UC-006's "``<name>`` is locked for ``<kind>`` by pid ``<pid>``"
-    message -- extended (ticket 012) to name the holder's host instead of
-    a null pid when the current holder is a remote session.
-
-    A remote-origin ``HolderRef`` (ticket 006's response shape: ``{"kind":
-    ..., "pid": None, "origin": "remote", "host": ...}``) always carries
-    ``pid=None`` -- "a PID means nothing across hosts" -- so the original
-    pid-only phrasing would read as "by pid None", which is not sensible.
-    This can happen on *either* branch: a peer-owned device locked by
-    someone else's remote session, but just as easily a *local* device
-    (``host is None`` on this registry) locked by a client connecting in
-    over this same registry's own ``remote_api`` -- the lock is one
-    process-wide ``LockManager``, shared by both transports. A local
-    holder (``host`` absent) keeps the exact original phrasing byte-for-
-    byte, since an existing test (``tests/deploy/test_deploy_cli.py``'s
-    ``test_already_locked_fails_fast_naming_holder``) asserts it.
-    """
-    kind = holder.get("kind")
-    host = holder.get("host")
-    if host:
-        return f"{name} is locked for {kind} by a remote session on {host}"
-    return f"{name} is locked for {kind} by pid {holder.get('pid')}"
-
-
 def _flash(
     client: RegistryClient | RemoteRegistryClient,
     uid: str,
@@ -372,7 +348,7 @@ def _run_deploy_flow(
         client.lock(uid, _LOCK_KIND_FLASH)
     except DeviceLockedError as exc:
         holder = exc.holder or {}
-        print(f"mbdeploy: {_format_locked(name, holder)}", file=sys.stderr)
+        print(f"mbdeploy: {format_locked_message(name, holder)}", file=sys.stderr)
         return exc.exit_code
     except RegistryClientError as exc:
         print(f"mbdeploy: {exc.message}", file=sys.stderr)

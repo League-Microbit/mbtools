@@ -30,6 +30,7 @@ that module's own tests would see them.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 #: ARM DAPLink's USB VID:PID — every micro:bit's onboard debug/CDC
 #: interface enumerates as this pair, on both macOS and Linux (ported from
@@ -81,6 +82,40 @@ CODE_AMBIGUOUS_NAME = "ambiguous_name"
 #: with this code before any dispatch. Never returned by the local Unix
 #: socket, which has no auth concept (sprint 1's trust model, unchanged).
 CODE_UNAUTHORIZED = "unauthorized"
+
+
+# -- sprint 003 additions (ticket 012, shared by ticket 013) ----------------
+
+
+def format_locked_message(name: str, holder: dict[str, Any]) -> str:
+    """UC-006's "``<name>`` is locked for ``<kind>`` by pid ``<pid>``"
+    message -- extended (``deploy.cli``, ticket 012) to name the holder's
+    host instead of a null pid when the current holder is a remote
+    session, and shared here (rather than defined once per client tool)
+    so ``mbdeploy``/``mbserial`` (ticket 013) can never drift apart on
+    this one piece of wording.
+
+    A remote-origin ``HolderRef`` (ticket 006's response shape: ``{"kind":
+    ..., "pid": None, "origin": "remote", "host": ...}``) always carries
+    ``pid=None`` -- "a PID means nothing across hosts" -- so the original
+    pid-only phrasing would read as "by pid None", which is not sensible.
+    This can happen on *either* transport branch of either tool: a
+    peer-owned device locked by someone else's remote session, but just as
+    easily a *local* device contested by someone connecting to that same
+    registry's own ``remote_api`` -- the lock is one process-wide
+    ``LockManager``, shared by every listener (Unix socket or TCP)
+    regardless of transport. A local holder (``host`` absent) keeps the
+    original pid-only phrasing byte-for-byte (asserted by
+    ``tests/deploy/test_deploy_cli.py``'s
+    ``test_already_locked_fails_fast_naming_holder`` and
+    ``tests/serial/test_mbserial_cli.py``'s own
+    ``test_already_locked_fails_fast_naming_holder``, both unchanged).
+    """
+    kind = holder.get("kind")
+    host = holder.get("host")
+    if host:
+        return f"{name} is locked for {kind} by a remote session on {host}"
+    return f"{name} is locked for {kind} by pid {holder.get('pid')}"
 
 
 @dataclass(frozen=True)
