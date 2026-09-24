@@ -1,7 +1,7 @@
 ---
 id: 009
 title: README usage section
-status: in-progress
+status: done
 use-cases:
 - SUC-005
 depends-on: []
