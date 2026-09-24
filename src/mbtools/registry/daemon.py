@@ -261,14 +261,36 @@ class Daemon:
         4. For each flash-pending uid that is still absent and past its
            deadline: give up and mark it ``connected_no_firmware``.
 
-        "Attached last cycle" is read from ``store`` (any record whose
-        ``state`` isn't ``disconnected``) rather than kept as a separate
-        in-memory set — per the module's "no persistent state of its own"
-        boundary, and because it makes a daemon restart naturally
-        idempotent: the very next scan re-attaches every currently-present
-        uid against whatever the store already believes, and
-        ``store.upsert_attached``'s own "not a reattach unless previously
-        disconnected" rule (ticket 004) takes it from there.
+        "Attached last cycle" is read from ``store`` (any *locally-owned*
+        record -- ``host is None`` -- whose ``state`` isn't
+        ``disconnected``) rather than kept as a separate in-memory set —
+        per the module's "no persistent state of its own" boundary, and
+        because it makes a daemon restart naturally idempotent: the very
+        next scan re-attaches every currently-present uid against whatever
+        the store already believes, and ``store.upsert_attached``'s own
+        "not a reattach unless previously disconnected" rule (ticket 004)
+        takes it from there.
+
+        The ``host is None`` filter (sprint 005 ticket 011) matters
+        because ``store`` also holds *remote*-owned rows this host learned
+        about via ``registry.peering`` — a uid this host has never itself
+        scanned, but knows about because some peer publishes it. Without
+        the filter, a uid physically attached to this host but still
+        mirrored here under a peer's stale ownership claim (``host`` !=
+        ``None``, ``state`` not yet ``disconnected``) would already count
+        as "previously attached" and never reach ``store.upsert_attached``
+        below, so this host could never reclaim local ownership of its own
+        physically-attached board — the exact gap that let one of
+        ``torture``'s three relays stay stuck as ``host=hodr`` even after
+        this ticket's store/peering-level ownership fix landed (see the
+        ticket's Implementation Notes for the hardware trace). The same
+        filter also stops this host's own scan from ever treating a
+        uid it merely *mirrors* from a peer (never physically here) as
+        "gone missing" below — that uid is never in ``current`` (this
+        host's own USB scan) either, so an unfiltered
+        ``previously_attached`` would wrongly diff it into ``detached``
+        and fire a bogus ``EVENT_DETACH`` for a device this host never
+        owned, every single cycle.
 
         The attach/detach diff and every store/locks write it makes runs
         under :attr:`_lock` (see the module docstring's "Concurrency"
@@ -293,7 +315,7 @@ class Daemon:
             previously_attached = {
                 record.uid
                 for record in self._store.list_devices()
-                if record.state != STATE_DISCONNECTED
+                if record.host is None and record.state != STATE_DISCONNECTED
             }
 
             for uid, info in current.items():

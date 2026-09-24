@@ -23,6 +23,7 @@ from mbtools.registry.store import (
     STATE_CONNECTED_NO_FIRMWARE,
     STATE_DISCONNECTED,
     Store,
+    format_vid_pid,
 )
 from mbtools.serial.connect import BREAK_DURATION
 from mbtools.testing.fakes import FakeSerial, FakeUSBSource
@@ -431,6 +432,64 @@ def test_no_event_callback_registered_is_a_silent_no_op(store):
     daemon.run_once()  # detach -- would raise if daemon assumed a callback exists
 
     assert store.get(UID).state == STATE_DISCONNECTED
+
+
+# ---------------------------------------------------------------------------
+# `previously_attached` is scoped to locally-owned rows (sprint 005
+# ticket 011) -- a uid this store merely mirrors from a peer must not
+# block this host from claiming it when it's physically attached here,
+# and must never be spuriously "detached" by a scan that was never
+# looking at it in the first place. Found via this ticket's own hardware
+# verification on torture: a board physically attached the whole time
+# stayed stuck as host=hodr because its store row was kept alive
+# (non-disconnected) by hodr's own ongoing peering events, so it never
+# satisfied the old, host-agnostic "not in previously_attached" check.
+# ---------------------------------------------------------------------------
+
+
+def test_physically_attached_uid_reclaims_local_ownership_from_stale_remote_row(store):
+    # Simulate what registry.peering would have written: this store
+    # mirrors uid as owned by "hodr", still "connected" (not disconnected)
+    # -- exactly the torture/f92f913d shape found on hardware.
+    store.upsert_remote_attached(UID, "hodr", "/dev/ttyACM1", format_vid_pid(VID, PID_))
+    store.apply_remote_probe(UID, None)  # anything non-disconnected; state irrelevant here
+    assert store.get(UID).state != STATE_DISCONNECTED
+    assert store.get(UID).host == "hodr"
+
+    # This host's own usbwatch now (still) sees the uid physically present.
+    usbwatch = FakeUSBSource([[_port_info(port="/dev/ttyACM1")]])
+    script = _ProbeScript([ANNOUNCEMENT])
+    daemon = _make_daemon(usbwatch, store, script)
+
+    daemon.run_once()
+
+    record = store.get(UID)
+    assert record.host is None
+    assert record.port == "/dev/ttyACM1"
+
+
+def test_remote_owned_row_not_physically_present_is_never_marked_disconnected(store):
+    # A uid this store only knows about via peering (never physically
+    # attached to this host) must not be diffed into "detached" just
+    # because it's absent from this host's own usbwatch scan.
+    store.upsert_remote_attached(UID2, "hodr", "/dev/ttyACM0", format_vid_pid(VID, PID_))
+    assert store.get(UID2).state != STATE_DISCONNECTED
+
+    usbwatch = FakeUSBSource([[]])  # nothing physically attached here
+    script = _ProbeScript([])
+    events: list[tuple[str, str]] = []
+    daemon = _make_daemon(
+        usbwatch, store, script, event_callback=lambda t, r: events.append((t, r.uid))
+    )
+
+    daemon.run_once()
+
+    # Neither marked disconnected locally nor announced as detached --
+    # this host never owned it and never touched it.
+    record = store.get(UID2)
+    assert record.host == "hodr"
+    assert record.state != STATE_DISCONNECTED
+    assert events == []
 
 
 # ---------------------------------------------------------------------------
