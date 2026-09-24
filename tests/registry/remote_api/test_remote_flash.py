@@ -293,12 +293,19 @@ def test_flash_rejects_a_hex_path_not_staged_by_this_connection(remote_server):
     assert result["ok"] is False
     assert result["code"] == CODE_INVALID_REQUEST
     assert result["type"] == "result"
-    stager.close()
-    flasher.close()
     # The staged file is still owned by `stager`'s connection -- untouched
-    # by the refused attempt on `flasher`'s connection.
+    # by the refused attempt on `flasher`'s connection. Checked *before*
+    # closing either connection: closing `stager` triggers its own
+    # staged-but-unflashed cleanup (see
+    # test_connection_close_cleans_up_an_unflashed_staged_hex_file below),
+    # which runs on the server's connection-handler thread asynchronously
+    # to this client-side close() call. Asserting after both closes raced
+    # that cleanup thread -- an intermittent failure this reordering
+    # fixes (the file's existence is deterministic before either
+    # connection closes; it is not deterministic after).
     assert os.path.exists(other_hex_path)
-    os.unlink(other_hex_path)
+    flasher.close()
+    stager.close()  # cleans up other_hex_path itself; nothing left to unlink
 
 
 # ---------------------------------------------------------------------------
