@@ -28,10 +28,19 @@ dedicated to mbtools testing; you may flash them freely.
 | `hodr` | Debian 13, aarch64 (Pi), Python 3.13 | `/dev/ttyACM0` | Nolanet node |
 | `magni` | Debian 13, aarch64 (Pi), Python 3.13 | `/dev/ttyACM0` | Nolanet node |
 | `braeburn` | macOS 15, x86_64, `uv` installed | `/dev/cu.usbmodem*` | The macOS test target |
+| `torture` | Ubuntu 24.04, x86_64, Python 3.12 | `/dev/ttyACM0`-`/dev/ttyACM3` (four RADIOBRIDGE relays) | Former production relay host (stakeholder decision, 2026-09-24 -- see sprint 005 ticket 007's Implementation Notes); the legacy `mbrelay.service` (`/usr/local/bin/mbrelay`, ports 8760/8761) is stopped and disabled here (unit file and binary left in place for rollback) -- `mbregistry.service` now owns the relays instead |
 
 Hostnames resolve on the garage LAN; don't hard-code IP addresses in this repo
 (it is public). Per-host details live on the Robot Garage wiki
 (<http://robot-garage.home/doku.php?id=mbdeploy>).
+
+`torture` is reached the same way as the other five hosts (`ssh torture`, user
+`eric`, passwordless sudo) but is **not** interchangeable with them for
+ordinary test runs: it is the fleet's real (former) relay host, not a
+dedicated per-developer test board, and its four relays are shared, scarce
+hardware -- don't reflash them with other firmware unless a test really needs
+it (project CLAUDE.md's standing hardware-testing rule), and prefer the other
+five hosts for routine `mbtools` development/testing.
 
 The **old** `mbdeploy serve` (`mbdeploy.service`, user `jtl`,
 `/home/jtl/mbdeploy`) was retired on all four Nolanet nodes during sprint
@@ -126,6 +135,33 @@ doesn't show an active lock because ``STATE_DISCONNECTED`` renders as
 cross-checking `dmesg` and/or `mbregistry list --json`'s `lock_kind`/
 `remote_lock_kind` fields, which aren't subject to the table's same
 "gone wins" precedence.
+
+**Known real bug, found during sprint 005 ticket 007's torture hardware
+pass, not fixed by that ticket (out of its scope — `registry.store`/
+`registry.peering`, not deployment tooling):** when a physical board's
+uid was previously known to *another* peer host (e.g. it was tested there
+in an earlier sprint, then physically moved), that peer keeps
+re-broadcasting its own stale `disconnected`, `host=<peer>` row for the
+uid, and `Store._upsert_device`'s remote path (`upsert_remote_attached`,
+called from `registry.peering`'s `_apply_snapshot_device`/`_apply_event`)
+unconditionally overwrites `host`/`state` on every incoming sync — even
+when *this* host's own daemon has that same uid physically attached and
+has just written a local (`host IS NULL`) row for it. The result: the
+uid flaps between a local, properly-probed row and the peer's stale
+remote one, and anything reading only `store.snapshot_local_devices()`
+(`WHERE host IS NULL`) — including `console_compat.relay_pool`, per its
+own module docstring — can see it as permanently peer-owned and never
+locally available, even though `mbregistry list`'s merged view and the
+board itself are both fine. Confirmed on `torture`: three of its four
+physical relays (uids `4f02a351`/`52f41cc6`/`f92f913d`) were previously
+tested on `hodr` in an earlier sprint; `hodr`'s own stale rows for them
+keep winning the race, and `torture`'s relay-pool port (7444) reports
+"0 devices" despite the boards being attached and reachable. No existing
+ticket owns this — the protocol has no "a peer's remote upsert must not
+clobber a uid this host has just scanned as physically local" rule at
+all. Needs its own issue/ticket (a `registry.store`/`registry.peering`
+fix, e.g. local-wins arbitration or a freshness/precedence rule) before
+`torture`'s relay pool can be trusted to reflect its own hardware.
 
 ## Firmware for tests (GitHub release assets — use `MICROBIT.hex`)
 
