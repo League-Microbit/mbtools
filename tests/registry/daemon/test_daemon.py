@@ -24,12 +24,14 @@ from mbtools.registry.store import (
     STATE_DISCONNECTED,
     Store,
 )
+from mbtools.serial.connect import BREAK_DURATION
 from mbtools.testing.fakes import FakeSerial, FakeUSBSource
 
 VID, PID_ = DAPLINK_VID_PID
 UID = "9900" + "0000" + "11112222" + "3333444455556666" + "77778888" + "6e052820"
 UID2 = "9900" + "0000" + "11112222" + "aaaabbbbccccdddd" + "77778888" + "6e052820"
 ANNOUNCEMENT = "device NEZHA2 robot vevov 1198504156"
+RELAY_ANNOUNCEMENT = "DEVICE:RADIOBRIDGE:relay:getez:1779042496"
 
 
 def _port_info(uid: str = UID, port: str = "/dev/ttyACM0") -> PortInfo:
@@ -70,16 +72,22 @@ class _ProbeScript:
     """A serial_factory that hands out a fresh FakeSerial per probe() call,
     scripted with the next queued announcement (or silence once the queue
     is empty) -- and counts how many times a port was actually opened, so
-    tests can assert "probed exactly N times" directly."""
+    tests can assert "probed exactly N times" directly. Every FakeSerial
+    handed out is also kept in :attr:`fakes` (ticket 001, sprint 005), so
+    a test can inspect e.g. ``fakes[1].break_calls`` to check whether a
+    particular probe call asserted BREAK."""
 
     def __init__(self, announcements: list[str | None] = ()) -> None:
         self._queue: deque[str | None] = deque(announcements)
         self.calls = 0
+        self.fakes: list[FakeSerial] = []
 
     def __call__(self, **kwargs: object) -> FakeSerial:
         self.calls += 1
         announcement = self._queue.popleft() if self._queue else None
-        return FakeSerial(announcement=announcement, **kwargs)
+        ser = FakeSerial(announcement=announcement, **kwargs)
+        self.fakes.append(ser)
+        return ser
 
 
 @pytest.fixture
@@ -423,3 +431,95 @@ def test_no_event_callback_registered_is_a_silent_no_op(store):
     daemon.run_once()  # detach -- would raise if daemon assumed a callback exists
 
     assert store.get(UID).state == STATE_DISCONNECTED
+
+
+# ---------------------------------------------------------------------------
+# reset_first: BREAK before HELLO on a relay's re-probe (ticket 001,
+# sprint 005) -- the daemon.py half of the fix for a relay left in the
+# data plane being misidentified by a re-probe
+# (docs/acceptance/004-hardware.md, ticket 011's togov/gitev finding).
+# ---------------------------------------------------------------------------
+
+
+def test_relay_reattach_reprobe_sends_break_before_hello(store):
+    """A uid whose *pre-probe stored role* is a relay gets reset_first=True
+    on its reattach-triggered re-probe -- the ordinary "device dropped
+    off and came back" path, as opposed to the flash-pending path covered
+    separately below."""
+    usbwatch = FakeUSBSource([[_port_info()], [], [_port_info()]])
+    script = _ProbeScript([RELAY_ANNOUNCEMENT, RELAY_ANNOUNCEMENT])
+    daemon = _make_daemon(usbwatch, store, script)
+
+    daemon.run_once()  # attach + probe #1 -- first-ever probe, no stored
+    # role yet, so no BREAK on this one.
+    assert script.fakes[0].break_calls == []
+    assert store.get(UID).role == "RADIOBRIDGE"
+
+    daemon.run_once()  # detach
+    daemon.run_once()  # reattach -> probe #2; pre-probe stored role is
+    # now RADIOBRIDGE, from probe #1.
+
+    assert script.calls == 2
+    assert script.fakes[1].break_calls == [BREAK_DURATION]
+
+
+def test_relay_flash_pending_reprobe_sends_break_before_hello(store):
+    """The flash-triggered re-probe path (device never left the bus, so
+    there's no detach/reattach for needs_probe() to key off) must pass
+    reset_first the same way as an ordinary reattach: from the uid's
+    pre-probe stored role."""
+    usbwatch = FakeUSBSource([[_port_info()]])  # uid never leaves the scan
+    script = _ProbeScript([RELAY_ANNOUNCEMENT, RELAY_ANNOUNCEMENT])
+    daemon = _make_daemon(usbwatch, store, script)
+
+    daemon.run_once()  # attach + probe #1 -- first-ever probe, no BREAK
+    assert script.fakes[0].break_calls == []
+    assert store.get(UID).role == "RADIOBRIDGE"
+    assert store.needs_probe(UID) is False
+
+    daemon.locks.acquire(UID, KIND_FLASH, _local_holder(777))
+    daemon.locks.release(UID, _local_holder(777))  # flash_pending[UID] set
+
+    daemon.run_once()  # still attached -> flash-pending re-probe #2
+
+    assert script.calls == 2
+    assert script.fakes[1].break_calls == [BREAK_DURATION]
+
+
+def test_non_relay_reattach_reprobe_never_sends_break(store):
+    """An ordinary (non-relay) device's reprobe is unaffected: no BREAK
+    sent when the stored role does not contain RELAY/BRIDGE -- covers
+    both the very first probe (no prior stored role at all) and a later
+    reattach-triggered re-probe (stored role is NEZHA2, not a relay)."""
+    usbwatch = FakeUSBSource([[_port_info()], [], [_port_info()]])
+    script = _ProbeScript([ANNOUNCEMENT, ANNOUNCEMENT])
+    daemon = _make_daemon(usbwatch, store, script)
+
+    daemon.run_once()  # attach + probe #1 -- no prior stored role at all
+    assert script.fakes[0].break_calls == []
+    assert store.get(UID).role == "NEZHA2"
+
+    daemon.run_once()  # detach
+    daemon.run_once()  # reattach -> probe #2; stored role is NEZHA2
+
+    assert script.calls == 2
+    assert script.fakes[1].break_calls == []
+
+
+def test_non_relay_flash_pending_reprobe_never_sends_break(store):
+    """Same non-relay "never sends BREAK" guarantee, on the flash-pending
+    re-probe path rather than the reattach path."""
+    usbwatch = FakeUSBSource([[_port_info()]])
+    script = _ProbeScript([ANNOUNCEMENT, ANNOUNCEMENT])
+    daemon = _make_daemon(usbwatch, store, script)
+
+    daemon.run_once()  # attach + probe #1
+    assert script.fakes[0].break_calls == []
+
+    daemon.locks.acquire(UID, KIND_FLASH, _local_holder(777))
+    daemon.locks.release(UID, _local_holder(777))
+
+    daemon.run_once()  # flash-pending re-probe #2
+
+    assert script.calls == 2
+    assert script.fakes[1].break_calls == []

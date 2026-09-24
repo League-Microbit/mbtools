@@ -26,6 +26,25 @@ def _factory(**fake_kwargs):
     return factory
 
 
+class _OrderedFakeSerial(FakeSerial):
+    """A ``FakeSerial`` that appends every ``send_break``/``write`` call,
+    in call order, to a shared ``call_log`` -- lets a test prove BREAK was
+    actually sent *before* the first ``HELLO`` write (ticket 001, sprint
+    005), not just that both happened somewhere during the probe."""
+
+    def __init__(self, call_log: list[tuple[str, object]], **kwargs: object) -> None:
+        super().__init__(**kwargs)
+        self._call_log = call_log
+
+    def send_break(self, duration: float = 0.25) -> None:
+        self._call_log.append(("break", duration))
+        super().send_break(duration)
+
+    def write(self, data: bytes) -> int:
+        self._call_log.append(("write", data))
+        return super().write(data)
+
+
 # ---------------------------------------------------------------------------
 # probe() — both dialects
 # ---------------------------------------------------------------------------
@@ -102,6 +121,109 @@ def test_probe_sends_hello_and_holds_dtr_rts_low():
     assert ser.written == [b"HELLO\n"]
     assert ser.reset_input_buffer_calls == 1
     assert ser.close_calls == 1
+
+
+# ---------------------------------------------------------------------------
+# probe() — reset_first (ticket 001, sprint 005): BREAK before HELLO
+# ---------------------------------------------------------------------------
+
+
+def test_probe_reset_first_sends_break_before_hello():
+    """reset_first=True asserts a BREAK before HELLO is ever written --
+    proven against an ordered call log (BREAK strictly before the first
+    write), not just that ``break_calls`` ends up non-empty, per the
+    ticket's own acceptance criterion."""
+    from mbtools.serial.connect import BREAK_DURATION
+
+    call_log: list[tuple[str, object]] = []
+    fakes: list[FakeSerial] = []
+
+    def capturing_factory(**kwargs):
+        ser = _OrderedFakeSerial(
+            call_log, announcement="device NEZHA2 robot vevov 1198504156", **kwargs
+        )
+        fakes.append(ser)
+        assert ser.break_calls == []  # nothing sent at construction
+        return ser
+
+    result = identity.probe(
+        "/dev/ttyACM0",
+        timeout_s=0.05,
+        serial_factory=capturing_factory,
+        settle_s=0,
+        reset_first=True,
+    )
+    ser = fakes[0]
+    assert ser.break_calls == [BREAK_DURATION]
+    assert ser.written == [b"HELLO\n"]
+    assert call_log[0] == ("break", BREAK_DURATION)
+    assert call_log[1] == ("write", b"HELLO\n")
+    assert result is not None
+    assert result.role == "NEZHA2"
+
+
+def test_probe_reset_first_false_default_never_sends_break():
+    """reset_first defaults to False -- every existing call site/test is
+    unaffected: no send_break call, same read-window/retry logic."""
+    fakes: list[FakeSerial] = []
+
+    def capturing_factory(**kwargs):
+        ser = FakeSerial(announcement="device NEZHA2 robot vevov 1198504156", **kwargs)
+        fakes.append(ser)
+        return ser
+
+    result = identity.probe(
+        "/dev/ttyACM0",
+        timeout_s=0.05,
+        serial_factory=capturing_factory,
+        settle_s=0,
+    )
+    assert fakes[0].break_calls == []
+    assert result is not None
+    assert result.role == "NEZHA2"
+
+
+def test_probe_reset_first_forwarded_announcement_case():
+    """Regression test for the bug this ticket fixes: a relay parked in
+    the data plane can have radio-forwarded traffic already flowing, so a
+    plain HELLO-based probe might read a fragment of another device's
+    announcement before ever writing anything. reset_first=True must
+    assert BREAK before the very first write -- proven here by scripting
+    a FakeSerial whose readline() would return a (misleading) robot-
+    dialect announcement even before any HELLO write (announcement_after
+    _writes defaults to 0), and asserting the BREAK happened first."""
+    from mbtools.serial.connect import BREAK_DURATION
+
+    call_log: list[tuple[str, object]] = []
+    fakes: list[FakeSerial] = []
+
+    def capturing_factory(**kwargs):
+        # Radio-forwarded traffic already flowing: readline() would
+        # return an announcement-shaped line with zero writes required.
+        ser = _OrderedFakeSerial(
+            call_log, announcement="device NEZHA2 robot vevov 1198504156", **kwargs
+        )
+        fakes.append(ser)
+        return ser
+
+    identity.probe(
+        "/dev/ttyACM0",
+        timeout_s=0.05,
+        serial_factory=capturing_factory,
+        settle_s=0,
+        reset_first=True,
+    )
+    ser = fakes[0]
+    # The BREAK was asserted before the first write -- proving the fix
+    # intercepts the ambiguous read path before HELLO (and before the
+    # reset_input_buffer() that would otherwise just discard, not
+    # prevent, the forwarded line).
+    assert ser.break_calls == [BREAK_DURATION]
+    assert call_log[0] == ("break", BREAK_DURATION)
+    assert ("write", b"HELLO\n") in call_log
+    assert call_log.index(("break", BREAK_DURATION)) < call_log.index(
+        ("write", b"HELLO\n")
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -1,7 +1,7 @@
 ---
 id: '005'
 title: mbregistry Windows platform support and fleet migration
-status: ticketing
+status: executing
 branch: sprint/005-mbregistry-windows-platform-support-and-fleet-migration
 use-cases:
 - SUC-001

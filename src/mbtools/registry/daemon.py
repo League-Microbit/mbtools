@@ -354,17 +354,36 @@ class Daemon:
         docstring's "Event hook" note) fires with the post-probe record
         after this second ``with self._lock`` block releases it, for the
         same "no network I/O under the shared lock" reason.
+
+        ``identity.probe`` is called with ``reset_first=identity
+        .is_relay(<uid's pre-probe stored role>)`` — the role the uid's
+        record held *before* this probe, read from the store inside the
+        same locked eligibility check above, never after the probe
+        completes (the post-probe role is exactly what a misidentified
+        re-probe would get wrong — see sprint.md's Architecture and this
+        ticket). This runs identically whether ``eligible`` came from
+        ``needs_probe`` (an ordinary reattach) or from
+        ``uid in self._flash_pending`` (a flash-triggered re-probe): a
+        relay's stored role forces a BREAK before ``HELLO`` either way,
+        and a non-relay uid (or one with no prior record at all) never
+        sees one — unaffected, byte for byte, by this change.
         """
         with self._lock:
             eligible = self._store.needs_probe(uid) or uid in self._flash_pending
             if not eligible or self.locks.status(uid) is not None:
                 return
+            pre_probe_record = self._store.get(uid)
+
+        reset_first = identity.is_relay(
+            pre_probe_record.role if pre_probe_record is not None else None
+        )
 
         result = identity.probe(
             info.port,
             self._probe_timeout_s,
             serial_factory=self._serial_factory,
             settle_s=self._settle_s,
+            reset_first=reset_first,
         )
 
         with self._lock:
