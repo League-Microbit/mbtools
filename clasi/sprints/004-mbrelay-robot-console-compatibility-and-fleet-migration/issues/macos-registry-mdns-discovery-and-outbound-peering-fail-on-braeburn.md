@@ -1,6 +1,9 @@
 ---
-status: pending
+status: in-progress
 sprint: '004'
+tickets:
+- 004-010
+- 004-011
 ---
 
 # macOS registry (braeburn): not discoverable by mDNS, and cannot reach peers

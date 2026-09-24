@@ -1,7 +1,7 @@
 ---
 status: pending
 split_from: mbregistry-device-registry-daemon.md
-sprint: '004'
+sprint: '005'
 ---
 
 # mbregistry: Windows platform support (USB event watch + service install)

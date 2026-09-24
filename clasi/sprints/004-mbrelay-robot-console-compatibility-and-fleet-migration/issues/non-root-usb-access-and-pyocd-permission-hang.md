@@ -1,6 +1,10 @@
 ---
-status: pending
+status: in-progress
 sprint: '004'
+tickets:
+- 004-008
+- 004-009
+- 004-011
 ---
 
 # Non-root USB access on Linux nodes, and a fail-fast for pyOCD permission hangs

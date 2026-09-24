@@ -1,6 +1,15 @@
 ---
-status: pending
+status: in-progress
 sprint: '004'
+tickets:
+- 004-001
+- 004-002
+- 004-003
+- 004-004
+- 004-005
+- 004-006
+- 004-007
+- 004-011
 ---
 
 # mbrelay: connect to a radio relay and send/receive, on top of mbregistry
