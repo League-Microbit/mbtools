@@ -20,18 +20,28 @@ fleet migration runbook that retires them.
 
 ## Usage
 
-Install with [`uv`](https://docs.astral.sh/uv/) (`uv sync`, see
-[Development](#development) below) or `pip install .` from a checkout.
+**Installing and running the daemon as a service** (install methods,
+default paths, ports, systemd/udev, macOS launchd plists, Windows SCM,
+peering, firewall, upgrades, logs, troubleshooting) is documented in
+[docs/service.md](docs/service.md). The same material, split into pages, is
+on the [project wiki](https://github.com/League-Microbit/mbtools/wiki).
+
+Install from GitHub: `pip install "git+https://github.com/League-Microbit/mbtools.git"`
+(the `mbtools` package on PyPI is an unrelated project), or with
+[`uv`](https://docs.astral.sh/uv/) (`uv sync` in a checkout, see
+[Development](#development) below).
 
 On Linux, run `mbregistry install-service` once, as root, before running
 `mbregistry` as a real daemon — it writes the systemd unit and a udev rule
 (so a non-root user in the `plugdev` group can access the boards) and
 prints the `systemctl`/`udevadm`/`usermod` follow-up commands; see
-`mbregistry install-service --help`. On macOS, `mbregistry run` is only
-ever run in the foreground — there is no `install-service` support there.
-On Windows, `mbregistry install-service` registers it with the Service
-Control Manager (`mbregistry run --windows-service` is what that service
-invokes); Windows support has not been verified on real hardware.
+`mbregistry install-service --help`. On macOS, `install-service` is not
+supported; run it under launchd with the plists in
+[docs/service.md](docs/service.md#7-macos-launchd), or in the foreground.
+On Windows, `mbregistry install-service` prints the `sc.exe` commands that
+register it with the Service Control Manager (`mbregistry run
+--windows-service` is what that service invokes); Windows support has not
+been verified on real hardware.
 
 `mbregistry run` needs no flags. It keeps its database and local API socket
 in the right place for the platform and the user running it:
@@ -107,6 +117,4 @@ uv run pytest  # run the test suite
 
 `mbregistry`, `mbdeploy`, `mbserial`, and `mbrelay` are console scripts
 registered in `pyproject.toml` and resolve via `uv run <name>` (or directly,
-once `uv sync` has put `.venv/bin` on `PATH`). Only `mbregistry` is under
-active development this sprint — the other three currently print a
-"not yet implemented" message and exit non-zero.
+once `uv sync` has put `.venv/bin` on `PATH`).
