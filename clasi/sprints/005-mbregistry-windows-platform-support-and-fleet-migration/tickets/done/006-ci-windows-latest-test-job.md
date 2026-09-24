@@ -1,7 +1,7 @@
 ---
 id: '006'
 title: 'CI: windows-latest test job'
-status: in-progress
+status: done
 use-cases:
 - SUC-002
 depends-on:
