@@ -377,28 +377,23 @@ class Daemon:
         after this second ``with self._lock`` block releases it, for the
         same "no network I/O under the shared lock" reason.
 
-        ``identity.probe`` is called with ``reset_first=identity
-        .is_relay(<uid's pre-probe stored role>)`` — the role the uid's
-        record held *before* this probe, read from the store inside the
-        same locked eligibility check above, never after the probe
-        completes (the post-probe role is exactly what a misidentified
-        re-probe would get wrong — see sprint.md's Architecture and this
-        ticket). This runs identically whether ``eligible`` came from
-        ``needs_probe`` (an ordinary reattach) or from
-        ``uid in self._flash_pending`` (a flash-triggered re-probe): a
-        relay's stored role forces a BREAK before ``HELLO`` either way,
-        and a non-relay uid (or one with no prior record at all) never
-        sees one — unaffected, byte for byte, by this change.
+        ``identity.probe`` is always called with ``reset_first=True``: the
+        board is reset (serial BREAK) before ``HELLO``, so whatever answers
+        is the board itself, freshly booted. Without it, a RADIOBRIDGE
+        relay left in its data plane forwards ``HELLO`` over radio and a
+        robot's reply comes back through it, so the relay gets recorded
+        under the robot's name (seen on hardware: a relay on one host
+        recorded as the robot on another after its registry was reset).
+        Keying the reset on the stored role is not enough, because a new
+        or wiped registry has no stored role. Probes only run on attach,
+        reattach and after a flash, when resetting the board is expected.
         """
         with self._lock:
             eligible = self._store.needs_probe(uid) or uid in self._flash_pending
             if not eligible or self.locks.status(uid) is not None:
                 return
-            pre_probe_record = self._store.get(uid)
 
-        reset_first = identity.is_relay(
-            pre_probe_record.role if pre_probe_record is not None else None
-        )
+        reset_first = True
 
         result = identity.probe(
             info.port,
