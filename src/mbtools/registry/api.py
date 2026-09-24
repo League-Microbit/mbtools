@@ -112,6 +112,7 @@ from mbtools.common import CODE_INVALID_REQUEST, CODE_NOT_FOUND, CODE_NOT_LOCKED
 from mbtools.registry._api_base import BaseAPIServer, _error
 from mbtools.registry.flash import FlashOp, HexValidationError
 from mbtools.registry.locks import KIND_FLASH, HolderRef, LockManager
+from mbtools.registry.paths import default_socket_path
 from mbtools.registry.store import Entry, Store
 
 __all__ = [
@@ -124,10 +125,14 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-#: Production default socket path, under ``/run/mbregistry/`` per
-#: sprint.md's Design Rationale "file layout (ASSUMPTION)" -- purely-live
-#: state, cleared at boot. Every test overrides this to a ``tmp_path``.
-DEFAULT_SOCKET_PATH = Path("/run/mbregistry/api.sock")
+#: Production default socket path, under ``/run/mbregistry/`` on
+#: Linux/macOS per sprint.md's Design Rationale "file layout (ASSUMPTION)"
+#: -- purely-live state, cleared at boot. Every test overrides this to a
+#: ``tmp_path``. Not meaningful on Windows (no Unix socket namespace) --
+#: see ``registry.paths.default_socket_path``'s docstring; importing this
+#: module on Windows will raise until a later ticket resolves how the
+#: Windows platform branch avoids evaluating this constant.
+DEFAULT_SOCKET_PATH = default_socket_path()
 
 #: How often the background liveness sweep runs. Generous relative to a
 #: human noticing a stuck lock, cheap enough to not matter at this

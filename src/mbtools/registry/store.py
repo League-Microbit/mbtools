@@ -62,6 +62,7 @@ from pathlib import Path
 from typing import Callable
 
 from mbtools.registry.identity import ProbeResult, short_uid
+from mbtools.registry.paths import default_db_path
 from mbtools.relay import naming
 
 __all__ = [
@@ -81,11 +82,13 @@ __all__ = [
 ]
 
 #: Production default for the SQLite file — under ``/var/lib/mbregistry/``
-#: per sprint.md's Design Rationale "file layout (ASSUMPTION)": identity
-#: worth keeping across reboots. Every test overrides this to a ``tmp_path``
-#: (see sprint.md's Test Strategy: "store CRUD runs against a real SQLite
-#: file in ``tmp_path``").
-DEFAULT_DB_PATH = Path("/var/lib/mbregistry/devices.db")
+#: on Linux/macOS, under ``%ProgramData%\mbregistry\`` on Windows (an
+#: ASSUMPTION, not a ratified decision — see ``registry.paths``'s module
+#: docstring) per sprint.md's Design Rationale "file layout (ASSUMPTION)":
+#: identity worth keeping across reboots. Every test overrides this to a
+#: ``tmp_path`` (see sprint.md's Test Strategy: "store CRUD runs against a
+#: real SQLite file in ``tmp_path``").
+DEFAULT_DB_PATH = default_db_path()
 
 # Device lifecycle states, per sprint.md's ERD §4.
 STATE_ATTACHED_UNPROBED = "attached_unprobed"
