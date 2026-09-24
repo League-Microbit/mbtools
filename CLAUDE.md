@@ -85,22 +85,33 @@ recur, but if a `mbregistry list` on a host ever shows its *own* board
 tagged with its *own* hostname instead of `local`, this is the first
 thing to suspect.
 
-**Known real-hardware quirk, not root-caused (ticket 014):** `braeburn`'s
-mDNS advertisement was not seen by any Linux host's `mbregistry` this
-session (confirmed at the raw-multicast level: `avahi-browse -r
-_mbregistry._tcp -t` on a Nolanet node never lists `braeburn`, though Apple's
-own `dns-sd -B` sees it fine Mac-to-Mac), and separately `braeburn`'s own
-daemon could not complete an outbound snapshot request to *any* peer
-(mDNS-discovered or explicit `--peer`, by hostname or by raw IP) even though
-a bare script on the same machine, same venv, doing the identical connect
-succeeds in well under 100ms every time, and other hosts' `--peer
-braeburn:7440` reliably reaches *it*. Three hypotheses were tried and
-refuted (see `docs/acceptance/003-hardware.md`'s own writeup); not
-root-caused this session. **Workaround**: `--peer braeburn:7440` (or the raw
-IP) from a Linux node's `mbregistry run` reliably brings `braeburn`'s device
-into that node's view; not applied as a permanent config change, so check
-`docs/acceptance/003-hardware.md` before assuming any host currently has it
-set.
+**Known real-hardware quirk, not root-caused (tickets 014, 010):**
+`braeburn`'s mDNS advertisement is not always seen by Linux hosts'
+`mbregistry` (`avahi-browse -r _mbregistry._tcp -t` on a Nolanet node
+sometimes never lists `braeburn`, though Apple's own `dns-sd -B` sees it
+fine Mac-to-Mac). Ticket 010 (sprint 004) narrowed this considerably: it
+is **not** a fixed/static misconfiguration -- macOS Application Firewall,
+Local Network permissions, and interface selection were all directly
+ruled out with hardware evidence -- it is `braeburn`'s `mbregistry`
+process's own mDNS responsiveness **degrading after several hours of
+uptime** (confirmed: a freshly-restarted process is discovered
+immediately; the same process, ~3.5 hours later, answered zero
+`_mbregistry` queries at all while every other function -- TCP
+control-plane, PUB, REP ports -- kept working fine). Root cause of the
+degradation itself is still open; see `docs/acceptance/004-hardware.md`
+for the full investigation and `docs/acceptance/003-hardware.md` for the
+original finding. Ticket 010 also fixed a real, independent bug found
+along the way (`registry.peering`'s `connect_peer` used to block
+`python-zeroconf`'s own callback thread for up to 5s per peer discovery)
+and added a self-check diagnostic that logs a `WARNING` the next time any
+host's mDNS responder goes silent like this, so a recurrence is a log
+line instead of a fresh hardware investigation. **Workaround**: `--peer
+braeburn:7440` (or the raw IP) from a Linux node's `mbregistry run`
+reliably brings `braeburn`'s device into that node's view regardless of
+mDNS state (inbound connections *to* `braeburn` are unaffected by any of
+this); not applied as a permanent config change, so check
+`docs/acceptance/004-hardware.md` before assuming any host currently has
+it set.
 
 **Known real-hardware quirk, not a code bug:** the Nolanet nodes' Pi USB
 host controller (`dwc_otg`) logs intermittent `Timed out waiting for FSM

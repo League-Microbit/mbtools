@@ -773,6 +773,126 @@ def test_connect_peer_without_remote_port_reproduces_ticket_005_behavior(store, 
 
 
 # ---------------------------------------------------------------------------
+# ticket 010: connect_peer/_PeerLink.start() never block their caller
+# (Decision 10's candidate 3 -- found while investigating braeburn's
+# mDNS/peering asymmetry, docs/acceptance/004-hardware.md). connect_peer
+# is, for the real mDNS path, invoked synchronously from python-zeroconf's
+# own ServiceBrowser callback-dispatch thread -- it must never stall that
+# thread for the snapshot REQ/REP round trip's full timeout.
+# ---------------------------------------------------------------------------
+
+
+def test_connect_peer_returns_immediately_against_unreachable_peer(store, tmp_path):
+    """The regression this fix targets: before ticket 010, connect_peer()
+    called _PeerLink.start() inline, which did the (blocking) snapshot
+    REQ/REP round trip before returning -- up to the full
+    ``_DEFAULT_SNAPSHOT_TIMEOUT_MS`` (5s) for a peer with nothing
+    listening on its snapshot port, exactly this test's setup. connect_peer
+    must now return in well under that -- the snapshot fetch and its
+    eventual timeout happen on _PeerLink's own thread instead.
+    """
+    peering_b = _make_peering(store, host="beta", pub_port=17652, snapshot_port=17653)
+
+    try:
+        peering_b.start()
+
+        started = time.monotonic()
+        # 17654/17655: real, bound-but-unused loopback ports -- nothing
+        # answers the SUB connect or the snapshot REQ, so the snapshot
+        # fetch this triggers is guaranteed to run the full
+        # snapshot_timeout_ms before giving up.
+        peering_b.connect_peer("ghost", "127.0.0.1", 17654, 17655)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 1.0, (
+            f"connect_peer() blocked its caller for {elapsed:.2f}s -- "
+            "the snapshot fetch must run on its own thread, not inline"
+        )
+    finally:
+        peering_b.stop()
+        store.close()
+
+
+def test_peer_link_stop_joins_in_flight_snapshot_thread(store, tmp_path):
+    """PeerDiscovery.stop() (via each _PeerLink.stop()) must still wait
+    for an in-flight snapshot fetch's own thread before returning --
+    ticket 010's async dispatch must not turn into "fire and forget":
+    every thread this module starts is still stoppable and joined, same
+    as every other background thread here.
+    """
+    peering_b = _make_peering(store, host="beta", pub_port=17662, snapshot_port=17663)
+
+    try:
+        peering_b.start()
+        peering_b.connect_peer("ghost", "127.0.0.1", 17664, 17665)
+
+        with peering_b._peer_links_lock:
+            link = peering_b._peer_links["ghost"]
+        assert link._snapshot_thread is not None
+
+        peering_b.stop()
+
+        assert link._snapshot_thread is None
+        # stop() joined it rather than abandoning it mid-fetch.
+        assert not (link._recv_thread and link._recv_thread.is_alive())
+    finally:
+        store.close()
+
+
+def test_snapshot_success_after_link_dropped_does_not_resurrect_reachable(store, tmp_path):
+    """The actual race ticket 010's async-dispatch fix (above) opened, and
+    the fix for it: moving the snapshot fetch off the caller's thread
+    means it and the SUB socket's own disconnect detection are now two
+    independent signals about the same link, with no ordering guarantee
+    between them. Found empirically (not guessed) while investigating
+    braeburn: a real timing-based repro of the original bug showed a
+    peer that dropped its link within the snapshot fetch's own window
+    ended up permanently stuck ``reachable=True`` even though
+    ``EVENT_DISCONNECTED`` had already fired correctly -- a late,
+    genuinely-successful snapshot reply overwrote it back. Reproduced
+    here deterministically (``_link_dropped`` set by hand, not by racing
+    real threads) rather than depending on that timing to land in CI.
+    """
+    peering_a = _make_peering(store, host="alpha", pub_port=17672, snapshot_port=17673)
+    store_b = Store(tmp_path / "beta.db")
+
+    peering_b = _make_peering(store_b, host="beta", pub_port=17682, snapshot_port=17683)
+    reachable_calls: list[str] = []
+
+    try:
+        peering_a.start()
+        peering_b.start()
+        store_b.record_peer_seen("alpha", "127.0.0.1:18672")
+
+        link = peering_mod._PeerLink(
+            host="alpha",
+            store=store_b,
+            zmq_module=peering_mod._real_zmq,
+            context=peering_b._zmq_ctx,
+            pub_address="tcp://127.0.0.1:17672",
+            snapshot_address="tcp://127.0.0.1:17673",
+            on_unreachable=None,
+            on_reachable=lambda host: reachable_calls.append(host),
+        )
+        # This is the race's own ordering, forced rather than awaited:
+        # the link is declared dropped *before* its (still in-flight, in
+        # the real race) snapshot fetch resolves -- alpha is genuinely up
+        # here, so _fetch_snapshot() below succeeds on the wire exactly
+        # like the late-arriving reply in the real race did.
+        link._link_dropped.set()
+        link._fetch_snapshot()
+
+        assert reachable_calls == [], (
+            "on_reachable fired for a link already observed dropped -- "
+            "the exact resurrection bug this guard exists to prevent"
+        )
+    finally:
+        peering_a.stop()
+        peering_b.stop()
+        store_b.close()
+
+
+# ---------------------------------------------------------------------------
 # ticket 009: peering handshake auth (sprint.md Decision 6)
 # ---------------------------------------------------------------------------
 

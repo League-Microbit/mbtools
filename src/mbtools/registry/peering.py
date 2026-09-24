@@ -36,6 +36,45 @@ is queued by the SUB socket's own buffer rather than lost, instead of
 being silently missed by connecting SUB only after the snapshot already
 arrived.
 
+**``connect_peer`` never blocks its caller (ticket 010)**: the SUB
+connect+subscribe above happens synchronously in :meth:`_PeerLink.start`,
+but the snapshot REQ/REP round trip that follows it (blocking, up to
+``snapshot_timeout_ms``) runs on its own thread
+(:meth:`_PeerLink._run_snapshot_and_recv`), not the caller's. This
+matters because :meth:`PeerDiscovery.connect_peer` — this method's only
+caller for the mDNS path — is itself invoked synchronously from
+``python-zeroconf``'s own ``ServiceBrowser`` callback-dispatch thread
+(wired as ``_BrowseListener``'s ``on_peer_ready``), a thread this module
+does not own and must never stall: found and fixed while investigating
+braeburn's mDNS/peering asymmetry (Decision 10's candidate 3 — see
+``docs/acceptance/004-hardware.md``), where the original (ticket 005)
+inline call meant every new/refreshed peer discovery blocked that shared
+thread for up to 5 seconds on a slow or unreachable peer. The ordering
+guarantee above still holds regardless: the SUB socket is already
+connected and subscribed before the snapshot-fetch thread ever starts.
+
+Decoupling the snapshot fetch from ``connect_peer``'s return also opened
+a real race, found (not guessed) via a timing-based repro before it ever
+reached production: the fetch and the SUB socket's own disconnect
+detection are now two independent signals about the same link, and a
+peer that drops the link *during* the fetch's own window can have a
+late-but-genuinely-successful snapshot reply overwrite an
+already-correct ``store.mark_peer_unreachable`` back to reachable.
+:attr:`_PeerLink._link_dropped`, set by :meth:`_PeerLink._monitor_loop`
+the moment it observes ``EVENT_DISCONNECTED``, guards
+:meth:`_PeerLink._fetch_snapshot`'s own ``on_reachable`` call against
+exactly this — see that method's own comment and this ticket's
+``test_snapshot_success_after_link_dropped_does_not_resurrect_reachable``.
+
+**Self-check diagnostic (ticket 010)**: :meth:`PeerDiscovery.
+_run_self_check`, run on its own thread every ``self_check_interval_s``
+(default 60s), best-effort re-resolves this host's own mDNS registration
+through its own ``Zeroconf`` instance and logs a ``WARNING`` if that
+fails — a root-cause-agnostic signal for "this process's mDNS responder
+has gone silent," the exact failure mode observed (but not root-caused)
+on braeburn after several hours of uptime; see
+``docs/acceptance/004-hardware.md``.
+
 **Peer-vanish detection**: each peer's SUB socket carries a ZeroMQ
 monitor socket (``get_monitor_socket()``) watched on its own thread for
 ``zmq.EVENT_DISCONNECTED`` — a real socket-level event, not a guessed
@@ -246,6 +285,11 @@ _HEARTBEAT_OPTS_MS = (
     ("HEARTBEAT_TIMEOUT", 5000),
     ("HEARTBEAT_TTL", 6000),
 )
+
+#: How often :class:`PeerDiscovery`'s self-check thread (ticket 010) tries
+#: to re-resolve this host's own mDNS registration through its own
+#: ``Zeroconf`` instance -- see :meth:`PeerDiscovery._run_self_check`.
+_DEFAULT_SELF_CHECK_INTERVAL_S = 60.0
 
 
 def _local_ip() -> str:
@@ -729,9 +773,25 @@ class _PeerLink:
         self._stop_event = threading.Event()
         self._recv_thread: threading.Thread | None = None
         self._monitor_thread: threading.Thread | None = None
+        self._snapshot_thread: threading.Thread | None = None
         self._started = False
+        # ticket 010: set by _monitor_loop the moment it observes
+        # zmq.EVENT_DISCONNECTED for this link -- see _fetch_snapshot's
+        # own use of this flag for why it exists (a real race the async
+        # snapshot dispatch above introduced, found and fixed in the same
+        # change, not shipped separately).
+        self._link_dropped = threading.Event()
 
     def start(self) -> None:
+        """Connect+subscribe the SUB socket synchronously, then hand the
+        snapshot fetch off to its own thread (ticket 010) -- see the
+        module docstring's "connect_peer never blocks its caller" note.
+        Returns as soon as the SUB socket is connected/subscribed and the
+        monitor thread is running; the snapshot REQ/REP round-trip (and
+        the SUB recv thread it gates -- see "Subscribe-before-snapshot
+        ordering" below) happen on :attr:`_snapshot_thread` instead of
+        this call's own thread.
+        """
         if self._started:
             return
         self._started = True
@@ -748,11 +808,39 @@ class _PeerLink:
         self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self._monitor_thread.start()
 
-        # Snapshot fetch happens *after* the SUB connect+subscribe above
-        # -- see the module docstring's "Subscribe-before-snapshot
-        # ordering" note.
-        self._fetch_snapshot()
+        # ticket 010 (braeburn investigation, architecture Decision 10):
+        # this method's caller is, for the mDNS path, PeerDiscovery.
+        # connect_peer -- invoked synchronously as _BrowseListener's
+        # on_peer_ready, itself called directly from python-zeroconf's
+        # own ServiceBrowser callback-dispatch thread (never a thread
+        # this module owns). The snapshot REQ/REP round trip below can
+        # block for up to snapshot_timeout_ms (5s default) on an
+        # unreachable/slow peer; running it inline here, as ticket 005
+        # originally did, stalled that shared zeroconf-owned thread for
+        # the same duration on every new/refreshed peer discovery --
+        # found while investigating braeburn's mDNS/peering asymmetry
+        # (docs/acceptance/004-hardware.md), confirmed as a real defect
+        # independent of whatever else was going on on that host. Moved
+        # onto its own thread so start()/connect_peer() always return
+        # immediately regardless of peer reachability, never blocking
+        # zeroconf's own callback machinery. The "subscribe before
+        # snapshot" ordering itself is preserved: the SUB socket above
+        # is already connected+subscribed before this thread starts, so
+        # an event published in the gap is still queued, not lost, no
+        # matter how long the snapshot fetch itself takes.
+        self._snapshot_thread = threading.Thread(
+            target=self._run_snapshot_and_recv, name=f"peer-snapshot-{self._host}", daemon=True
+        )
+        self._snapshot_thread.start()
 
+    def _run_snapshot_and_recv(self) -> None:
+        """Body of :attr:`_snapshot_thread` -- fetch the snapshot, then
+        start the SUB recv loop, unless :meth:`stop` already ran while
+        the (blocking) snapshot fetch was in flight.
+        """
+        self._fetch_snapshot()
+        if self._stop_event.is_set():
+            return
         self._recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
         self._recv_thread.start()
 
@@ -840,6 +928,28 @@ class _PeerLink:
                         self._host,
                     )
 
+        # ticket 010: never resurrect a link this instance already saw
+        # zmq.EVENT_DISCONNECTED for -- see _monitor_loop's own comment.
+        # This snapshot fetch runs on its own thread now (this ticket's
+        # own async-dispatch fix, above), which opened a real race a
+        # synchronous fetch never could: this REQ/REP round trip and the
+        # SUB socket's disconnect detection are two independent signals
+        # about the same link, racing each other with no ordering
+        # relationship -- a peer that vanishes within the fetch's own
+        # window can otherwise have its correctly-observed "unreachable"
+        # overwritten back to "reachable" by a late-arriving (but
+        # genuinely successful, at send time) snapshot reply. Caught by
+        # this ticket's own new regression test
+        # (test_connect_peer_does_not_resurrect_reachable_after_disconnect
+        # in tests/registry/peering/test_peering_eventbus.py), not shipped
+        # as a silent behavior change.
+        if self._link_dropped.is_set():
+            logger.debug(
+                "peering: snapshot from %s succeeded after its link was "
+                "already observed dropped; not marking reachable",
+                self._host,
+            )
+            return
         if self._on_reachable is not None:
             self._on_reachable(self._host)
 
@@ -867,6 +977,9 @@ class _PeerLink:
             except self._zmq.error.ZMQError:
                 break  # socket closed by stop()
             if event.get("event") == self._zmq.EVENT_DISCONNECTED:
+                # ticket 010: recorded before the on_unreachable callback
+                # fires -- see _fetch_snapshot's own use of this flag.
+                self._link_dropped.set()
                 logger.warning(
                     "peering: link to %s (%s) dropped", self._host, self._pub_address
                 )
@@ -874,13 +987,25 @@ class _PeerLink:
                     self._on_unreachable(self._host)
 
     def stop(self) -> None:
-        """Stop both background threads (joined, with a timeout) before
+        """Stop every background thread (joined, with a timeout) before
         closing any socket -- a thread must never be left reading from a
         socket another thread is in the middle of closing. Idempotent.
+
+        :attr:`_snapshot_thread` is joined *first*, with a timeout wide
+        enough to cover its own worst case (the snapshot REQ's
+        ``RCVTIMEO``/``SNDTIMEO``, both ``snapshot_timeout_ms``) plus a
+        margin -- by the time that join returns, ``_recv_thread`` has
+        definitely either been started (fetch succeeded/timed-out
+        in-bounds) or never will be (see :meth:`_run_snapshot_and_recv`'s
+        own stop-event check), so the ``_recv_thread`` join below always
+        sees its final state.
         """
         if not self._started:
             return
         self._stop_event.set()
+        if self._snapshot_thread is not None:
+            self._snapshot_thread.join(timeout=(self._snapshot_timeout_ms / 1000.0) + 1.0)
+            self._snapshot_thread = None
         if self._recv_thread is not None:
             self._recv_thread.join(timeout=2.0)
             self._recv_thread = None
@@ -936,6 +1061,7 @@ class PeerDiscovery:
         zmq: Any = None,
         lock: threading.RLock | None = None,
         auth_token: str | None = None,
+        self_check_interval_s: float = _DEFAULT_SELF_CHECK_INTERVAL_S,
     ) -> None:
         self._store = store
         self._host = host if host is not None else _short_hostname()
@@ -980,6 +1106,12 @@ class PeerDiscovery:
         self._peer_links: dict[str, _PeerLink] = {}
         self._peer_links_lock = threading.Lock()
 
+        # ticket 010: best-effort liveness self-check -- see
+        # _run_self_check's own docstring.
+        self._self_check_interval_s = self_check_interval_s
+        self._self_check_thread: threading.Thread | None = None
+        self._self_check_stop_event = threading.Event()
+
     # -- lifecycle -----------------------------------------------------
 
     def start(self) -> None:
@@ -1022,6 +1154,21 @@ class PeerDiscovery:
             server=f"{self._host}.local.",
         )
         self._zc.register_service(self._own_info, allow_name_change=True)
+        # ticket 010: explicit, always-on record of which single address
+        # this instance chose to advertise (Decision 10's candidate 2,
+        # "which interface/address zeroconf binds/advertises on macOS")
+        # -- a future multi-homed-host recurrence (braeburn had four
+        # active interfaces -- see docs/acceptance/004-hardware.md) is
+        # now a log line to check instead of an `lsof`/`ifconfig` session.
+        logger.info(
+            "peering: advertising %s as %s (%s:%d, pub_port=%d, snapshot_port=%d)",
+            self._host,
+            self._own_info.name,
+            self._advertise_address,
+            self._remote_port,
+            self._pub_port,
+            self._snapshot_port,
+        )
 
         listener = _BrowseListener(
             store=self._store,
@@ -1034,6 +1181,13 @@ class PeerDiscovery:
         self._browser = self._zc_module.ServiceBrowser(
             self._zc, self._service_type, listener=listener
         )
+
+        self._self_check_stop_event.clear()
+        self._self_check_thread = threading.Thread(
+            target=self._self_check_loop, name="peering-self-check", daemon=True
+        )
+        self._self_check_thread.start()
+
         self._started = True
 
     def stop(self) -> None:
@@ -1044,6 +1198,13 @@ class PeerDiscovery:
         """
         if not self._started:
             return
+        # Stopped first, and joined, before self._zc is touched below --
+        # _run_self_check calls self._zc.get_service_info(), which must
+        # never race a concurrent self._zc.close().
+        self._self_check_stop_event.set()
+        if self._self_check_thread is not None:
+            self._self_check_thread.join(timeout=2.0)
+            self._self_check_thread = None
         if self._browser is not None:
             cancel = getattr(self._browser, "cancel", None)
             if callable(cancel):
@@ -1080,6 +1241,55 @@ class PeerDiscovery:
             self._zmq_ctx = None
 
         self._started = False
+
+    # -- ticket 010: self-check diagnostic -------------------------------
+
+    def _self_check_loop(self) -> None:
+        while not self._self_check_stop_event.wait(self._self_check_interval_s):
+            self._run_self_check()
+
+    def _run_self_check(self) -> None:
+        """Best-effort liveness probe (Decision 10): re-resolve this
+        host's own just-registered mDNS record through this same
+        ``Zeroconf`` instance's own ``get_service_info`` -- the same
+        call :class:`_BrowseListener` makes for any other discovered
+        peer, aimed back at ourselves.
+
+        Found while investigating braeburn's mDNS/peering asymmetry
+        (docs/acceptance/004-hardware.md): a long-running daemon on that
+        host silently stopped answering ``_mbregistry._tcp`` queries at
+        all after some hours of uptime, while every other function (the
+        REP/PUB ZeroMQ sockets, the TCP control-plane port) kept working
+        -- confirmed directly with synchronized packet captures on both
+        ends, not reproduced against a freshly-started process. None of
+        this ticket's three original candidate causes explained that
+        specific failure mode, and it was not root-caused this ticket
+        (see the doc's own writeup) -- this self-check exists so the
+        *next* time it happens, on any host, it is a ``WARNING`` log line
+        within one interval instead of a multi-hour hardware
+        investigation: a miss here means this process's own mDNS
+        responder can no longer even answer a query about its own
+        service, independent of any remote peer, network condition, or
+        remote host's behavior.
+        """
+        own_name = f"{self._host}.{self._service_type}"
+        try:
+            info = self._zc.get_service_info(
+                self._service_type, own_name, timeout=_DEFAULT_RESOLVE_TIMEOUT_MS
+            )
+        except Exception:
+            logger.exception("peering: self-check for %s raised", own_name)
+            return
+        if info is None:
+            logger.warning(
+                "peering: self-check failed -- %s did not resolve via this "
+                "process's own Zeroconf instance; this host's mDNS "
+                "responder may have silently stopped answering queries "
+                "(see docs/acceptance/004-hardware.md's braeburn finding)",
+                own_name,
+            )
+        else:
+            logger.debug("peering: self-check ok for %s", own_name)
 
     def __enter__(self) -> "PeerDiscovery":
         self.start()

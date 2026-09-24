@@ -61,6 +61,12 @@ class _FakeZeroconf:
         self.registered: list = []
         self.unregistered: list = []
         self.closed = False
+        #: ticket 010: controls PeerDiscovery._run_self_check's own
+        #: get_service_info() call -- None (default) means "resolves
+        #: fine" (echoes the just-registered info back), matching a
+        #: healthy responder; a test sets this to True to simulate the
+        #: braeburn-style "own registration no longer resolves" failure.
+        self.self_check_fails = False
 
     def register_service(self, info, allow_name_change=False):
         self.registered.append(info)
@@ -70,6 +76,14 @@ class _FakeZeroconf:
 
     def close(self):
         self.closed = True
+
+    def get_service_info(self, type_, name, timeout=3000):
+        if self.self_check_fails:
+            return None
+        for info in self.registered:
+            if info.name == name:
+                return info
+        return None
 
 
 class _FakeServiceBrowser:
@@ -452,6 +466,70 @@ def test_stop_is_idempotent(store):
     pd.stop()
     pd.stop()  # must not raise, must not double-close/double-unregister
     assert ns.instance.unregistered.count(ns.instance.registered[0]) == 1
+
+
+def test_self_check_ok_when_own_registration_resolves(store, caplog):
+    """ticket 010: the common/healthy case -- _run_self_check re-resolves
+    this instance's own just-registered record through its own fake
+    Zeroconf (which echoes it back by default -- see _FakeZeroconf.
+    get_service_info) and logs no WARNING.
+    """
+    ns = _FakeZeroconfNamespace()
+    pd = PeerDiscovery(
+        store=store, host="loki", advertise_address="192.168.1.149", zeroconf=ns
+    )
+    pd.start()
+    caplog.set_level("WARNING", logger="mbtools.registry.peering")
+
+    pd._run_self_check()
+
+    assert "self-check failed" not in caplog.text
+    pd.stop()
+
+
+def test_self_check_warns_when_own_registration_stops_resolving(store, caplog):
+    """ticket 010: the braeburn failure mode this diagnostic exists for
+    -- this host's own mDNS responder can no longer resolve its own
+    registration (docs/acceptance/004-hardware.md's finding: a
+    long-running daemon on that host stopped answering
+    ``_mbregistry._tcp`` queries at all after some hours of uptime).
+    ``_run_self_check`` must log a WARNING naming the service, not raise
+    and not stay silent.
+    """
+    ns = _FakeZeroconfNamespace()
+    pd = PeerDiscovery(
+        store=store, host="loki", advertise_address="192.168.1.149", zeroconf=ns
+    )
+    pd.start()
+    ns.instance.self_check_fails = True
+    caplog.set_level("WARNING", logger="mbtools.registry.peering")
+
+    pd._run_self_check()
+
+    assert "self-check failed" in caplog.text
+    assert "loki." + SERVICE_TYPE in caplog.text
+    pd.stop()
+
+
+def test_self_check_thread_is_started_and_stopped_with_peer_discovery(store):
+    """The self-check thread (default 60s interval, never fires during
+    this test) must still be a real, joinable thread that start()/stop()
+    own -- per this ticket's own "any thread started must be stoppable
+    and joined" requirement, same as every other background thread this
+    module owns.
+    """
+    ns = _FakeZeroconfNamespace()
+    pd = PeerDiscovery(
+        store=store, host="loki", advertise_address="192.168.1.149", zeroconf=ns
+    )
+    assert pd._self_check_thread is None
+    pd.start()
+    assert pd._self_check_thread is not None
+    assert pd._self_check_thread.is_alive()
+
+    pd.stop()
+
+    assert pd._self_check_thread is None
 
 
 def test_default_host_and_advertise_address_are_not_empty(store):
