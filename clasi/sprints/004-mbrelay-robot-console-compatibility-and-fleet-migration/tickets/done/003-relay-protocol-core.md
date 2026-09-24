@@ -1,7 +1,7 @@
 ---
 id: '003'
 title: Relay protocol core
-status: in-progress
+status: done
 use-cases:
 - SUC-001
 depends-on: []
