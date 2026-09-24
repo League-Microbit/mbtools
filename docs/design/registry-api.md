@@ -295,6 +295,47 @@ the shape shown above, plus a `reachable` flag derived from the owning
 `peer` row for a remote-owned device — none of that wiring exists yet as
 of this ticket, which only touches `store.py`.
 
+## Peering snapshot handshake auth (sprint 003, ticket 009)
+
+`registry.peering`'s snapshot REQ/REP exchange (ticket 005) is the one
+"handshake" Decision 6 means by "forwarded to both `remote_api` and
+`peering`'s handshake" — the live PUB/SUB event stream itself is one-way
+and has nothing to attach a token to. When a `PeerDiscovery` is
+constructed with `auth_token` set:
+
+```jsonc
+// request (replaces ticket 005's bare b"snapshot" wire text)
+{"token": "<the configured token>"}
+// response, on success: unchanged from ticket 005 -- the snapshot array
+[{"uid": "...", ...}, ...]
+// response, on a missing/mismatched token:
+{"error": "unauthorized"}
+```
+
+An unauthorized reply is treated exactly like a request that timed out:
+logged, no `on_reachable` callback fires, and the peer's row (if
+`connect_peer`'s own `remote_port` argument recorded one -- see below) is
+never marked reachable from this exchange. When `auth_token` is unset
+(the default), the REP handler never inspects the request body at all —
+byte-for-byte the same wire behavior ticket 005 always had.
+
+## `--peer`'s record-before-connect fix (sprint 003, ticket 009)
+
+`PeerDiscovery.connect_peer(host, address, pub_port, snapshot_port)`
+(ticket 005) never itself calls `Store.record_peer_seen` — the mDNS path
+(`_BrowseListener`, ticket 004) does that *before* calling `connect_peer`
+as its `on_peer_ready` hook, from the TXT record's own advertised remote
+port. `mbregistry run --peer HOST[:PORT]` (this ticket) has no
+`_BrowseListener` doing that for it, so `connect_peer` grew an optional
+keyword-only `remote_port` argument: when given, it calls
+`record_peer_seen(host, f"{address}:{remote_port}")` itself, before
+establishing the link. Omitting it (still `connect_peer`'s default,
+preserving every ticket 004/005 test's own pre-recording pattern
+unchanged) reproduces the original gap: the link still connects and even
+snapshot-syncs, but `store.mark_peer_reachable`'s `KeyError` for a
+not-yet-recorded host is caught and logged, so the peer's row never
+appears. `cmd_run`'s own `--peer` handling always passes `remote_port`.
+
 ## Remote TCP control plane (sprint 003, ticket 006)
 
 Implemented by `mbtools.registry.remote_api.RemoteAPIServer`, sharing the
@@ -610,6 +651,15 @@ listed above, for the same one-place reason.
   in-memory/single-sqlite-statement bookkeeping (the attach/detach diff and
   the pre/post-probe store writes), never around the real port I/O in
   `identity.probe()` — see `daemon.py`'s own "Concurrency" docstring note.
+  **Extended, same ticket:** `mbregistry run`'s real assembly
+  (`registry.cli.assemble_registry`) hands this exact same `RLock` to
+  `RemoteAPIServer(lock=...)` and `PeerDiscovery(lock=...)` too, so a
+  peering-driven store write (a peer's snapshot apply or live event) and
+  every local/remote API op all serialize through the one lock — see
+  `peering.py`'s own constructor docstring note on why (defense in depth;
+  `Store` is independently thread-safe on its own, so this is not a
+  correctness requirement peering has by itself, only consistency with
+  the rest of this assembly).
 - **`flash` no longer holds the shared lock for the whole pyocd run —
   resolved in ticket 009.** Holding it there was an acceptable sprint-1
   trade-off when the lock was scoped to `api` alone; it stopped being

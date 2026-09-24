@@ -134,10 +134,11 @@ class Daemon:
     real assembly ticket 009's ``mbregistry run`` builds) owns their
     lifecycle. ``locks`` is *not* injected: :class:`Daemon` always
     constructs its own :class:`~mbtools.registry.locks.LockManager` so it
-    can wire its flash-release callback at construction (the only point
-    ``LockManager`` accepts one) — exposed as :attr:`locks` so ticket
-    007/008 (and tests) can acquire/release/inspect locks against the
-    exact instance this daemon watches.
+    can wire its flash-release callback (and, as of ticket 009, a
+    ``lock_display_callback`` — see below) at construction, the only
+    point ``LockManager`` accepts either — exposed as :attr:`locks` so
+    ticket 007/008 (and tests) can acquire/release/inspect locks against
+    the exact instance this daemon watches.
 
     ``serial_factory``/``probe_timeout_s``/``settle_s`` are forwarded
     verbatim to :func:`mbtools.registry.identity.probe` on every probe
@@ -162,6 +163,15 @@ class Daemon:
     ``event_callback`` is the optional attach/detach/identity hook
     described in the module docstring's "Event hook" note. Defaults to
     ``None`` (no-op) so every pre-ticket-005 caller/test is unaffected.
+
+    ``lock_display_callback`` (ticket 009) is forwarded verbatim into
+    this daemon's own :class:`~mbtools.registry.locks.LockManager`
+    construction — :func:`mbtools.registry.cli.assemble_registry` passes
+    ``registry.peering.PeerDiscovery.publish_lock_event`` here so every
+    lock-acquire/lock-release this daemon's ``LockManager`` sees is also
+    published onto the peering event bus (sprint.md Decision 3's
+    replicated lock-display cache). Defaults to ``None`` (no-op), so
+    every pre-ticket-009 caller/test is unaffected.
     """
 
     def __init__(
@@ -176,6 +186,8 @@ class Daemon:
         now_fn: Callable[[], float] = time.monotonic,
         lock: threading.RLock | None = None,
         event_callback: Callable[[str, DeviceRecord], None] | None = None,
+        lock_display_callback: Callable[[str, str | None, str | None], None]
+        | None = None,
     ) -> None:
         self._usbwatch = usbwatch
         self._store = store
@@ -196,7 +208,10 @@ class Daemon:
         #: for).
         self._flash_pending: dict[str, float] = {}
 
-        self.locks = LockManager(flash_release_callback=self._on_flash_release)
+        self.locks = LockManager(
+            flash_release_callback=self._on_flash_release,
+            lock_display_callback=lock_display_callback,
+        )
 
     # -- flash-release hook ------------------------------------------------
 

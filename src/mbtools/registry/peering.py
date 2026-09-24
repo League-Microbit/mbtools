@@ -71,6 +71,28 @@ a collision) -- it compares the discovered service's resolved
 address/port against the single address/port this instance itself
 registered, per this ticket's acceptance criteria.
 
+**Peering handshake auth (ticket 009, sprint.md Decision 6)**: when
+``auth_token`` is set, every snapshot REQ/REP exchange — the one true
+"handshake" this module has, per Decision 6's own wording — carries it:
+:class:`_PeerLink` sends ``{"token": "<value>"}`` instead of the bare
+``b"snapshot"`` ticket 005 always sent, and :meth:`PeerDiscovery._rep_loop`
+replies ``{"error": "unauthorized"}`` (never the snapshot payload) for a
+request whose ``token`` field is missing or doesn't match. A rejected
+snapshot is treated exactly like a timed-out one — logged, no
+``on_reachable`` callback fires, no peer row is left half-updated — so a
+misconfigured/mismatched-token peer degrades the same silent-no-op way an
+old, non-peering daemon already does per sprint.md's Migration Concerns.
+When ``auth_token`` is unset (the default, matching every other trust
+boundary in this sprint), the REP handler never inspects the request body
+at all — reproducing ticket 005's exact wire behavior, which is why every
+ticket-004/005 test (raw ``req.send(b"snapshot")``, no token) still
+passes unchanged. The live PUB/SUB event stream itself is not
+authenticated — it is one-way and has no request to attach a token to;
+only the snapshot handshake and, separately, ``registry.remote_api``'s
+own per-connection first-line handshake (``docs/design/registry-api.md``'s
+"Auth" section) carry ``auth_token``, per Decision 6's "forwarded to both
+``remote_api`` and ``peering``'s handshake."
+
 **Coexistence with ``avahi-daemon``**: confirmed clean on real Nolanet
 hardware by ``mbdeploy``'s own spike
 (``docs/spikes/002-avahi-coexistence.md`` there) -- no design change
@@ -539,6 +561,8 @@ class _PeerLink:
         on_unreachable: Callable[[str], None] | None,
         on_reachable: Callable[[str], None] | None,
         snapshot_timeout_ms: int = _DEFAULT_SNAPSHOT_TIMEOUT_MS,
+        lock: threading.RLock | None = None,
+        auth_token: str | None = None,
     ) -> None:
         self._host = host
         self._store = store
@@ -549,6 +573,8 @@ class _PeerLink:
         self._on_unreachable = on_unreachable
         self._on_reachable = on_reachable
         self._snapshot_timeout_ms = snapshot_timeout_ms
+        self._lock = lock if lock is not None else threading.RLock()
+        self._auth_token = auth_token
 
         self._sub_socket: Any = None
         self._monitor_socket: Any = None
@@ -597,9 +623,21 @@ class _PeerLink:
         req.setsockopt(self._zmq.LINGER, 0)
         req.setsockopt(self._zmq.RCVTIMEO, self._snapshot_timeout_ms)
         req.setsockopt(self._zmq.SNDTIMEO, self._snapshot_timeout_ms)
+        # ticket 009: when this side has an auth token configured, send
+        # it as {"token": ...} instead of ticket 005's bare b"snapshot"
+        # -- see the module docstring's "Peering handshake auth" note.
+        # When unset (the default), the wire is byte-for-byte what
+        # ticket 005 always sent, so an unauthenticated peer's REP
+        # handler (which never inspects the request body at all in that
+        # case) sees no difference.
+        request = (
+            json.dumps({"token": self._auth_token}).encode("utf-8")
+            if self._auth_token is not None
+            else b"snapshot"
+        )
         try:
             req.connect(self._snapshot_address)
-            req.send(b"snapshot")
+            req.send(request)
             reply = req.recv()
         except self._zmq.error.Again:
             logger.warning(
@@ -617,15 +655,29 @@ class _PeerLink:
             logger.exception("peering: malformed snapshot reply from %s", self._host)
             return
 
-        for device in devices:
-            try:
-                _apply_snapshot_device(self._store, self._host, device)
-            except Exception:
-                logger.exception(
-                    "peering: failed applying snapshot device %r from %s",
-                    device.get("uid"),
-                    self._host,
-                )
+        if isinstance(devices, dict):
+            # {"error": "unauthorized"} (ticket 009) or any other
+            # object-shaped reply -- never a valid snapshot (always a
+            # list, see _snapshot_payload) -- treated like a timeout:
+            # logged, no on_reachable, no peer row left half-updated.
+            logger.warning(
+                "peering: snapshot request to %s (%s) refused: %r",
+                self._host,
+                self._snapshot_address,
+                devices,
+            )
+            return
+
+        with self._lock:
+            for device in devices:
+                try:
+                    _apply_snapshot_device(self._store, self._host, device)
+                except Exception:
+                    logger.exception(
+                        "peering: failed applying snapshot device %r from %s",
+                        device.get("uid"),
+                        self._host,
+                    )
 
         if self._on_reachable is not None:
             self._on_reachable(self._host)
@@ -640,7 +692,8 @@ class _PeerLink:
                 break  # socket closed by stop()
             try:
                 event = json.loads(message.decode("utf-8"))
-                _apply_event(self._store, self._host, event)
+                with self._lock:
+                    _apply_event(self._store, self._host, event)
             except Exception:
                 logger.exception("peering: failed applying event from %s", self._host)
 
@@ -720,6 +773,8 @@ class PeerDiscovery:
         service_type: str = SERVICE_TYPE,
         zeroconf: Any = None,
         zmq: Any = None,
+        lock: threading.RLock | None = None,
+        auth_token: str | None = None,
     ) -> None:
         self._store = store
         self._host = host if host is not None else _short_hostname()
@@ -732,6 +787,22 @@ class PeerDiscovery:
         self._service_type = service_type
         self._zc_module = zeroconf if zeroconf is not None else _real_zeroconf
         self._zmq_module = zmq if zmq is not None else _real_zmq
+        # ticket 009: the same threading.RLock `assemble_registry` shares
+        # across Daemon/RegistryAPIServer/RemoteAPIServer -- guards every
+        # store mutation this module makes on a peer's behalf (snapshot
+        # apply, live-event apply, the REP handler's own snapshot read),
+        # consistent with every other module's "every store/locks access
+        # goes through the shared lock" convention, even though `Store`
+        # is independently thread-safe on its own (see store.py's
+        # "Thread safety" note) -- this is defense in depth/consistency,
+        # not a correctness requirement peering has on its own. Defaults
+        # to a private RLock, matching every other module here.
+        self._lock = lock if lock is not None else threading.RLock()
+        #: Optional shared-secret (sprint.md Decision 6) required of a
+        #: peer's snapshot request -- see the module docstring's "Peering
+        #: handshake auth" note below and :meth:`_rep_loop`/
+        #: :class:`_PeerLink`'s own use of it.
+        self._auth_token = auth_token
 
         self._zc: Any = None
         self._own_info: Any = None
@@ -859,7 +930,10 @@ class PeerDiscovery:
 
     def _rep_loop(self) -> None:
         """Answer every snapshot request with this host's own current
-        devices (:func:`_snapshot_payload`).
+        devices (:func:`_snapshot_payload`) -- or, when ``auth_token``
+        (ticket 009) is set and the request's token is missing/wrong, an
+        ``{"error": "unauthorized"}`` reply instead (see the module
+        docstring's "Peering handshake auth" note).
 
         Runs on its own thread against its own socket -- never the PUB
         socket -- so a slow or stalled requester can never block this
@@ -871,17 +945,43 @@ class PeerDiscovery:
         """
         while not self._rep_stop_event.is_set():
             try:
-                self._rep_socket.recv()
+                message = self._rep_socket.recv()
             except self._zmq_module.error.Again:
                 continue
             except self._zmq_module.error.ZMQError:
                 break  # socket closed by stop()
-            payload = json.dumps(_snapshot_payload(self._store)).encode("utf-8")
+            if self._auth_token is not None and not self._token_ok(message):
+                payload = json.dumps({"error": "unauthorized"}).encode("utf-8")
+            else:
+                with self._lock:
+                    payload = json.dumps(_snapshot_payload(self._store)).encode("utf-8")
             self._rep_socket.send(payload)
+
+    def _token_ok(self, message: bytes) -> bool:
+        """Does ``message`` (a snapshot REQ's raw payload) carry a
+        ``{"token": ...}`` matching :attr:`_auth_token`? Only called when
+        :attr:`_auth_token` is set (see :meth:`_rep_loop`) -- a
+        non-JSON or JSON-but-wrong-shape message (e.g. ticket 005's
+        legacy bare ``b"snapshot"``) is simply not-ok, never an
+        exception.
+        """
+        try:
+            data = json.loads(message.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return False
+        return isinstance(data, dict) and data.get("token") == self._auth_token
 
     # -- ticket 005: peer link lifecycle ---------------------------------
 
-    def connect_peer(self, host: str, address: str, pub_port: int, snapshot_port: int) -> None:
+    def connect_peer(
+        self,
+        host: str,
+        address: str,
+        pub_port: int,
+        snapshot_port: int,
+        *,
+        remote_port: int | None = None,
+    ) -> None:
         """Establish (or re-establish) a live peering link to ``host`` at
         ``address``'s ``pub_port``/``snapshot_port``.
 
@@ -891,6 +991,32 @@ class PeerDiscovery:
         exercising "no mDNS involved" both call directly -- the one
         method every path into a live peer link funnels through.
 
+        **``remote_port`` and the record-before-connect pitfall.** Ticket
+        004's mDNS path never has to think about this: ``_BrowseListener``
+        already calls ``store.record_peer_seen(host, endpoint)`` itself,
+        from the TXT record's own advertised remote port, *before* it
+        ever invokes this method as ``on_peer_ready`` -- so by the time a
+        link's snapshot exchange succeeds and fires ``on_reachable`` ->
+        :meth:`_on_peer_reachable` -> ``store.mark_peer_reachable(host)``,
+        a ``peer`` row already exists for ``host`` to mark. A caller with
+        no such prior step -- concretely, ticket 009's ``--peer
+        HOST[:PORT]`` CLI flag, which has no ``_BrowseListener`` doing
+        this for it -- must pass ``remote_port`` here so this method does
+        the recording itself, in the same record-then-connect order, before
+        the link is established. Omitting it when no prior
+        ``record_peer_seen`` has happened is exactly the bug this
+        parameter exists to prevent: the link still connects and even
+        snapshot-syncs successfully, but ``_on_peer_reachable``'s
+        ``store.mark_peer_reachable`` then raises ``KeyError`` for a host
+        with no ``peer`` row -- caught and logged (see
+        :meth:`_on_peer_reachable`), never raised to the caller -- so the
+        peer's own reachability silently never appears in ``store``,
+        even though devices from its snapshot/events keep flowing in.
+        Defaults to ``None`` (skip the recording here), which reproduces
+        ticket 005's exact behavior for the mDNS path -- every existing
+        ticket-004/005 test that calls this method directly, having
+        already called ``record_peer_seen`` itself first, is unaffected.
+
         Safe to call more than once for the same ``host`` (an mDNS
         ``update_service`` refresh, or an explicit reconnect after a
         vanish per Decision 5, "a later reconnect ... re-runs the
@@ -898,6 +1024,9 @@ class PeerDiscovery:
         first, then a fresh one is started, which always re-does the
         snapshot exchange and marks the peer reachable again on success.
         """
+        if remote_port is not None:
+            self._store.record_peer_seen(host, f"{address}:{remote_port}")
+
         with self._peer_links_lock:
             existing = self._peer_links.pop(host, None)
         if existing is not None:
@@ -912,6 +1041,8 @@ class PeerDiscovery:
             snapshot_address=f"tcp://{address}:{snapshot_port}",
             on_unreachable=self._on_peer_unreachable,
             on_reachable=self._on_peer_reachable,
+            lock=self._lock,
+            auth_token=self._auth_token,
         )
         with self._peer_links_lock:
             self._peer_links[host] = link

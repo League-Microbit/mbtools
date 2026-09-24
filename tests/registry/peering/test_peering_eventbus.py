@@ -467,4 +467,193 @@ def test_peer_vanish_marks_unreachable_and_reconnect_marks_reachable_again(store
         if peering_a2 is not None:
             peering_a2.stop()
         store.close()
+
+
+# ---------------------------------------------------------------------------
+# ticket 009: connect_peer(remote_port=...) records the peer before
+# connecting -- the fix for the pitfall ticket 005 left open (calling
+# connect_peer alone, with no preceding record_peer_seen, connects and
+# even snapshot-syncs successfully, but on_reachable's
+# store.mark_peer_reachable then silently KeyErrors for a host with no
+# peer row -- caught and logged, never surfacing). Ticket 009's --peer
+# CLI flag is the caller that has no _BrowseListener doing the recording
+# for it first (unlike every test above, which reproduces that
+# mDNS-path pre-recording manually via record_peer_seen before
+# connect_peer), so this is exactly its own code path, exercised
+# directly.
+# ---------------------------------------------------------------------------
+
+
+def test_connect_peer_with_remote_port_records_peer_before_connecting(store, tmp_path):
+    store_b = Store(tmp_path / "beta.db")
+    store.upsert_attached(UID, "/dev/ttyACM0", "0d28:0204")
+
+    peering_a = _make_peering(store, host="alpha", pub_port=17602, snapshot_port=17603)
+    peering_b = _make_peering(store_b, host="beta", pub_port=17612, snapshot_port=17613)
+
+    try:
+        peering_a.start()
+        peering_b.start()
+
+        # No store_b.record_peer_seen(...) call here -- unlike every
+        # other test in this module, this is deliberately the --peer
+        # flag's own code path: connect_peer() alone, with remote_port
+        # given, must do the recording itself.
+        assert store_b.get_peer("alpha") is None
+        peering_b.connect_peer(
+            "alpha", "127.0.0.1", 17602, 17603, remote_port=_remote_port(17602)
+        )
+
+        assert _wait_until(lambda: store_b.get_peer("alpha") is not None)
+        peer = store_b.get_peer("alpha")
+        assert peer.reachable is True
+        assert peer.endpoint == f"127.0.0.1:{_remote_port(17602)}"
+
+        # And the snapshot itself still converges normally.
+        assert _wait_until(lambda: store_b.get(UID) is not None)
+        assert store_b.get(UID).host == "alpha"
+    finally:
+        peering_a.stop()
+        peering_b.stop()
+        store.close()
+        store_b.close()
+
+
+def test_connect_peer_without_remote_port_reproduces_ticket_005_behavior(store, tmp_path):
+    """Documents the flip side of the fix above: omitting ``remote_port``
+    (its default) is exactly ticket 005's original behavior -- the link
+    still connects and snapshot-syncs, but with no preceding
+    ``record_peer_seen``, no ``peer`` row ever appears, since
+    ``_on_peer_reachable``'s ``mark_peer_reachable`` call finds nothing to
+    mark and is caught/logged rather than raised. This is the exact
+    pitfall :func:`test_connect_peer_with_remote_port_records_peer_before_connecting`
+    fixes when a caller opts in via ``remote_port`` -- kept passing
+    unchanged here since ticket 004/005's own mDNS-path tests all rely on
+    this "connect_peer alone does not record" contract still holding when
+    ``remote_port`` is not given.
+    """
+    store_b = Store(tmp_path / "beta.db")
+    store.upsert_attached(UID, "/dev/ttyACM0", "0d28:0204")
+
+    peering_a = _make_peering(store, host="alpha", pub_port=17622, snapshot_port=17623)
+    peering_b = _make_peering(store_b, host="beta", pub_port=17632, snapshot_port=17633)
+
+    try:
+        peering_a.start()
+        peering_b.start()
+
+        peering_b.connect_peer("alpha", "127.0.0.1", 17622, 17623)
+
+        # The snapshot still converges (the link itself works fine)...
+        assert _wait_until(lambda: store_b.get(UID) is not None)
+        # ...but no peer row was ever created, since nothing called
+        # record_peer_seen and connect_peer's own remote_port was omitted.
+        assert store_b.get_peer("alpha") is None
+    finally:
+        peering_a.stop()
+        peering_b.stop()
+        store.close()
+        store_b.close()
+
+
+# ---------------------------------------------------------------------------
+# ticket 009: peering handshake auth (sprint.md Decision 6)
+# ---------------------------------------------------------------------------
+
+
+def test_snapshot_handshake_with_matching_auth_token_succeeds(store, tmp_path):
+    store_b = Store(tmp_path / "beta.db")
+    store.upsert_attached(UID, "/dev/ttyACM0", "0d28:0204")
+
+    peering_a = PeerDiscovery(
+        store=store,
+        host="alpha",
+        advertise_address="127.0.0.1",
+        remote_port=_remote_port(17642),
+        pub_port=17642,
+        snapshot_port=17643,
+        zeroconf=_FakeZeroconfNamespace(),
+        auth_token="s3cret",
+    )
+    peering_b = PeerDiscovery(
+        store=store_b,
+        host="beta",
+        advertise_address="127.0.0.1",
+        remote_port=_remote_port(17652),
+        pub_port=17652,
+        snapshot_port=17653,
+        zeroconf=_FakeZeroconfNamespace(),
+        auth_token="s3cret",
+    )
+
+    try:
+        peering_a.start()
+        peering_b.start()
+        peering_b.connect_peer(
+            "alpha", "127.0.0.1", 17642, 17643, remote_port=_remote_port(17642)
+        )
+
+        assert _wait_until(lambda: store_b.get(UID) is not None)
+        assert _wait_until(lambda: store_b.get_peer("alpha").reachable is True)
+    finally:
+        peering_a.stop()
+        peering_b.stop()
+        store.close()
+        store_b.close()
+
+
+def test_snapshot_handshake_with_wrong_auth_token_is_rejected(store, tmp_path):
+    """A mismatched (or missing) token degrades the same silent-no-op way
+    a snapshot timeout does (module docstring's "Peering handshake auth"
+    note) -- no snapshot applied, no peer marked reachable, no
+    exception raised on either side.
+    """
+    store_b = Store(tmp_path / "beta.db")
+    store.upsert_attached(UID, "/dev/ttyACM0", "0d28:0204")
+
+    peering_a = PeerDiscovery(
+        store=store,
+        host="alpha",
+        advertise_address="127.0.0.1",
+        remote_port=_remote_port(17662),
+        pub_port=17662,
+        snapshot_port=17663,
+        zeroconf=_FakeZeroconfNamespace(),
+        auth_token="s3cret",
+    )
+    peering_b = PeerDiscovery(
+        store=store_b,
+        host="beta",
+        advertise_address="127.0.0.1",
+        remote_port=_remote_port(17672),
+        pub_port=17672,
+        snapshot_port=17673,
+        zeroconf=_FakeZeroconfNamespace(),
+        auth_token="wrong",
+    )
+
+    try:
+        peering_a.start()
+        peering_b.start()
+        peering_b.connect_peer(
+            "alpha", "127.0.0.1", 17662, 17663, remote_port=_remote_port(17662)
+        )
+
+        # Give the (failed) snapshot exchange time to complete -- there is
+        # no success condition to _wait_until on, so this sleeps a bound
+        # generous enough for the REQ/REP round trip, then asserts the
+        # negative: no device from alpha's snapshot ever applied.
+        time.sleep(0.5)
+        assert store_b.get(UID) is None
+        # The peer row does exist -- connect_peer's own remote_port
+        # recorded it as "discovered", the same as the mDNS path always
+        # has, independent of whether the snapshot handshake that follows
+        # then succeeds or is refused.
+        peer = store_b.get_peer("alpha")
+        assert peer is not None
+    finally:
+        peering_a.stop()
+        peering_b.stop()
+        store.close()
+        store_b.close()
         store_b.close()
