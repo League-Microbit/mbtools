@@ -1,7 +1,7 @@
 ---
 id: '012'
 title: 'mbdeploy: flash a peer-owned device by name (remote transport)'
-status: in-progress
+status: done
 use-cases:
 - SUC-003
 depends-on:
