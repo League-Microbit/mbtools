@@ -26,12 +26,14 @@ import pytest
 
 import mbtools.registry.cli as cli_module
 from mbtools.common import EXIT_OK
-from mbtools.registry.cli import (
-    DEFAULT_UDEV_RULE_PATH,
-    main,
-    render_systemd_unit,
-    render_udev_rule,
-)
+from mbtools.registry.cli import DEFAULT_UDEV_RULE_PATH, main
+
+# Ticket 006-003: render_systemd_unit/render_udev_rule moved from
+# mbtools.registry.cli into mbtools.registry.service (its own "Linux:
+# systemd/udev" section) -- cli.py still imports and uses the same
+# functions, but this suite now imports them from their new home
+# directly, per that ticket's own plan.
+from mbtools.registry.service import render_systemd_unit, render_udev_rule
 
 
 def test_rendered_unit_is_a_golden_file_for_the_required_directives():

@@ -89,6 +89,7 @@ from mbtools.registry.peering import (
 )
 from mbtools.registry.remote_api import DEFAULT_REMOTE_PORT, RemoteAPIServer
 from mbtools.registry.render import render_json, render_table
+from mbtools.registry.service import _UDEV_GROUP, render_systemd_unit, render_udev_rule
 from mbtools.registry.service_windows import (
     cmd_install_service_windows,
     run_as_windows_service,
@@ -128,18 +129,12 @@ DEFAULT_UNIT_PATH = Path("/etc/systemd/system/mbregistry.service")
 #: matches this VID:PID.
 DEFAULT_UDEV_RULE_PATH = Path("/etc/udev/rules.d/99-mbregistry-cmsis-dap.rules")
 
-#: The micro:bit DAPLink interface's fixed VID:PID (sprint.md SUC-005,
-#: Decision 9; confirmed on the Nolanet nodes -- see CLAUDE.md's hardware
-#: test hosts table and ``docs/acceptance/002-hardware.md``). Shared
-#: between the tty/usb/hidraw match rules in :func:`render_udev_rule` so
-#: they can never drift apart from each other.
-_USB_VENDOR_ID = "0d28"
-_USB_PRODUCT_ID = "0204"
-
-#: The group :func:`render_udev_rule`'s rules grant access via, alongside
-#: ``TAG+="uaccess"`` -- see that function's own docstring for why both
-#: mechanisms are written into the same rule rather than picking just one.
-_UDEV_GROUP = "plugdev"
+#: ``render_systemd_unit``/``render_udev_rule`` (ticket 006-003 moved
+#: both, and the udev VID:PID/group constants they close over, into
+#: ``registry.service`` -- see that module's own "Linux: systemd/udev"
+#: section) and the ``_UDEV_GROUP`` name :func:`cmd_install_service`
+#: still prints below are all imported above, not redefined here, so
+#: they cannot drift apart from ``registry.service``'s copies.
 
 _DB_ENV_VAR = "MBREGISTRY_DB"
 
@@ -870,144 +865,16 @@ def _run_registry(args: argparse.Namespace, stop_event: threading.Event) -> int:
 
 
 # ---------------------------------------------------------------------------
-# install-service -- write the systemd unit
+# install-service -- write the systemd unit + non-root-USB-access udev rule
+#
+# Ticket 006-003 moved render_systemd_unit()/render_udev_rule() (and the
+# udev VID:PID/group constants they close over) verbatim into
+# registry.service's own "Linux: systemd/udev" section -- imported above
+# rather than defined here, so cmd_install_service below keeps working
+# unchanged. Ticket 006-004 is what replaces cmd_install_service itself
+# with the new `service install|uninstall|status` subcommands calling
+# registry.service's orchestration functions directly.
 # ---------------------------------------------------------------------------
-
-#: Rendered with ``str.format(exec_start=...)``. ``RuntimeDirectory=``/
-#: ``StateDirectory=`` are systemd's own directive for "create this
-#: subdirectory of /run or /var/lib, owned by this service, before
-#: ExecStart runs" -- the Design Rationale's "install-service's systemd
-#: unit must create both directories (or rely on RuntimeDirectory=/
-#: StateDirectory= systemd directives)" satisfied without this module
-#: ever shelling out to ``mkdir`` itself. Named ``mbregistry.service``,
-#: distinct from the fleet's existing ``mbrelay.service``/old ``mbdeploy
-#: serve`` per sprint.md's Migration Concerns -- this ticket does not
-#: need to detect or retire those.
-_SYSTEMD_UNIT_TEMPLATE = """\
-[Unit]
-Description=mbregistry -- micro:bit device registry daemon
-After=network.target
-
-[Service]
-Type=simple
-ExecStart={exec_start}
-Restart=on-failure
-RestartSec=2
-RuntimeDirectory=mbregistry
-StateDirectory=mbregistry
-
-[Install]
-WantedBy=multi-user.target
-"""
-
-
-def render_systemd_unit(exec_start: str | None = None) -> str:
-    """The systemd unit's text. ``exec_start`` defaults to invoking
-    ``mbregistry run`` through the current interpreter
-    (``{sys.executable} -m mbtools.registry.cli run``) -- the same
-    "invoke through the running interpreter, not a bare PATH lookup"
-    reasoning ``flash.py``'s own ``_PYOCD`` already documents: mbtools is
-    typically installed into an isolated venv whose ``bin/`` directory is
-    not on the ``PATH`` systemd uses for a unit's ``ExecStart=``, but the
-    package is always importable through the interpreter that installed
-    it.
-    """
-    if exec_start is None:
-        exec_start = f"{sys.executable} -m mbtools.registry.cli run"
-    return _SYSTEMD_UNIT_TEMPLATE.format(exec_start=exec_start)
-
-
-# ---------------------------------------------------------------------------
-# install-service -- write the non-root-USB-access udev rule (ticket 008)
-# ---------------------------------------------------------------------------
-
-#: Three match rules, one per device node ``mbserial``/pyOCD open for the
-#: micro:bit DAPLink interface (sprint.md SUC-005):
-#:
-#: 1. The CDC-ACM ``tty`` device node -- what ``mbserial`` and pyOCD's own
-#:    serial transport use (matches the legacy
-#:    ``microbit-radio-relay/server/packaging/99-microbit-relay.rules``
-#:    shape: ``SUBSYSTEM=="tty", SUBSYSTEMS=="usb"``).
-#: 2. The raw ``usb`` device node -- what pyOCD's CMSIS-DAP v2 (WinUSB)
-#:    transport opens *directly*, bypassing the tty layer entirely (pyOCD's
-#:    own udev guidance ships a ``SUBSYSTEM=="usb"`` rule for exactly this
-#:    reason -- the tty-only legacy rule above does not cover it).
-#: 3. Any ``hidraw*`` device node -- what pyOCD's CMSIS-DAP v1 (HID)
-#:    transport opens instead, on DAPLink firmware that negotiates HID
-#:    rather than WinUSB (also called out in pyOCD's own udev guidance).
-#:
-#: Covering all three means the same rule works regardless of which
-#: transport a given board's DAPLink firmware happens to negotiate, without
-#: this module needing to know that ahead of time.
-#:
-#: ``GROUP="plugdev"``/``MODE="0660"`` *and* ``TAG+="uaccess"`` are both
-#: written into every rule (not one or the other) -- see
-#: :func:`render_udev_rule`'s own docstring, "Decision: GROUP *and*
-#: TAG+=uaccess, not either alone", for why.
-_UDEV_RULE_TEMPLATE = """\
-# mbregistry -- non-root access to the micro:bit DAPLink interface
-# (VID:PID {vendor_id}:{product_id}). Written by `mbregistry install-service`
-# (ticket 008) -- re-running it overwrites this file with identical
-# content, so re-running install-service is idempotent. See
-# mbtools.registry.cli.render_udev_rule()'s docstring for why each rule
-# below grants access via both the {group} group and uaccess rather than
-# just one of the two.
-
-# CDC-ACM tty device node (mbserial, and pyOCD's DAPLink serial transport)
-SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{{idVendor}}=="{vendor_id}", ATTRS{{idProduct}}=="{product_id}", GROUP="{group}", MODE="0660", TAG+="uaccess"
-
-# Raw USB device node (CMSIS-DAP v2 / WinUSB transport, opened directly by pyOCD)
-SUBSYSTEM=="usb", ATTRS{{idVendor}}=="{vendor_id}", ATTRS{{idProduct}}=="{product_id}", GROUP="{group}", MODE="0660", TAG+="uaccess"
-
-# hidraw device node (CMSIS-DAP v1 / HID transport)
-KERNEL=="hidraw*", ATTRS{{idVendor}}=="{vendor_id}", ATTRS{{idProduct}}=="{product_id}", GROUP="{group}", MODE="0660", TAG+="uaccess"
-"""
-
-
-def render_udev_rule() -> str:
-    """The udev rule text :func:`cmd_install_service` writes to
-    :data:`DEFAULT_UDEV_RULE_PATH` (or ``--udev-output``) to grant the
-    operating (non-root) user access to the micro:bit DAPLink interface
-    (VID:PID ``0d28:0204``) -- sprint.md SUC-005/Decision 9, closing out
-    the issue this ticket completes
-    (``non-root-usb-access-and-pyocd-permission-hang.md``). See
-    :data:`_UDEV_RULE_TEMPLATE`'s own comment for what each of the three
-    match rules (tty/usb/hidraw) covers and why all three are needed.
-
-    **Decision: grant access via both ``GROUP="plugdev"`` and
-    ``TAG+="uaccess"``, not just one of the two** (the ticket's Description
-    frames this as a choice between the two -- this implementation makes
-    both, deliberately, rather than picking one):
-
-    - ``TAG+="uaccess"`` is systemd-logind's ACL mechanism: it grants the
-      user of the *active session on a seat* access the moment the rule is
-      (re-)applied, with no group-membership or relogin step at all. It's
-      the cleaner fit *when it works* -- but it is scoped to a seat's
-      active session, and the four Nolanet nodes this ticket targets
-      (CLAUDE.md's hardware test hosts table) are reached **only over
-      SSH**, with no local console/graphical seat for logind to track.  An
-      SSH session is not reliably assigned a seat, so relying on
-      ``uaccess`` alone risks silently granting nothing at all on exactly
-      the hosts this ticket exists for.
-    - ``GROUP="plugdev"``/``MODE="0660"`` has no seat/session dependency:
-      any process the operating user starts, in any session (including
-      SSH) opened *after* the group membership below takes effect, gets
-      access -- deterministic and reliable on a headless host. The one
-      cost is that a *newly added* group membership needs a fresh login
-      session to take effect in that session (standard Linux behavior for
-      any group-based grant, not specific to this rule) -- documented in
-      :func:`cmd_install_service`'s own printed follow-up instructions.
-
-    Writing both into the same rule costs nothing (they're independent
-    grant mechanisms; a udev rule can assign both) and means access works
-    immediately wherever ``uaccess`` happens to apply (e.g. a future
-    graphical/console login), while still working reliably on the
-    SSH-only hosts this ticket was written for once the printed
-    ``usermod``/relogin step is done.
-    """
-    return _UDEV_RULE_TEMPLATE.format(
-        vendor_id=_USB_VENDOR_ID, product_id=_USB_PRODUCT_ID, group=_UDEV_GROUP
-    )
 
 
 def cmd_install_service(args: argparse.Namespace) -> int:

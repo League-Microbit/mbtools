@@ -1,9 +1,14 @@
 ---
 id: '003'
 title: Linux systemd user/system install/uninstall/status + plugdev/udev
-status: open
-use-cases: [SUC-001, SUC-002, SUC-003, SUC-004]
-depends-on: ['001']
+status: done
+use-cases:
+- SUC-001
+- SUC-002
+- SUC-003
+- SUC-004
+depends-on:
+- '001'
 github-issue: ''
 issue: mbregistry-service-install-uninstall-user-system.md
 completes_issue: true
@@ -71,33 +76,33 @@ specifies.
 
 ## Acceptance Criteria
 
-- [ ] `render_systemd_unit`/`render_udev_rule` live in `service.py`; their
+- [x] `render_systemd_unit`/`render_udev_rule` live in `service.py`; their
       existing golden-file assertions (moved to
       `tests/registry/service/test_service_linux.py`) still pass unchanged
       for system scope.
-- [ ] A user-scope unit renders with no `RuntimeDirectory=`/
+- [x] A user-scope unit renders with no `RuntimeDirectory=`/
       `StateDirectory=`, `WantedBy=default.target`, and the correct
       `ExecStart=`.
-- [ ] `linux_install(scope="system", ...)` against a mocked runner calls
+- [x] `linux_install(scope="system", ...)` against a mocked runner calls
       `daemon-reload`, `enable --now`, `udevadm control --reload-rules`,
       `udevadm trigger`, and `usermod -aG plugdev <user>` — and the mock
       shows `usermod` was actually invoked, not merely printed (this is
       the ticket's key acceptance criterion distinguishing it from the old
       `install-service`).
-- [ ] `linux_install(scope="user", ...)` with a mocked "plugdev missing"
+- [x] `linux_install(scope="user", ...)` with a mocked "plugdev missing"
       precondition refuses to install, prints the exact `sudo` remediation
       commands, and returns a distinct nonzero result — and performs no
       writes and no `systemctl` calls when it refuses.
-- [ ] `linux_install(scope="user", ...)` with a mocked "plugdev present"
+- [x] `linux_install(scope="user", ...)` with a mocked "plugdev present"
       precondition writes the user unit and calls `systemctl --user
       daemon-reload`/`enable --now` and `loginctl enable-linger`.
-- [ ] `linux_uninstall` for both scopes stops/removes correctly, keeps
+- [x] `linux_uninstall` for both scopes stops/removes correctly, keeps
       `devices.db` unless `purge=True`, no-ops cleanly when nothing is
       installed (naming the other scope if applicable), and never calls
       `usermod` to remove `plugdev` membership.
-- [ ] `linux_status` reports not-installed / installed-not-running /
+- [x] `linux_status` reports not-installed / installed-not-running /
       installed-and-running correctly for both scopes.
-- [ ] No test invokes a real `systemctl`/`udevadm`/`usermod`/`loginctl`.
+- [x] No test invokes a real `systemctl`/`udevadm`/`usermod`/`loginctl`.
 
 ## Implementation Plan
 
@@ -133,3 +138,42 @@ golden-file tests and the new orchestration tests pass, with no real
 external command invoked.
 
 **Documentation updates**: None yet (ticket 004).
+
+## Implementation Notes
+
+- Extra fix (team-lead request, from the linked issue's own uninstall
+  text — "removes the plist/unit, ..., the socket and log files"):
+  `macos_uninstall` (ticket 006-002) and `linux_uninstall` (this ticket)
+  now also remove the scope's socket file
+  (`system_socket_path()`/`user_socket_path()`) unconditionally on every
+  real (non-`dry_run`) uninstall, not gated on `purge` — `devices.db`
+  remains the one thing kept unless `purge=True`. `macos_uninstall` also
+  removes the scope's log file (`_macos_log_path`). Linux has no
+  equivalent log *file* to remove — this module's systemd unit sets no
+  `StandardOutput=`/`StandardError=`, so `journald` captures output by
+  default and there is no file this module ever wrote to clean up; this
+  is documented in `linux_uninstall`'s own docstring rather than a
+  no-op removal call.
+- `render_systemd_unit`'s existing signature is extended with a
+  keyword-only `scope: str = "system"` parameter (default preserves
+  every pre-ticket call site's behavior unchanged) rather than adding a
+  parallel function, per the ticket's own suggestion.
+- `_resolve_operating_user`'s logic is duplicated (not imported) into
+  `registry.service` as `_resolve_linux_operating_user`, since
+  `registry.cli`'s copy still lives in `cli.py` and importing it from
+  `service.py` would invert sprint.md's `cli` → `service` dependency
+  direction (and would be a real circular import). Ticket 006-004 is
+  expected to consolidate the two copies by moving `cli.py`'s version
+  into `registry.service` and having `cli.py` import it back — the same
+  treatment already given to `render_systemd_unit`/`render_udev_rule`.
+- The `--user` preflight's "is the operating user in `plugdev`" check
+  (`_linux_user_in_plugdev`) uses `grp`/`pwd`, imported lazily inside the
+  function (not at module scope) so importing `registry.service` on
+  Windows — exercised by this ticket's own
+  `test_linux_functions_dont_depend_on_sys_platform` — never fails just
+  because this function exists.
+- `linux_install(scope="user", ...)`'s refusal path raises
+  `LinuxUserPreflightError` (a new, exported exception) rather than
+  returning an `int`/`Path` union — ticket 006-004's CLI wiring is
+  expected to catch it and turn it into the "distinct nonzero exit
+  code" this ticket's acceptance criteria call for.

@@ -72,12 +72,18 @@ def macos_paths(monkeypatch, tmp_path):
     system_db = tmp_path / "Library" / "Application Support" / "mbregistry" / "devices.db"
     monkeypatch.setattr(service_module, "system_db_path", lambda: system_db)
 
+    system_socket = tmp_path / "var" / "run" / "mbregistry" / "api.sock"
+    monkeypatch.setattr(service_module, "system_socket_path", lambda: system_socket)
+
     monkeypatch.setattr(service_module.os, "getuid", lambda: 501, raising=False)
 
     agent_plist = home / "Library" / "LaunchAgents" / "org.jointheleague.mbregistry.plist"
     agent_log = home / "Library" / "Logs" / "mbregistry.log"
     user_db = home / "Library" / "Application Support" / "mbregistry" / "devices.db"
     monkeypatch.setattr(service_module, "user_db_path", lambda: user_db)
+
+    user_socket = home / "Library" / "Application Support" / "mbregistry" / "api.sock"
+    monkeypatch.setattr(service_module, "user_socket_path", lambda: user_socket)
 
     class _Paths:
         pass
@@ -87,9 +93,11 @@ def macos_paths(monkeypatch, tmp_path):
     p.user_plist = agent_plist
     p.user_log = agent_log
     p.user_db = user_db
+    p.user_socket = user_socket
     p.system_plist = daemon_plist
     p.system_log = daemon_log
     p.system_db = system_db
+    p.system_socket = system_socket
     return p
 
 
@@ -283,6 +291,23 @@ def test_macos_uninstall_removes_plist_and_calls_bootout(macos_paths):
     domain = "gui/501"
     assert runner.calls == [["launchctl", "bootout", f"{domain}/{label}"]]
     assert str(macos_paths.user_plist) in message
+
+
+def test_macos_uninstall_removes_socket_and_log_files_when_not_purging(macos_paths):
+    macos_install("user", dry_run=False, runner=_FakeRunner())
+    macos_paths.user_socket.parent.mkdir(parents=True, exist_ok=True)
+    macos_paths.user_socket.write_text("")
+    # macos_install only creates the log file's *parent* directory (the
+    # file itself is created by launchd at first run, when it redirects
+    # the service's stdout/stderr there) -- write it directly here so
+    # this test can assert uninstall removes an existing one.
+    macos_paths.user_log.parent.mkdir(parents=True, exist_ok=True)
+    macos_paths.user_log.write_text("log output")
+
+    macos_uninstall("user", purge=False, runner=_FakeRunner())
+
+    assert not macos_paths.user_socket.exists()
+    assert not macos_paths.user_log.exists()
 
 
 def test_macos_uninstall_keeps_devices_db_without_purge(macos_paths):
