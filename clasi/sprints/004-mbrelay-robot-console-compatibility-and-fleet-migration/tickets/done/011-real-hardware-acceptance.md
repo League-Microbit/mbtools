@@ -1,7 +1,7 @@
 ---
 id: '011'
 title: Real-hardware acceptance
-status: in-progress
+status: done
 use-cases:
 - SUC-001
 - SUC-002
