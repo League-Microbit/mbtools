@@ -33,9 +33,18 @@ outright").
 
 **Ported unchanged from mbdeploy's ``console.py``**: :func:`send_command`
 and :func:`interact` (and the DTR/RTS-low half of ``open_port``, as
-:func:`_open_no_reboot`) -- both are already duck-typed against a
+:func:`open_no_reboot`) -- both are already duck-typed against a
 serial-like object per that module's own docstring, so zero lines of
 their own logic changed crossing into this module.
+
+**Shared with ``registry.remote_api`` (sprint 003, ticket 007)**:
+:func:`open_no_reboot` is a public, module-level function (not a
+``Session``/``connect()``-internal helper) precisely so
+``registry.remote_api``'s ``stream`` op can open the *server's own*
+local port the exact same "DTR/RTS held low, no reboot" way this
+module's local ``connect()`` does, rather than a second, drifting copy
+of the same four pyserial calls -- ticket 007's own acceptance criterion
+("reuse that helper rather than duplicating").
 
 **Session shape**: :class:`Session` forwards the same six members
 mbdeploy's ``remote.SocketSerial`` adapter exposes
@@ -73,10 +82,13 @@ __all__ = [
     "connect",
     "interact",
     "send_command",
+    "open_no_reboot",
     "BAUD_RATE",
     "DEFAULT_TIMEOUT",
     "OPEN_SETTLE",
     "IDLE_GAP",
+    "READ_TIMEOUT",
+    "BREAK_DURATION",
 ]
 
 #: Default serial baud rate -- mirrors today's ``mbdeploy``'s own
@@ -144,13 +156,18 @@ def _current_platform() -> str:
     return platform.system()
 
 
-def _open_no_reboot(factory: Callable[..., Any], port: str, baud: int, settle: float) -> Any:
+def open_no_reboot(factory: Callable[..., Any], port: str, baud: int, settle: float) -> Any:
     """Open ``port`` at ``baud`` with DTR/RTS held low, and let it settle.
 
     Ported unchanged from ``mbdeploy``'s ``console.open_port``: DAPLink
     resets the target when DTR is asserted, so the modem lines are
     cleared *before* the port is opened -- connecting to a robot must not
     reboot it (spec cross-cutting §4 / SUC-004's own main flow).
+
+    Public (not module-private) since ``registry.remote_api``'s ``stream``
+    op (sprint 003, ticket 007) calls this exact function to open its own
+    local port the same no-reboot way -- see the module docstring's
+    "Shared with registry.remote_api" note.
     """
     ser = factory(baudrate=baud, timeout=READ_TIMEOUT, dsrdtr=False, rtscts=False)
     ser.port = port
@@ -192,10 +209,10 @@ def _reset_via_reopen(
 
     A plain reopen *does* reset a DAPLink target on macOS (spec
     cross-cutting §4) -- but only if the reopen is allowed to toggle DTR
-    the ordinary way, which is exactly what :func:`_open_no_reboot`
+    the ordinary way, which is exactly what :func:`open_no_reboot`
     deliberately suppresses. So this reopens with pyserial's own
     defaults (no DTR/RTS preset before ``open()``), not via
-    :func:`_open_no_reboot`, then returns the line state to the held-low
+    :func:`open_no_reboot`, then returns the line state to the held-low
     idle default once the reset has happened -- the reset is a one-time
     act, not the ongoing line state a caller's session should see.
     """
@@ -427,7 +444,7 @@ def connect(
     # -- 3. open, then reset if asked -- unlock on any failure here so the
     # lock this call just took is never leaked on an open/reset failure.
     try:
-        ser = _open_no_reboot(factory, port, baud, settle)
+        ser = open_no_reboot(factory, port, baud, settle)
         if reset:
             if active_platform == "Linux":
                 ser = _reset_via_break(ser, port, BREAK_DURATION, reset_settle)
