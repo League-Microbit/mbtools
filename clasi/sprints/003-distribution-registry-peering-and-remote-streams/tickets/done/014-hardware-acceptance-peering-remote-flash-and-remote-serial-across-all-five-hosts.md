@@ -2,7 +2,7 @@
 id: '014'
 title: 'Hardware acceptance: peering, remote flash, and remote serial across all five
   hosts'
-status: in-progress
+status: done
 use-cases:
 - SUC-001
 - SUC-002

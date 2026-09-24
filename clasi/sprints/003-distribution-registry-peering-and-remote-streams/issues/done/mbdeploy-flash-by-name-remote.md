@@ -1,5 +1,5 @@
 ---
-status: in-progress
+status: done
 split_from: mbdeploy-flash-by-name-via-mbregistry.md
 sprint: '003'
 tickets:

@@ -1,5 +1,5 @@
 ---
-status: in-progress
+status: done
 split_from: mbserial-raw-serial-access-local-or-remote.md
 sprint: '003'
 tickets:
