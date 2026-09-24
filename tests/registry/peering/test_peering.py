@@ -207,12 +207,13 @@ def test_resolve_address_empty_when_nothing_available():
 # ---------------------------------------------------------------------------
 
 
-def _listener(store, *, own_address="192.168.1.149", own_port=7440):
+def _listener(store, *, own_address="192.168.1.149", own_port=7440, own_host=None):
     return peering_mod._BrowseListener(
         store=store,
         service_type=SERVICE_TYPE,
         own_address=own_address,
         own_port=own_port,
+        own_host=own_host,
     )
 
 
@@ -235,6 +236,33 @@ def test_add_service_excludes_own_advertisement(store):
     listener.add_service(_StaticZc(info), SERVICE_TYPE, "loki." + SERVICE_TYPE)
 
     assert store.list_peers() == []
+
+
+def test_add_service_excludes_own_advertisement_by_hostname_even_when_address_differs(store):
+    # Ticket 014's hardware pass (docs/acceptance/003-hardware.md): a
+    # multi-homed host (eth0 + wlan0 on the same LAN, the Nolanet nodes'
+    # actual configuration) advertises its own service on one address
+    # but a browsing zeroconf instance resolving that *same* service back
+    # can hand back the *other* interface's address -- so the old
+    # address+port-only check silently failed to recognize the host's
+    # own advertisement, and the host peered with itself. Here, "hodr"
+    # discovers a service named "hodr" (its own name) resolving to an
+    # address that does NOT match its own_address -- reproducing exactly
+    # that mismatch -- and the hostname check must still exclude it.
+    on_ready_calls = []
+    listener = _listener(
+        store,
+        own_address="192.168.2.148",
+        own_port=7440,
+        own_host="hodr",
+    )
+    listener._on_peer_ready = on_ready_calls.append
+    info = _make_info(address="192.168.1.148", port=7440, server="hodr.local.")
+
+    listener.add_service(_StaticZc(info), SERVICE_TYPE, "hodr." + SERVICE_TYPE)
+
+    assert store.list_peers() == []
+    assert on_ready_calls == []
 
 
 def test_add_service_does_not_exclude_a_peer_sharing_only_the_address(store):

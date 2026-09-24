@@ -447,6 +447,41 @@ class _BrowseListener:
     discovered TXT record's ``pub_port``/``snapshot_port`` both parse --
     this is :meth:`PeerDiscovery.connect_peer`, wired by
     :meth:`PeerDiscovery.start`.
+
+    **Self-filtering, two checks (ticket 014's hardware pass found the
+    address/port check alone insufficient).** A multi-homed host --
+    ``eth0``/``wlan0`` both up on the same LAN, an ordinary Nolanet-node
+    configuration -- advertises its own service with exactly one address
+    (``PeerDiscovery``'s own ``_local_ip()`` pick, fixed for the process's
+    life), but a *browsing* ``zeroconf`` instance resolving that same
+    service back can hand ``_resolve_address`` a *different* one of the
+    host's own addresses (observed: the browse side's
+    ``parsed_addresses()[0]`` came back as the other interface's IP, not
+    the one actually registered) -- so ``address == self._own_address``
+    silently fails to match and the host connects to *itself* as a peer.
+    That is not a harmless no-op: the self-directed snapshot/event
+    application (``_apply_snapshot_device``/``_apply_event``, both keyed
+    by the discovered service's *name*, which for a self-connection is
+    this host's own name) re-tags this host's own local device rows with
+    ``host = <this host's own name>`` instead of leaving them ``NULL`` --
+    and since the local daemon's own next attach-scan cycle (``store.
+    upsert_attached``, ``host`` always ``NULL``) races the same rows
+    against the self-peering link's re-tagging on every subsequent event,
+    the two fight indefinitely and the device flickers between "local"
+    and "owned by a peer that is actually itself", permanently hiding it
+    from ``store.snapshot_local_devices()`` (``WHERE host IS NULL``)
+    roughly half the time -- which is what a *newly joining* real peer's
+    snapshot request can land on, receiving an empty list for a host that
+    demonstrably has a device attached. Fixed by comparing the
+    discovered service's bare hostname (``_peer_host_from_name``, parsed
+    from the mDNS instance name itself, never re-derived from a
+    resolved address) against this instance's own ``host`` -- identity
+    that does not depend on which interface answered. The address/port
+    check is kept as a second guard (harmless, and still correct for a
+    single-homed host), not removed, so a caller that does not pass
+    ``own_host`` -- ``tests/registry/peering/test_peering.py``'s own
+    ``_listener`` fixture, deliberately left unchanged -- still filters
+    correctly by address alone, same as before this fix.
     """
 
     def __init__(
@@ -456,6 +491,7 @@ class _BrowseListener:
         service_type: str,
         own_address: str,
         own_port: int,
+        own_host: str | None = None,
         resolve_timeout_ms: int = _DEFAULT_RESOLVE_TIMEOUT_MS,
         on_peer_ready: Callable[[str, str, int, int], None] | None = None,
     ) -> None:
@@ -463,6 +499,7 @@ class _BrowseListener:
         self._service_type = service_type
         self._own_address = own_address
         self._own_port = own_port
+        self._own_host = own_host
         self._resolve_timeout_ms = resolve_timeout_ms
         self._on_peer_ready = on_peer_ready
 
@@ -487,10 +524,16 @@ class _BrowseListener:
         pass
 
     def _record(self, name: str, info: Any) -> None:
+        host = _peer_host_from_name(name, self._service_type)
+        if self._own_host is not None and host == self._own_host:
+            return  # this instance's own advertisement -- never a peer of itself
         address = _resolve_address(info)
         port = getattr(info, "port", None)
         if address == self._own_address and port == self._own_port:
-            return  # this instance's own advertisement -- never a peer of itself
+            return  # same check, by address/port -- kept as a second guard
+            # for a caller that doesn't pass own_host (e.g. an older test
+            # fixture); see the hostname check above for why address/port
+            # alone is not reliable enough on its own.
         txt = _decode_txt(getattr(info, "properties", None))
         remote_port_str = txt.get(TXT_REMOTE_PORT)
         if not address or not remote_port_str:
@@ -510,7 +553,6 @@ class _BrowseListener:
                 remote_port_str,
             )
             return
-        host = _peer_host_from_name(name, self._service_type)
         endpoint = f"{address}:{remote_port_str}"
         self._store.record_peer_seen(host, endpoint)
 
@@ -867,6 +909,7 @@ class PeerDiscovery:
             service_type=self._service_type,
             own_address=self._advertise_address,
             own_port=self._remote_port,
+            own_host=self._host,
             on_peer_ready=self.connect_peer,
         )
         self._browser = self._zc_module.ServiceBrowser(

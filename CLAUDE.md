@@ -9,9 +9,17 @@ This project uses the CLASI SE process. **You are the CLASI team-lead** — the 
 # Hardware test targets
 
 There are **no micro:bits on the development Mac** (they lock it up — which is
-why mbtools exists). Test on these hosts over SSH (`ssh <host>`, user `eric`,
-passwordless sudo, internet access). Each has exactly one micro:bit dedicated
-to mbtools testing; you may flash them freely.
+why mbtools exists) — though ticket 014's hardware pass found one physically
+attached during that session (a real `BBC micro:bit CMSIS-DAP` device,
+`ioreg`-visible, likely left plugged in from unrelated work rather than a
+permanent fixture); if you see one too, don't assume it's gone by the next
+session. `mbregistry`'s own USB scan/probe is read-only enough not to need
+`pyocd`/lock up the Mac just from a zero-device registry running there (see
+"Peering ports" below), but this doesn't change the general guidance: don't
+rely on the dev Mac having a board, and don't `mbdeploy deploy`/`mbdeploy
+debug` (pyOCD) against it. Test on these hosts over SSH (`ssh <host>`, user
+`eric`, passwordless sudo, internet access). Each has exactly one micro:bit
+dedicated to mbtools testing; you may flash them freely.
 
 | Host | Platform | Board port | Notes |
 |---|---|---|---|
@@ -39,7 +47,74 @@ Local (client-side) pyOCD/serial access on the Nolanet nodes needs `sudo`:
 tty access to a non-root user on these hosts, so `mbdeploy deploy`/`debug`
 and `mbserial` all need `sudo` there (same reason `mbregistry.service`
 itself runs as root). Not needed on `braeburn` (macOS). See
-`docs/acceptance/002-hardware.md` for where this was confirmed.
+`docs/acceptance/002-hardware.md` for where this was confirmed, and
+`docs/acceptance/003-hardware.md` (sprint 003) for confirmation this is
+*still* true and **unaffected by any of sprint 003's remote-transport
+commands** — a client-side `mbdeploy deploy`/`mbserial` targeting a
+*peer-owned* device never opens a local port or pyOCD session at all (the
+flash/serial I/O runs on the *owning* host's already-root
+`mbregistry.service`), so remote invocations need no `sudo` on the
+*client* host regardless of platform.
+
+## Peering ports (sprint 003)
+
+Every `mbregistry.service` on the garage LAN advertises and browses
+`_mbregistry._tcp.local.` (mDNS) and listens on three plain unprivileged
+TCP ports — **7440** (remote control-plane API), **7442** (ZeroMQ peering
+PUB/event bus), **7443** (ZeroMQ peering snapshot REQ/REP) — always on, not
+flag-gated (`mbregistry run --remote-port`/`--peer-pub-port`/
+`--peer-snapshot-port` override the defaults; every host here is left at
+them). All three, plus mDNS's own UDP 5353, must be reachable *between*
+hosts for peering/remote flash/remote serial to work — confirmed
+reachable with no host firewall in the way on all five hosts as of ticket
+014's pass (no `ufw`, no relevant `iptables` rule, macOS Application
+Firewall disabled on `braeburn`); if a future session finds peering not
+converging, check for a firewall before suspecting the code.
+
+**Known real-hardware quirk, already fixed (ticket 014):** all four
+Nolanet nodes are dual-homed (`eth0` *and* `wlan0` up on the same LAN).
+`mbregistry`'s self-filter used to compare only the discovered service's
+*resolved address* against this host's own advertised address, which a
+multi-homed host's own mDNS self-discovery can defeat (the browsing side
+can resolve the *other* interface's address for the same service) — the
+host would peer with itself, silently corrupting its own device rows.
+Fixed by also comparing the discovered service's *hostname*; see
+`src/mbtools/registry/peering.py`'s `_BrowseListener` docstring and
+`docs/acceptance/003-hardware.md` for the full story. Not expected to
+recur, but if a `mbregistry list` on a host ever shows its *own* board
+tagged with its *own* hostname instead of `local`, this is the first
+thing to suspect.
+
+**Known real-hardware quirk, not root-caused (ticket 014):** `braeburn`'s
+mDNS advertisement was not seen by any Linux host's `mbregistry` this
+session (confirmed at the raw-multicast level: `avahi-browse -r
+_mbregistry._tcp -t` on a Nolanet node never lists `braeburn`, though Apple's
+own `dns-sd -B` sees it fine Mac-to-Mac), and separately `braeburn`'s own
+daemon could not complete an outbound snapshot request to *any* peer
+(mDNS-discovered or explicit `--peer`, by hostname or by raw IP) even though
+a bare script on the same machine, same venv, doing the identical connect
+succeeds in well under 100ms every time, and other hosts' `--peer
+braeburn:7440` reliably reaches *it*. Three hypotheses were tried and
+refuted (see `docs/acceptance/003-hardware.md`'s own writeup); not
+root-caused this session. **Workaround**: `--peer braeburn:7440` (or the raw
+IP) from a Linux node's `mbregistry run` reliably brings `braeburn`'s device
+into that node's view; not applied as a permanent config change, so check
+`docs/acceptance/003-hardware.md` before assuming any host currently has it
+set.
+
+**Known real-hardware quirk, not a code bug:** the Nolanet nodes' Pi USB
+host controller (`dwc_otg`) logs intermittent `Timed out waiting for FSM
+NP transfer to complete` warnings (`dmesg`) and correspondingly flaps a
+board's `mbregistry list` STATE between its real value and `gone` every
+few seconds, independent of any lock/peering activity — confirmed via
+`dmesg` timestamps lining up with the flapping, present on every Nolanet
+node tested, not something `mbtools` causes or can route around from
+userspace. Expect it; don't read a transient "gone" (or a table row that
+doesn't show an active lock because ``STATE_DISCONNECTED`` renders as
+"gone" before the lock check) as a real detach or a lock bug without
+cross-checking `dmesg` and/or `mbregistry list --json`'s `lock_kind`/
+`remote_lock_kind` fields, which aren't subject to the table's same
+"gone wins" precedence.
 
 ## Firmware for tests (GitHub release assets — use `MICROBIT.hex`)
 
