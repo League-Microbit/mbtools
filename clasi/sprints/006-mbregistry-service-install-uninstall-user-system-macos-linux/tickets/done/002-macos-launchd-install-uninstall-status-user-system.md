@@ -1,9 +1,14 @@
 ---
 id: '002'
 title: macOS launchd install/uninstall/status (user + system)
-status: open
-use-cases: [SUC-001, SUC-002, SUC-003, SUC-004]
-depends-on: ['001']
+status: done
+use-cases:
+- SUC-001
+- SUC-002
+- SUC-003
+- SUC-004
+depends-on:
+- '001'
 github-issue: ''
 issue:
 - macos-default-socket-path-needs-a-user-writable-location.md
@@ -64,29 +69,29 @@ launchd plist" ask.
 
 ## Acceptance Criteria
 
-- [ ] `render_launchd_plist` (or its two variants) produces XML matching
+- [x] `render_launchd_plist` (or its two variants) produces XML matching
       `docs/service.md` §7's `Label`/`ProgramArguments`/`KeepAlive`/
       `ThrottleInterval`/log-path directives, for both LaunchAgent and
       LaunchDaemon scope, golden-file tested.
-- [ ] `macos_install(scope="user", dry_run=False, runner=<mock>)` writes
+- [x] `macos_install(scope="user", dry_run=False, runner=<mock>)` writes
       the plist to the ticket-001 path and calls the mocked runner with
       the expected `launchctl enable`/`bootstrap` commands, in that order.
       Same for `scope="system"`.
-- [ ] `dry_run=True` writes nothing, runs nothing, and the mock records no
+- [x] `dry_run=True` writes nothing, runs nothing, and the mock records no
       calls (or the runner's dry-run mode records "would run" text
       instead — match ticket 001's seam).
-- [ ] Re-running install with the same mocked runner (simulating "already
+- [x] Re-running install with the same mocked runner (simulating "already
       loaded") does not raise and results in the same end state (idempotent
       sequence, e.g. bootout-then-bootstrap or an equivalent safe pattern).
-- [ ] `macos_uninstall` removes the plist and calls `launchctl bootout`;
+- [x] `macos_uninstall` removes the plist and calls `launchctl bootout`;
       keeps `devices.db` unless `purge=True`; is a no-op (no error) when
       nothing is installed at that scope, and its message names the other
       scope if that one has an install.
-- [ ] `macos_status` correctly reports "not installed", "installed but not
+- [x] `macos_status` correctly reports "not installed", "installed but not
       running", and "installed and running" for both scopes, driven
       entirely through a mocked runner (no real `launchctl` call anywhere
       in this ticket's tests).
-- [ ] No test in this ticket runs on a non-macOS assumption implicitly —
+- [x] No test in this ticket runs on a non-macOS assumption implicitly —
       force the platform branch via monkeypatch the same way
       `tests/registry/cli/test_cli_install_service.py` already does for
       the Linux branch, so these tests run and pass on Linux/Windows CI
