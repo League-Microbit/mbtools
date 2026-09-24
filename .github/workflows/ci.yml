@@ -54,4 +54,14 @@ jobs:
         # grouped-dots-per-file default, which hid every failing test's
         # actual name behind an unlabeled `F`/`E` in the windows-latest
         # investigation this fixed) so a failure names its own test.
-        run: uv run pytest -v --tb=short -ra --timeout=60
+        #
+        # scripts/run_tests_ci.py, not a bare `pytest` invocation: see
+        # that script's own docstring -- pytest itself finished this
+        # suite in ~132s on windows-latest, but the job then sat idle
+        # for another ~18 minutes (killed by timeout-minutes) waiting on
+        # Python's normal interpreter shutdown. The wrapper forces an
+        # immediate os._exit() with pytest's own exit code the moment
+        # pytest.main() returns, sidestepping that shutdown hang instead
+        # of relying on timeout-minutes as anything but a last-resort
+        # backstop.
+        run: uv run python scripts/run_tests_ci.py -v --tb=short -ra --timeout=60
