@@ -1,7 +1,7 @@
 ---
-id: '008'
+id: 008
 title: Migration runbook (docs/migration.md)
-status: open
+status: done
 use-cases:
 - SUC-004
 depends-on:
@@ -70,20 +70,20 @@ reconstruct any of the reasoning from sprint history.
 
 ## Acceptance Criteria
 
-- [ ] `docs/migration.md` exists and covers every bullet in the Approach
+- [x] `docs/migration.md` exists and covers every bullet in the Approach
       section above: prerequisites, cut-over order (`torture` last),
       per-host retirement + install procedure, rollback, and exact
       paste-ready wiki text.
-- [ ] The document explicitly states this sprint did not execute any
+- [x] The document explicitly states this sprint did not execute any
       part of the runbook against a production host.
-- [ ] The per-host retirement commands match what
+- [x] The per-host retirement commands match what
       `docs/acceptance/001-hardware.md` already used and verified on the
       four Nolanet test nodes (no invented command sequence).
-- [ ] The robot-console verification step references the specific
+- [x] The robot-console verification step references the specific
       contract (`_mbrelay._tcp`/`registry=`/`/names`) and points at
       `docs/acceptance/004-hardware.md`'s Scenario 4 as the template,
       rather than restating it from scratch with room to drift.
-- [ ] The document names `docs/migration.md`'s own tooling dependency
+- [x] The document names `docs/migration.md`'s own tooling dependency
       (ticket 007's script/role) by path, so the stakeholder isn't left
       to guess which tool to run.
 
@@ -106,3 +106,45 @@ reconstruct any of the reasoning from sprint history.
   `docs/acceptance/004-hardware.md` by section rather than duplicating
   their content wholesale, so this document doesn't drift from the
   hardware evidence those two already recorded.
+
+### Deviation from this ticket's original framing: `torture` is recorded as already done, not "last"
+
+By the time this ticket was implemented, `torture` — the fleet's one
+relay host at sprint start, and the host this ticket's own text
+originally had in mind for the "cut-over order: ... `torture` last"
+bullet — had already been cut over to `mbregistry` during this sprint
+(ticket 007, with the ownership-race bug that surfaced during that
+cutover then fixed by ticket 011 and hardware-verified on `torture`
+itself). `docs/migration.md` therefore does not tell the stakeholder to
+migrate `torture` last as a future step; it records `torture`'s cutover
+as **already done**, with its own rollback recipe, and restates the
+"any relay host, migrate it last, verify robot-console first" rule as
+general guidance for any *other* relay host the stakeholder might
+encounter in the rest of the fleet, using `torture` as the worked
+example. This matches this sprint's own `sprint.md` (Problem section,
+mid-sprint amendment) and ticket 007's Implementation Notes, both of
+which record `torture` as migrated, not pending.
+
+`docs/migration.md` also flags one small provenance discrepancy for
+accuracy: `sprint.md`'s own amendment describes `torture`'s cutover as
+having happened "outside this sprint, by the stakeholder's own action,"
+but ticket 007's own hardware-verified Implementation Notes show
+`scripts/deploy-host.sh torture`'s first run performing the actual
+stop/disable of the legacy service and the `mbregistry` install, during
+this sprint. `docs/migration.md` follows ticket 007's record as ground
+truth (command-level, hardware-confirmed) and says so explicitly, rather
+than silently picking one account.
+
+Consequence for the per-host retirement commands: this ticket's own
+Approach text pointed at `docs/acceptance/001-hardware.md`'s "Old
+`mbdeploy` retirement" section, which deleted the old unit file and
+`/home/jtl/mbdeploy` outright (`rm -rf`, no rollback path — fine for
+four low-risk dedicated test hosts). This ticket's own Rollback bullet
+requires the old units still be re-enable-able until the new install is
+confirmed healthy, which the sprint-001 precedent doesn't satisfy as
+written. `docs/migration.md` resolves this by reusing the *same*
+stop/disable commands from that precedent but deliberately not deleting
+the unit file/directory immediately — deletion is left as optional,
+stakeholder-timed cleanup, documented as a deliberate generalization
+from the sprint-001 precedent (not an invented command sequence: the
+stop/disable commands themselves are identical).
