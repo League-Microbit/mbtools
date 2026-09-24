@@ -309,6 +309,32 @@ def test_remote_one_shot_message_prints_reply_lines(
     _wait_until(lambda: owning_locks.status(uid) is None)
 
 
+@pytest.mark.requires_af_unix
+def test_remote_name_at_host_target_reaches_the_owning_host(
+    local_server, local_store, remote_server, owning_store, owning_locks, capsys
+):
+    """``tovez@loki`` resolves locally, but the owning host holds the board
+    as a local device (no ``host``), so the ``@loki`` suffix means nothing
+    there -- the remote branch must ask for the resolved uid instead."""
+    def _factory(**kw):
+        return FakeSerial(announcement="OK 42", announcement_after_writes=1, **kw)
+
+    srv = remote_server(serial_factory=_factory)
+    uid = _uid("nameathost")
+    _seed_owned_device(owning_store, uid)
+    _seed_remote_device(local_store, uid, "loki", f"127.0.0.1:{srv.bound_port}")
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli_mod.main(
+            ["tovez@loki", "PING", "--socket", str(local_server.socket_path),
+             "--timeout", "1.0"]
+        )
+
+    assert excinfo.value.code == EXIT_OK
+    assert "OK 42" in capsys.readouterr().out
+    _wait_until(lambda: owning_locks.status(uid) is None)
+
+
 # ---------------------------------------------------------------------------
 # --reset: sends a BREAK frame over the wire, resetting the owning port
 # ---------------------------------------------------------------------------

@@ -169,7 +169,7 @@ def _run_connect_remote(device: dict, host: str, args: argparse.Namespace) -> in
         with RemoteRegistryClient(remote_host, remote_port) as remote_client:
             try:
                 session = remote_connect.connect(
-                    remote_client, args.target, reset=args.reset
+                    remote_client, device["uid"], reset=args.reset
                 )
             except DeviceLockedError as exc:
                 holder = exc.holder or {}
