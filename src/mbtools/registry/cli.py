@@ -73,7 +73,7 @@ from mbtools.registry.client import (
     RegistryUnavailable,
 )
 from mbtools.registry.client import SOCKET_ENV_VAR as _SOCKET_ENV_VAR
-from mbtools.registry.client import resolve_local_api_address
+from mbtools.registry.client import find_local_api_address, resolve_local_api_address
 from mbtools.registry.console_compat.names_api import NamesAPI
 from mbtools.registry.console_compat.relay_pool import (
     DEFAULT_NAMES_API_PORT,
@@ -295,7 +295,7 @@ def cmd_list(args: argparse.Namespace) -> int:
     :class:`~mbtools.registry.client.RegistryClient`'s own new pipe
     transport -- everywhere else, unchanged.
     """
-    socket_path = _resolve_local_api_address(args.socket, _SOCKET_ENV_VAR)
+    socket_path = find_local_api_address(args.socket, _SOCKET_ENV_VAR)
 
     try:
         with RegistryClient(socket_path) as client:

@@ -134,7 +134,7 @@ from mbtools.registry.client import (
     RegistryUnavailable,
 )
 from mbtools.registry.client import SOCKET_ENV_VAR as _SOCKET_ENV_VAR
-from mbtools.registry.client import resolve_local_api_address
+from mbtools.registry.client import find_local_api_address
 from mbtools.registry.remote_client import RemoteRegistryClient
 from mbtools.registry.render import render_json, render_table
 
@@ -499,7 +499,7 @@ def cmd_deploy(args: argparse.Namespace) -> int:
     connection -- never reconnect mid-flow), and hand off to
     :func:`_run_deploy`.
     """
-    socket_path = resolve_local_api_address(args.socket, _SOCKET_ENV_VAR)
+    socket_path = find_local_api_address(args.socket, _SOCKET_ENV_VAR)
     try:
         with RegistryClient(socket_path) as client:
             return _run_deploy(client, args)
@@ -529,7 +529,7 @@ def cmd_list(args: argparse.Namespace) -> int:
     ``EXIT_NO_DAEMON`` error ``mbregistry list`` already gives, not a
     stack trace.
     """
-    socket_path = resolve_local_api_address(args.socket, _SOCKET_ENV_VAR)
+    socket_path = find_local_api_address(args.socket, _SOCKET_ENV_VAR)
     try:
         with RegistryClient(socket_path) as client:
             devices = client.list()
@@ -698,7 +698,7 @@ def cmd_debug(args: argparse.Namespace) -> int:
     taken on this connection must be released, or reported, on this same
     connection), and hand off to :func:`_run_debug`.
     """
-    socket_path = resolve_local_api_address(args.socket, _SOCKET_ENV_VAR)
+    socket_path = find_local_api_address(args.socket, _SOCKET_ENV_VAR)
     try:
         with RegistryClient(socket_path) as client:
             return _run_debug(client, args)

@@ -702,6 +702,6 @@ def test_cli_resolves_windows_pipe_name_with_no_socket_override(monkeypatch):
 
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.delenv("MBREGISTRY_SOCKET", raising=False)
-    result = cli_mod.resolve_local_api_address(None, cli_mod._SOCKET_ENV_VAR)
+    result = cli_mod.find_local_api_address(None, cli_mod._SOCKET_ENV_VAR)
     assert result == r"\\.\pipe\mbregistry"
     assert isinstance(result, str)

@@ -427,8 +427,10 @@ def test_resolve_socket_path_env_var_used_when_no_flag(monkeypatch):
 def test_resolve_socket_path_default_when_neither_given(monkeypatch):
     from mbtools.registry.client import SOCKET_ENV_VAR, resolve_socket_path
 
+    from mbtools.registry.api import DEFAULT_SOCKET_PATH
+
     monkeypatch.delenv(SOCKET_ENV_VAR, raising=False)
-    assert resolve_socket_path(None) == Path("/run/mbregistry/api.sock")
+    assert resolve_socket_path(None) == DEFAULT_SOCKET_PATH
 
 
 # ---------------------------------------------------------------------------
@@ -517,8 +519,10 @@ def test_resolve_local_api_address_off_windows_default_when_neither_given(monkey
     from mbtools.registry.client import resolve_local_api_address
 
     monkeypatch.delenv("MBREGISTRY_SOCKET", raising=False)
+    from mbtools.registry.paths import default_socket_path
+
     result = resolve_local_api_address(None, "MBREGISTRY_SOCKET")
-    assert result == Path("/run/mbregistry/api.sock")
+    assert result == default_socket_path()
 
 
 # ---------------------------------------------------------------------------

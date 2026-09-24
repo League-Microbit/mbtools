@@ -64,8 +64,10 @@ def test_schema_created_on_first_use(tmp_path):
         "test's subject is the non-Windows default specifically"
     ),
 )
-def test_default_db_path_is_var_lib_mbregistry():
-    assert str(store_mod.DEFAULT_DB_PATH) == "/var/lib/mbregistry/devices.db"
+def test_default_db_path_comes_from_registry_paths():
+    from mbtools.registry.paths import default_db_path
+
+    assert store_mod.DEFAULT_DB_PATH == default_db_path()
 
 
 def test_reopening_existing_db_does_not_lose_data(tmp_path):

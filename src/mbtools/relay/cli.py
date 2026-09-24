@@ -108,7 +108,7 @@ from mbtools.registry.client import (
     RegistryUnavailable,
 )
 from mbtools.registry.client import SOCKET_ENV_VAR as _SOCKET_ENV_VAR
-from mbtools.registry.client import resolve_local_api_address
+from mbtools.registry.client import find_local_api_address
 from mbtools.registry.locks import KIND_RELAY
 from mbtools.registry.remote_client import RemoteRegistryClient
 from mbtools.relay import naming
@@ -587,7 +587,7 @@ def cmd_connect(args: argparse.Namespace) -> int:
         print(f"mbrelay: {exc}", file=sys.stderr)
         return EXIT_USAGE
 
-    socket_path = resolve_local_api_address(args.socket, _SOCKET_ENV_VAR)
+    socket_path = find_local_api_address(args.socket, _SOCKET_ENV_VAR)
     try:
         with RegistryClient(socket_path) as client:
             return _run_connect(client, target, args)
@@ -609,7 +609,7 @@ def cmd_connect(args: argparse.Namespace) -> int:
 
 
 def _with_client(args: argparse.Namespace, body):
-    socket_path = resolve_local_api_address(args.socket, _SOCKET_ENV_VAR)
+    socket_path = find_local_api_address(args.socket, _SOCKET_ENV_VAR)
     try:
         with RegistryClient(socket_path) as client:
             return body(client)

@@ -99,7 +99,7 @@ from mbtools.common import (
 )
 from mbtools.registry.api import DEFAULT_SOCKET_PATH
 from mbtools.registry.api_windows import _PipeLineReader, _PipeWriter, _Win32PipeAPI
-from mbtools.registry.paths import default_pipe_name
+from mbtools.registry.paths import default_pipe_name, find_client_socket
 
 __all__ = [
     "RegistryClient",
@@ -112,6 +112,7 @@ __all__ = [
     "DEFAULT_SOCKET_PATH",
     "resolve_socket_path",
     "resolve_local_api_address",
+    "find_local_api_address",
 ]
 
 #: Mirrors ``registry.cli``'s pre-extraction ``_SOCKET_ENV_VAR`` exactly —
@@ -198,6 +199,29 @@ def resolve_local_api_address(
             return env_value
         return default_pipe_name()
     return resolve_socket_path(flag_value, env_var, DEFAULT_SOCKET_PATH)
+
+
+def find_local_api_address(
+    flag_value: str | None, env_var: str = SOCKET_ENV_VAR
+) -> str | Path:
+    """Client-side counterpart of :func:`resolve_local_api_address`:
+    ``flag_value`` wins, then ``$env_var``, then whichever daemon is
+    actually running — this user's own per-user daemon first, then the
+    system (root/systemd) daemon (:func:`~mbtools.registry.paths
+    .find_client_socket`). Every client command (``mbregistry list``,
+    ``mbdeploy``, ``mbserial``, ``mbrelay``) resolves through this, so a
+    normal user reaches a root daemon with no flags. ``mbregistry run``
+    itself keeps :func:`resolve_local_api_address`, since a daemon binds
+    its own default rather than looking for another one.
+    """
+    if sys.platform == "win32":
+        return resolve_local_api_address(flag_value, env_var)
+    if flag_value:
+        return Path(flag_value)
+    env_value = os.environ.get(env_var)
+    if env_value:
+        return Path(env_value)
+    return find_client_socket()
 
 
 # ---------------------------------------------------------------------------

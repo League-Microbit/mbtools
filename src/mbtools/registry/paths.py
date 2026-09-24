@@ -1,27 +1,32 @@
 """mbtools.registry.paths — the one place that knows where ``mbregistry``'s
-on-disk/OS-namespace state lives, per platform.
+on-disk/OS-namespace state lives, per platform and per privilege level.
 
-Per sprint.md's Architecture (module "paths", Step 2 responsibility #2),
-today's ``registry.store.DEFAULT_DB_PATH`` and ``registry.api
-.DEFAULT_SOCKET_PATH`` were Linux-path literals; Windows needs
-``ProgramData``-rooted equivalents (brief §9.2, spec Open decision #2)
-and a named-pipe name (which has no filesystem path at all — it lives in
-the ``\\\\.\\pipe\\`` namespace). This module centralizes that
-platform dispatch so it exists in exactly one place rather than being
-duplicated across ``store``, ``api``, ``api_windows``, and
-``service_windows``.
+``mbregistry run`` must work with no flags however it is started:
 
-**ASSUMPTION, not a ratified decision**: the Windows ``%ProgramData%``
-root for ``default_db_path()`` (and the fixed pipe name for
-``default_pipe_name()``) are this sprint's best guess at the right
-Windows-native locations, per the brief's own open decision #2. They are
-flagged here and restated in ``docs/migration.md`` for stakeholder
-confirmation before any real Windows node is provisioned from them — do
-not treat these as settled production paths.
+=========================  =========================================  ==========================================
+                           database                                   local API socket
+=========================  =========================================  ==========================================
+Linux, root (systemd)      ``/var/lib/mbregistry/devices.db``         ``/run/mbregistry/api.sock``
+Linux, normal user         ``$XDG_STATE_HOME/mbregistry/devices.db``  ``$XDG_RUNTIME_DIR/mbregistry/api.sock``
+                           (default ``~/.local/state``)               (fallback ``~/.cache/mbregistry/api.sock``)
+macOS, root                ``/Library/Application Support/            ``/var/run/mbregistry/api.sock``
+                           mbregistry/devices.db``
+macOS, normal user         ``~/Library/Application Support/           ``~/Library/Application Support/
+                           mbregistry/devices.db``                    mbregistry/api.sock``
+Windows                    ``%ProgramData%\\mbregistry\\devices.db``    named pipe ``\\\\.\\pipe\\mbregistry``
+=========================  =========================================  ==========================================
 
-This module does no I/O and has no dependency on ``pyserial`` or any
-other platform-specific library — pure path/string computation — so
-(unlike ``usbwatch``/``identity``) it needs no lazy-import guard.
+The daemon uses the location matching the user it runs as. Client tools
+(``mbregistry list``, ``mbdeploy``, ``mbserial``, ``mbrelay``) must find
+whichever daemon is running, so they try :func:`client_socket_candidates`
+in order: your own per-user daemon first, then the system daemon. That way
+a normal user on a Pi finds the root systemd daemon with no flags.
+
+Flags (``--db``/``--socket``) and ``$MBREGISTRY_DB``/``$MBREGISTRY_SOCKET``
+still override all of this.
+
+This module does no I/O (apart from the existence checks in
+:func:`find_client_socket`) and needs no platform-specific libraries.
 """
 
 from __future__ import annotations
@@ -31,67 +36,136 @@ import sys
 from pathlib import Path
 
 __all__ = [
+    "is_root",
+    "system_db_path",
+    "user_db_path",
     "default_db_path",
+    "system_socket_path",
+    "user_socket_path",
     "default_socket_path",
+    "client_socket_candidates",
+    "find_client_socket",
     "default_pipe_name",
 ]
 
 #: Fixed named-pipe path, in the Windows ``\\.\pipe\`` namespace. Not a
 #: filesystem path — never created via ``mkdir``/``open`` — but returned
 #: as a plain string on every platform so non-Windows tests can exercise
-#: it too (see module docstring's ASSUMPTION note).
+#: it too.
 _WINDOWS_PIPE_NAME = r"\\.\pipe\mbregistry"
+
+_APP = "mbregistry"
+
+
+def is_root() -> bool:
+    """True when running with root privileges (never on Windows)."""
+    if sys.platform == "win32":
+        return False
+    return os.geteuid() == 0
+
+
+def _home() -> Path:
+    return Path(os.path.expanduser("~"))
+
+
+def _no_unix_socket() -> NotImplementedError:
+    return NotImplementedError(
+        "mbtools.registry.paths: no Unix socket on Windows — use "
+        "default_pipe_name() instead"
+    )
+
+
+# -- database ---------------------------------------------------------------
+
+
+def system_db_path() -> Path:
+    """Machine-level database location, used when running as root."""
+    if sys.platform == "win32":
+        program_data = os.environ.get("PROGRAMDATA", r"C:\ProgramData")
+        return Path(program_data) / _APP / "devices.db"
+    if sys.platform == "darwin":
+        return Path("/Library/Application Support") / _APP / "devices.db"
+    return Path("/var/lib") / _APP / "devices.db"
+
+
+def user_db_path() -> Path:
+    """Per-user database location, used when running as a normal user."""
+    if sys.platform == "win32":
+        return system_db_path()
+    if sys.platform == "darwin":
+        return _home() / "Library" / "Application Support" / _APP / "devices.db"
+    state = os.environ.get("XDG_STATE_HOME") or str(_home() / ".local" / "state")
+    return Path(state) / _APP / "devices.db"
 
 
 def default_db_path() -> Path:
-    """The production default for the SQLite device database.
+    """The database the daemon uses when no ``--db``/``$MBREGISTRY_DB``
+    is given: the system location as root, the per-user one otherwise."""
+    return system_db_path() if is_root() else user_db_path()
 
-    Linux/macOS (``sys.platform`` not ``"win32"``): unchanged from
-    today's value, ``/var/lib/mbregistry/devices.db`` — identity worth
-    keeping across reboots, per sprint.md's Design Rationale "file
-    layout (ASSUMPTION)".
 
-    Windows: a path under ``%ProgramData%`` (falling back to
-    ``C:\\ProgramData`` if the environment variable is unset), the
-    Windows-native analogue of ``/var/lib`` — machine-level, persistent
-    state, not per-user. This is an ASSUMPTION per this module's
-    docstring, not a stakeholder-confirmed decision.
-    """
+# -- local API socket -------------------------------------------------------
+
+
+def system_socket_path() -> Path:
+    """Machine-level socket location, used by a root (service) daemon."""
     if sys.platform == "win32":
-        program_data = os.environ.get("PROGRAMDATA", r"C:\ProgramData")
-        return Path(program_data) / "mbregistry" / "devices.db"
-    return Path("/var/lib/mbregistry/devices.db")
+        raise _no_unix_socket()
+    if sys.platform == "darwin":
+        return Path("/var/run") / _APP / "api.sock"
+    return Path("/run") / _APP / "api.sock"
+
+
+def user_socket_path() -> Path:
+    """Per-user socket location, used by a daemon run as a normal user."""
+    if sys.platform == "win32":
+        raise _no_unix_socket()
+    if sys.platform == "darwin":
+        return _home() / "Library" / "Application Support" / _APP / "api.sock"
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime and os.path.isdir(runtime):
+        return Path(runtime) / _APP / "api.sock"
+    return _home() / ".cache" / _APP / "api.sock"
 
 
 def default_socket_path() -> Path:
-    """The production default for the local Unix-socket API path.
+    """The socket the daemon binds when no ``--socket``/``$MBREGISTRY_SOCKET``
+    is given: the system location as root, the per-user one otherwise.
 
-    Linux/macOS: unchanged from today's value, ``/run/mbregistry/
-    api.sock`` — purely-live state, cleared at boot, per sprint.md's
-    Design Rationale "file layout (ASSUMPTION)".
-
-    Windows has no Unix domain socket namespace, so this function is not
-    meaningful there and raises :class:`NotImplementedError` rather than
-    returning a nonsense path — callers on Windows use
-    :func:`default_pipe_name` instead (ticket 005's platform branch in
-    ``cli.py`` decides which of the two to call, based on
-    ``sys.platform``).
+    Raises :class:`NotImplementedError` on Windows, which uses
+    :func:`default_pipe_name` instead.
     """
+    return system_socket_path() if is_root() else user_socket_path()
+
+
+def client_socket_candidates() -> list[Path]:
+    """Where a client should look for a running daemon, in order: the
+    daemon matching this user first, then the other one (so a normal user
+    finds the root systemd daemon, and root finds a user's daemon)."""
     if sys.platform == "win32":
-        raise NotImplementedError(
-            "mbtools.registry.paths: no Unix socket on Windows — use "
-            "default_pipe_name() instead"
-        )
-    return Path("/run/mbregistry/api.sock")
+        raise _no_unix_socket()
+    first, second = (
+        (system_socket_path(), user_socket_path())
+        if is_root()
+        else (user_socket_path(), system_socket_path())
+    )
+    return [first] if first == second else [first, second]
+
+
+def find_client_socket() -> Path:
+    """The first candidate that exists, or the first candidate if none do
+    (so the "registry unavailable" error names the expected path)."""
+    candidates = client_socket_candidates()
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
 
 
 def default_pipe_name() -> str:
-    """The production default Windows named-pipe path, e.g.
-    ``r"\\\\.\\pipe\\mbregistry"``.
+    """The Windows named-pipe path, ``r"\\\\.\\pipe\\mbregistry"``.
 
-    Unlike :func:`default_socket_path`, this is callable on *any*
-    platform — it is just a fixed string, not I/O, so macOS/Linux tests
-    can exercise it too. This is an ASSUMPTION per this module's
-    docstring, not a stakeholder-confirmed decision.
+    Callable on any platform — it is just a fixed string — so macOS/Linux
+    tests can exercise it too.
     """
     return _WINDOWS_PIPE_NAME

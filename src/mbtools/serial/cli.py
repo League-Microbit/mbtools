@@ -62,7 +62,7 @@ from mbtools.registry.client import (
     RegistryUnavailable,
 )
 from mbtools.registry.client import SOCKET_ENV_VAR as _SOCKET_ENV_VAR
-from mbtools.registry.client import resolve_local_api_address
+from mbtools.registry.client import find_local_api_address
 from mbtools.registry.remote_client import RemoteRegistryClient
 from mbtools.serial import remote_connect
 from mbtools.serial.connect import (
@@ -220,7 +220,7 @@ def cmd_connect(args: argparse.Namespace) -> int:
     must be released, or reported, on this same connection), and hand
     off to :func:`_run_connect`.
     """
-    socket_path = resolve_local_api_address(args.socket, _SOCKET_ENV_VAR)
+    socket_path = find_local_api_address(args.socket, _SOCKET_ENV_VAR)
     try:
         with RegistryClient(socket_path) as client:
             return _run_connect(client, args)
