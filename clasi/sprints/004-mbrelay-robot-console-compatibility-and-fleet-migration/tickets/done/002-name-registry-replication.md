@@ -1,7 +1,7 @@
 ---
 id: '002'
 title: Name registry replication
-status: in-progress
+status: done
 use-cases:
 - SUC-004
 depends-on:
