@@ -207,6 +207,7 @@ class TestUsageValidation:
             cli_mod.main(["deploy", "tovez"])
         assert excinfo.value.code == EXIT_USAGE
 
+    @pytest.mark.requires_af_unix
     def test_asset_without_repo_is_a_usage_error(self, server, capsys):
         with pytest.raises(SystemExit) as excinfo:
             cli_mod.main(
@@ -230,6 +231,7 @@ class TestUsageValidation:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_relay_guard_refuses_before_lock_or_hex_resolution(
     server, store, locks, monkeypatch, capsys
 ):
@@ -263,6 +265,7 @@ def test_relay_guard_refuses_before_lock_or_hex_resolution(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_already_locked_fails_fast_naming_holder(server, store, locks, capsys):
     uid = _uid("locked11")
     _seed_device(store, uid, device_name="tovez")
@@ -286,6 +289,7 @@ def test_already_locked_fails_fast_naming_holder(server, store, locks, capsys):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_mark_flashed_invalid_request_is_non_fatal_warning(
     server, store, locks, monkeypatch, capsys
 ):
@@ -328,6 +332,7 @@ def test_mark_flashed_invalid_request_is_non_fatal_warning(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_blank_board_report_is_distinct_from_generic_flash_failure(
     server, store, locks, monkeypatch, capsys
 ):
@@ -360,6 +365,7 @@ def test_blank_board_report_is_distinct_from_generic_flash_failure(
     assert locks.status(uid) is None  # unlocked even on failure
 
 
+@pytest.mark.requires_af_unix
 def test_ordinary_flash_failure_uses_generic_message(
     server, store, locks, monkeypatch, capsys
 ):
@@ -386,6 +392,7 @@ def test_ordinary_flash_failure_uses_generic_message(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_wait_for_reprobe_timeout_reports_plainly_and_does_not_hang(
     server, store, locks, monkeypatch, capsys
 ):
@@ -506,6 +513,7 @@ def _run_daemon(tmp_path, socket_dir, announcements):
     return uid, socket_path, store, thread, stop_event, api
 
 
+@pytest.mark.requires_af_unix
 def test_deploy_hex_end_to_end_reports_new_announcement(tmp_path, daemon_socket_dir, monkeypatch, capsys):
     uid, socket_path, store, thread, stop_event, api = _run_daemon(
         tmp_path, daemon_socket_dir, [ANNOUNCEMENT, ANNOUNCEMENT]
@@ -547,6 +555,7 @@ def test_deploy_hex_end_to_end_reports_new_announcement(tmp_path, daemon_socket_
         store.close()
 
 
+@pytest.mark.requires_af_unix
 def test_deploy_repo_end_to_end_reports_new_announcement(tmp_path, daemon_socket_dir, monkeypatch, capsys):
     uid, socket_path, store, thread, stop_event, api = _run_daemon(
         tmp_path, daemon_socket_dir, [ANNOUNCEMENT, ANNOUNCEMENT]

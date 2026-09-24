@@ -24,6 +24,7 @@ import sys
 
 import pytest
 
+import mbtools.registry.cli as cli_module
 from mbtools.common import EXIT_OK
 from mbtools.registry.cli import (
     DEFAULT_UDEV_RULE_PATH,
@@ -58,7 +59,17 @@ def test_rendered_unit_accepts_a_custom_exec_start():
     assert "ExecStart=/usr/bin/mbregistry run" in unit_text
 
 
-def test_unit_is_named_mbregistry_service_distinct_from_mbrelay_service(tmp_path, capsys):
+def test_unit_is_named_mbregistry_service_distinct_from_mbrelay_service(
+    tmp_path, capsys, monkeypatch
+):
+    # Ticket 006: on real Windows, cmd_install_service dispatches to the
+    # SCM install path (ticket 005) instead of writing the systemd
+    # unit/udev rule this test checks for -- this test's own subject is
+    # the systemd/udev install path specifically, so it forces the
+    # off-Windows branch explicitly (rather than skip outright) to stay
+    # a real, exercised regression test on every CI leg, including
+    # windows-latest.
+    monkeypatch.setattr(cli_module.sys, "platform", "linux")
     output = tmp_path / "mbregistry.service"
     udev_output = tmp_path / "99-mbregistry-cmsis-dap.rules"
 
@@ -87,7 +98,11 @@ def test_unit_is_named_mbregistry_service_distinct_from_mbrelay_service(tmp_path
     assert "systemctl enable --now mbregistry.service" in err
 
 
-def test_install_service_creates_parent_directories(tmp_path):
+def test_install_service_creates_parent_directories(tmp_path, monkeypatch):
+    # Ticket 006: see test_unit_is_named_mbregistry_service_distinct_
+    # from_mbrelay_service's own comment just above for why this forces
+    # the off-Windows branch rather than skipping on real Windows.
+    monkeypatch.setattr(cli_module.sys, "platform", "linux")
     output = tmp_path / "nested" / "dir" / "mbregistry.service"
     udev_output = tmp_path / "nested" / "udev-dir" / "99-mbregistry-cmsis-dap.rules"
 
@@ -173,7 +188,14 @@ def test_rendered_udev_rule_grants_access_via_group_and_uaccess():
     assert rule_text.count('TAG+="uaccess"') == 3
 
 
-def test_install_service_writes_the_udev_rule_to_udev_output(tmp_path, capsys):
+def test_install_service_writes_the_udev_rule_to_udev_output(
+    tmp_path, capsys, monkeypatch
+):
+    # Ticket 006: see test_unit_is_named_mbregistry_service_distinct_
+    # from_mbrelay_service's own comment (top of file) for why this
+    # forces the off-Windows branch rather than skipping on real
+    # Windows.
+    monkeypatch.setattr(cli_module.sys, "platform", "linux")
     unit_output = tmp_path / "mbregistry.service"
     udev_output = tmp_path / "99-mbregistry-cmsis-dap.rules"
 
@@ -204,6 +226,18 @@ def test_install_service_writes_the_udev_rule_to_udev_output(tmp_path, capsys):
     assert "usermod -aG plugdev eric" in err
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "DEFAULT_UDEV_RULE_PATH is Path('/etc/udev/rules.d/...') --"
+        "always POSIX-shaped, unconditionally, since udev itself is "
+        "Linux-only -- and pathlib picks WindowsPath vs PosixPath from "
+        "the real OS at interpreter startup, not from sys.platform (so "
+        "unlike the other tests in this file, forcing sys.platform via "
+        "monkeypatch cannot fix this one: str(WindowsPath('/etc/udev/"
+        "...')) renders with backslashes on real Windows regardless)"
+    ),
+)
 def test_install_service_udev_rule_write_defaults_to_the_module_constant(tmp_path):
     # DEFAULT_UDEV_RULE_PATH is exercised only for its *value* here (no
     # write to the real path, which needs root) -- confirms --udev-output
@@ -213,7 +247,12 @@ def test_install_service_udev_rule_write_defaults_to_the_module_constant(tmp_pat
     assert str(DEFAULT_UDEV_RULE_PATH).startswith("/etc/udev/rules.d/")
 
 
-def test_install_service_udev_rule_install_is_idempotent_on_rerun(tmp_path):
+def test_install_service_udev_rule_install_is_idempotent_on_rerun(tmp_path, monkeypatch):
+    # Ticket 006: see test_unit_is_named_mbregistry_service_distinct_
+    # from_mbrelay_service's own comment (top of file) for why this
+    # forces the off-Windows branch rather than skipping on real
+    # Windows.
+    monkeypatch.setattr(cli_module.sys, "platform", "linux")
     unit_output = tmp_path / "mbregistry.service"
     udev_output = tmp_path / "99-mbregistry-cmsis-dap.rules"
     argv = [

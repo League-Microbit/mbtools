@@ -5,12 +5,19 @@ that makes the rendered commands actually correspond to a real,
 non-1053-erroring Windows service; see the module's own docstring, "A
 plain console app is not a real service", for why the latter exists.
 
-Every test here runs off real Windows (this suite's own dev/CI
-machines), so every ``_Win32ServiceAPI``-touching test drives
+Ticket 003/004 wrote this suite assuming it would only ever run off
+real Windows; ticket 006 makes that no longer universally true (the
+``windows-latest`` CI job runs it on real Windows too). Every
+``_Win32ServiceAPI``-touching test still drives
 :func:`run_as_windows_service` against a scripted fake standing in for
 the ``ctypes.windll`` calls -- mirrors
 ``tests/registry/api_windows/test_api_windows.py``'s own fake-transport
-approach. What is genuinely unverifiable here -- whether the real
+approach -- and the two tests whose own subject is specifically the
+*off-Windows* guard (``test_win32_service_api_requires_real_windows``/
+``test_run_as_windows_service_without_a_fake_raises_off_windows``) now
+force a non-``"win32"`` platform explicitly via ``monkeypatch`` rather
+than assuming the ambient host, so they stay meaningful (and green) on
+every CI leg. What is genuinely unverifiable here -- whether the real
 ``ctypes.windll.advapi32`` bindings inside ``_Win32ServiceAPI`` actually
 match ``advapi32.dll``'s calling convention, and whether a real SCM
 actually accepts the rendered ``sc.exe`` commands -- is explicitly out
@@ -267,13 +274,20 @@ def test_run_as_windows_service_reports_stopped_even_if_main_raises():
     assert fake.status_calls[-1] == (service_windows._SERVICE_STOPPED, 0)
 
 
-def test_win32_service_api_requires_real_windows():
-    assert sys.platform != "win32"  # this suite always runs off real Windows
+def test_win32_service_api_requires_real_windows(monkeypatch):
+    # Ticket 006: this file's own module docstring assumption ("every
+    # test here runs off real Windows") no longer holds -- the
+    # windows-latest CI job runs this suite on real Windows, where
+    # sys.platform genuinely is "win32". This test's own subject is
+    # _Win32ServiceAPI's *off-Windows* guard, so it forces a non-win32
+    # value explicitly rather than relying on the ambient host platform
+    # -- deterministic on every CI leg, including this one.
+    monkeypatch.setattr(service_windows.sys, "platform", "linux")
     with pytest.raises(RuntimeError):
         service_windows._Win32ServiceAPI(service_windows.SERVICE_NAME)
 
 
-def test_run_as_windows_service_without_a_fake_raises_off_windows():
-    assert sys.platform != "win32"
+def test_run_as_windows_service_without_a_fake_raises_off_windows(monkeypatch):
+    monkeypatch.setattr(service_windows.sys, "platform", "linux")
     with pytest.raises(RuntimeError):
         service_windows.run_as_windows_service(lambda stop_event: 0)

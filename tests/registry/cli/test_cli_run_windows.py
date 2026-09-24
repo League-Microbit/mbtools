@@ -77,13 +77,20 @@ def test_assemble_daemon_and_api_uses_windows_pipe_server_on_simulated_win32(
         store.close()
 
 
-def test_assemble_daemon_and_api_still_uses_registry_api_server_off_windows(tmp_path):
-    # sys.platform is left alone here -- this dev host's own real
-    # platform (macOS/Linux) -- the "byte-for-byte unchanged on
-    # Linux/macOS" acceptance criterion, verbatim: no regression to
-    # what every pre-ticket-005 test already asserts (see
+def test_assemble_daemon_and_api_still_uses_registry_api_server_off_windows(
+    tmp_path, monkeypatch
+):
+    # Ticket 006 correction: this used to leave sys.platform alone,
+    # relying on the dev host's own real platform (macOS/Linux) --
+    # which broke the instant this suite actually ran on real Windows
+    # (the windows-latest CI job), since sys.platform there genuinely
+    # is "win32". This test's own subject is the *off-Windows* branch,
+    # so it now forces a non-"win32" value explicitly -- deterministic
+    # on every CI leg, still the same "byte-for-byte unchanged off
+    # Windows" acceptance criterion (see
     # test_cli_run.py/test_cli_run_peering.py, unmodified by this
-    # ticket and still green).
+    # ticket and still green there, on the real off-Windows platform).
+    monkeypatch.setattr(cli.sys, "platform", "linux")
     store = Store(tmp_path / "devices.db")
     usbwatch = FakeUSBSource([[_port_info(_uid("winb2222"))]])
     try:
@@ -129,7 +136,13 @@ def test_resolve_local_api_address_env_var_wins_over_default_on_simulated_win32(
     assert result == r"\\.\pipe\from-env"
 
 
-def test_resolve_local_api_address_unaffected_off_windows(tmp_path):
+def test_resolve_local_api_address_unaffected_off_windows(tmp_path, monkeypatch):
+    # Ticket 006: force the off-Windows branch explicitly -- see the
+    # sibling fix above this test's own docstring-less twin,
+    # test_assemble_daemon_and_api_still_uses_registry_api_server_off_windows,
+    # for why relying on the ambient host platform broke on the
+    # windows-latest CI job.
+    monkeypatch.setattr(cli.sys, "platform", "linux")
     result = cli._resolve_local_api_address(str(tmp_path / "api.sock"), "MBREGISTRY_SOCKET")
     assert result == tmp_path / "api.sock"
 

@@ -141,6 +141,7 @@ def test_registry_unavailable_reports_no_daemon(tmp_path, capsys):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_already_locked_fails_fast_naming_holder(server, store, locks, capsys):
     _seed_device(store)
     locks.acquire(UID, KIND_FLASH, _local_holder(5150))
@@ -158,6 +159,7 @@ def test_already_locked_fails_fast_naming_holder(server, store, locks, capsys):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_interactive_session_end_to_end(server, store, locks, monkeypatch, capsys):
     _seed_device(store)
     _install_fake_pyserial(monkeypatch)
@@ -177,6 +179,7 @@ def test_interactive_session_end_to_end(server, store, locks, monkeypatch, capsy
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_one_shot_message_prints_reply_lines(server, store, locks, monkeypatch, capsys):
     _seed_device(store)
     _install_fake_pyserial(
@@ -203,6 +206,7 @@ def test_one_shot_message_prints_reply_lines(server, store, locks, monkeypatch, 
     assert locks.status(UID) is None
 
 
+@pytest.mark.requires_af_unix
 def test_one_shot_no_reply_is_reported_and_unlocked(
     server, store, locks, monkeypatch, capsys
 ):
@@ -233,6 +237,7 @@ def test_one_shot_no_reply_is_reported_and_unlocked(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_reset_flag_reaches_connect_and_resets_the_board(
     server, store, locks, monkeypatch
 ):

@@ -15,6 +15,7 @@ from __future__ import annotations
 import itertools
 import shutil
 import socket
+import sys
 import tempfile
 import threading
 from pathlib import Path
@@ -123,6 +124,7 @@ def server(socket_dir, store, locks):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_list_returns_plain_dicts_for_every_device(server):
     with RegistryClient(server.socket_path) as client:
         devices = client.list()
@@ -133,6 +135,7 @@ def test_list_returns_plain_dicts_for_every_device(server):
     assert by_uid[UID]["lock_kind"] is None
 
 
+@pytest.mark.requires_af_unix
 def test_find_returns_the_matching_device(server):
     with RegistryClient(server.socket_path) as client:
         device = client.find(UID)
@@ -141,6 +144,7 @@ def test_find_returns_the_matching_device(server):
     assert device["device_name"] == "vevov"
 
 
+@pytest.mark.requires_af_unix
 def test_find_unknown_uid_raises_device_not_found(server):
     with RegistryClient(server.socket_path) as client:
         with pytest.raises(DeviceNotFoundError) as excinfo:
@@ -155,6 +159,7 @@ def test_find_unknown_uid_raises_device_not_found(server):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_lock_then_unlock_round_trip(server, locks):
     with RegistryClient(server.socket_path) as client:
         client.lock(UID, KIND_SERIAL)
@@ -166,12 +171,14 @@ def test_lock_then_unlock_round_trip(server, locks):
     assert locks.status(UID) is None
 
 
+@pytest.mark.requires_af_unix
 def test_lock_unknown_uid_raises_device_not_found(server):
     with RegistryClient(server.socket_path) as client:
         with pytest.raises(DeviceNotFoundError):
             client.lock("does-not-exist", KIND_SERIAL)
 
 
+@pytest.mark.requires_af_unix
 def test_lock_unknown_kind_raises_invalid_request(server):
     with RegistryClient(server.socket_path) as client:
         with pytest.raises(InvalidRequestError) as excinfo:
@@ -181,6 +188,7 @@ def test_lock_unknown_kind_raises_invalid_request(server):
     assert excinfo.value.code == "invalid_request"
 
 
+@pytest.mark.requires_af_unix
 def test_lock_already_held_raises_device_locked_with_holder_preserved(server, locks):
     holder = RegistryClient(server.socket_path)
     holder.connect()
@@ -202,12 +210,14 @@ def test_lock_already_held_raises_device_locked_with_holder_preserved(server, lo
     assert excinfo.value.holder == {"kind": KIND_FLASH, "pid": holder_pid}
 
 
+@pytest.mark.requires_af_unix
 def test_unlock_unknown_uid_raises_device_not_found(server):
     with RegistryClient(server.socket_path) as client:
         with pytest.raises(DeviceNotFoundError):
             client.unlock("does-not-exist")
 
 
+@pytest.mark.requires_af_unix
 def test_unlock_when_not_held_by_this_connection_returns_false(server):
     with RegistryClient(server.socket_path) as client:
         released = client.unlock(UID)
@@ -220,6 +230,7 @@ def test_unlock_when_not_held_by_this_connection_returns_false(server):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_mark_flashed_without_flash_lock_raises_registry_client_error(server, store):
     with RegistryClient(server.socket_path) as client:
         with pytest.raises(RegistryClientError) as excinfo:
@@ -229,6 +240,7 @@ def test_mark_flashed_without_flash_lock_raises_registry_client_error(server, st
     assert store.find(UID).flash_count == 0
 
 
+@pytest.mark.requires_af_unix
 def test_mark_flashed_increments_flash_count(server, store):
     with RegistryClient(server.socket_path) as client:
         client.lock(UID, KIND_FLASH)
@@ -237,6 +249,7 @@ def test_mark_flashed_increments_flash_count(server, store):
     assert store.find(UID).flash_count == 1
 
 
+@pytest.mark.requires_af_unix
 def test_mark_flashed_unknown_uid_raises_device_not_found(server):
     with RegistryClient(server.socket_path) as client:
         with pytest.raises(DeviceNotFoundError):
@@ -248,6 +261,7 @@ def test_mark_flashed_unknown_uid_raises_device_not_found(server):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_closing_the_client_releases_locks_it_held(server, locks):
     client = RegistryClient(server.socket_path)
     client.connect()
@@ -264,6 +278,7 @@ def test_closing_the_client_releases_locks_it_held(server, locks):
         assert locks.status(UID).kind == KIND_FLASH
 
 
+@pytest.mark.requires_af_unix
 def test_one_client_reuses_the_same_connection_across_calls(server):
     """A single RegistryClient sends several requests over one
     connection (the module's own "one connection is one client session"
@@ -305,6 +320,7 @@ def test_exception_code_maps_to_stable_exit_code(exc_cls, code, exit_code):
     assert exc.exit_code == exit_code
 
 
+@pytest.mark.requires_af_unix
 def test_unmapped_code_raises_base_registry_client_error_with_default_exit_code(server):
     """An op-specific/unmapped code (e.g. ``not_locked``, which no
     list/find/lock/unlock response can produce) falls back to the base
@@ -337,6 +353,7 @@ def test_connect_to_absent_socket_raises_registry_unavailable(tmp_path):
     assert "registry unavailable" in str(excinfo.value)
 
 
+@pytest.mark.requires_af_unix
 def test_connect_to_stale_socket_file_raises_registry_unavailable(socket_dir):
     """A socket file that exists but has no listener behind it any more
     (daemon crashed without cleaning up, or never started) raises
@@ -390,6 +407,23 @@ def test_resolve_socket_path_env_var_used_when_no_flag(monkeypatch):
     assert resolve_socket_path(None) == Path("/env/api.sock")
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "DEFAULT_SOCKET_PATH -- this call's own default `default=` "
+        "parameter -- is bound once, at real import time, to None on "
+        "real sys.platform == 'win32' (see that constant's own "
+        "docstring in registry.api); a monkeypatch of sys.platform "
+        "here cannot retroactively change an already-bound default "
+        "parameter value, so on the windows-latest CI job this call "
+        "genuinely raises TypeError from Path(None) -- documented, "
+        "expected behavior (resolve_socket_path's own docstring: "
+        "'ticket 005's Windows platform branch in cli.py is where a "
+        "Windows-aware caller resolves the named pipe instead of "
+        "calling this function at all' -- registry.client"
+        ".resolve_local_api_address is that caller)"
+    ),
+)
 def test_resolve_socket_path_default_when_neither_given(monkeypatch):
     from mbtools.registry.client import SOCKET_ENV_VAR, resolve_socket_path
 
@@ -444,13 +478,36 @@ def test_resolve_local_api_address_env_var_wins_over_default_on_simulated_win32(
     assert result == r"\\.\pipe\from-env"
 
 
-def test_resolve_local_api_address_unaffected_off_windows(tmp_path):
+def test_resolve_local_api_address_unaffected_off_windows(tmp_path, monkeypatch):
+    # Ticket 006: force the off-Windows branch explicitly -- the
+    # sys.platform == "win32" check itself is live (evaluated on every
+    # call, unlike DEFAULT_SOCKET_PATH's own import-time-frozen value --
+    # see the skip reasons just above for that distinction), so on real
+    # Windows CI this branch selection would otherwise flip and return a
+    # bare str instead of a Path, failing this assertion.
+    import mbtools.registry.client as client_module
+
+    monkeypatch.setattr(client_module.sys, "platform", "linux")
     from mbtools.registry.client import resolve_local_api_address
 
     result = resolve_local_api_address(str(tmp_path / "api.sock"), "MBREGISTRY_SOCKET")
     assert result == tmp_path / "api.sock"
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "this test's own subject is the off-Windows default path, which "
+        "on real sys.platform == 'win32' is genuinely unreachable: the "
+        "else branch passes DEFAULT_SOCKET_PATH -- bound once, at real "
+        "import time, to None on win32 -- straight through to "
+        "resolve_socket_path, which raises TypeError from Path(None); "
+        "monkeypatching sys.platform here cannot retroactively change "
+        "that already-bound value (see "
+        "test_resolve_socket_path_default_when_neither_given's own "
+        "skip reason just above for the same underlying issue)"
+    ),
+)
 def test_resolve_local_api_address_off_windows_default_when_neither_given(monkeypatch):
     """Off Windows, this delegates to resolve_socket_path with
     DEFAULT_SOCKET_PATH -- a real, non-None default there (unlike
@@ -469,11 +526,13 @@ def test_resolve_local_api_address_off_windows_default_when_neither_given(monkey
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_names_get_returns_none_for_an_unregistered_name(server):
     with RegistryClient(server.socket_path) as client:
         assert client.names_get("tovez") is None
 
 
+@pytest.mark.requires_af_unix
 def test_names_set_then_get_round_trips(server):
     with RegistryClient(server.socket_path) as client:
         set_entry = client.names_set("tovez", 20, 30)
@@ -485,6 +544,7 @@ def test_names_set_then_get_round_trips(server):
         assert got == set_entry
 
 
+@pytest.mark.requires_af_unix
 def test_names_clear_drops_the_row(server):
     with RegistryClient(server.socket_path) as client:
         client.names_set("tovez", 20, 30)
@@ -492,6 +552,7 @@ def test_names_clear_drops_the_row(server):
         assert client.names_get("tovez") is None
 
 
+@pytest.mark.requires_af_unix
 def test_names_list_includes_every_row(server):
     with RegistryClient(server.socket_path) as client:
         client.names_set("tovez", 20, 30)
@@ -501,6 +562,7 @@ def test_names_list_includes_every_row(server):
     assert {e["name"] for e in entries} == {"tovez", "vevov"}
 
 
+@pytest.mark.requires_af_unix
 def test_names_set_of_a_malformed_name_raises_invalid_request(server):
     with RegistryClient(server.socket_path) as client:
         with pytest.raises(InvalidRequestError):

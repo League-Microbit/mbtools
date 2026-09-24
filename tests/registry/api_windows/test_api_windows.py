@@ -146,6 +146,17 @@ class _NullWin32:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "this test's own subject is the off-Windows import guard "
+        "(_kernel32/_advapi32 stay None) -- meaningless on the "
+        "windows-latest CI job (ticket 006), where the module was "
+        "actually imported on real Windows and those names are real, "
+        "non-None ctypes.windll bindings by design; every other test in "
+        "this file exercises that real-Windows import path instead"
+    ),
+)
 def test_module_imports_cleanly_off_windows():
     """Mirrors the module's own docstring claim -- already proven by this
     file's own top-level `from mbtools.registry import api_windows`
@@ -153,6 +164,13 @@ def test_module_imports_cleanly_off_windows():
     took the off-Windows branch, not just that some import happened to
     work) so a future edit that breaks the guard fails loudly here
     rather than only in a downstream module's own import.
+
+    This assumes the ambient host is not real Windows (see the
+    `skipif` above) rather than forcing `sys.platform` via monkeypatch,
+    because the thing under test -- whether `_kernel32`/`_advapi32`
+    stayed `None` -- was decided once, at real import time, before this
+    test (or any monkeypatch) ever runs; monkeypatching `sys.platform`
+    now cannot retroactively change what already happened at import.
     """
     assert sys.platform != "win32"  # this suite always runs off real Windows
     assert api_windows._kernel32 is None

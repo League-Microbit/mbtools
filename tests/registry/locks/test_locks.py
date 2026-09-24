@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 
 import pytest
 
@@ -445,6 +446,18 @@ def _real_is_pid_alive(pid: int) -> bool:
     return True
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "needs two POSIX-only facilities together: the 'sleep' binary "
+        "run as a subprocess (no such command on Windows by default) "
+        "and os.kill(pid, 0)-as-a-liveness-probe semantics (Python's "
+        "os.kill on Windows does not support signal 0 as a liveness "
+        "check -- see registry.api_windows.default_is_pid_alive_windows's "
+        "own docstring); that Windows analogue is exercised separately "
+        "in tests/registry/api_windows/"
+    ),
+)
 def test_sweep_releases_lock_of_real_dead_subprocess():
     manager = LockManager()
     proc = subprocess.Popen(["sleep", "30"])

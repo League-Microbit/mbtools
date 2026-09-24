@@ -86,6 +86,18 @@ def test_default_socket_path_raises_on_windows(monkeypatch):
         default_socket_path()
 
 
+@pytest.mark.skipif(
+    paths_module.sys.platform == "win32",
+    reason=(
+        "both sides of this comparison are meaningless on real Windows: "
+        "default_socket_path() itself raises NotImplementedError there "
+        "by design (its own docstring), and registry.api."
+        "DEFAULT_SOCKET_PATH is bound once, at real import time, to "
+        "None rather than calling default_socket_path() at all, "
+        "specifically to avoid that raise (see DEFAULT_SOCKET_PATH's "
+        "own docstring, 'ticket 003's import-safety fix')"
+    ),
+)
 def test_default_socket_path_matches_api_default_socket_path():
     """registry.api.DEFAULT_SOCKET_PATH must be sourced from this module
     and must be unchanged from its pre-ticket value on the platform

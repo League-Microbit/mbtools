@@ -107,6 +107,7 @@ def server(socket_dir, store, locks):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_list_table_shows_state_uid_firmware_port_and_error_notes(server, capsys):
     with pytest.raises(SystemExit) as excinfo:
         main(["list", "--socket", str(server.socket_path)])
@@ -125,6 +126,7 @@ def test_list_table_shows_state_uid_firmware_port_and_error_notes(server, capsys
     assert "no announcement received during probe" in out
 
 
+@pytest.mark.requires_af_unix
 def test_list_json_matches_api_device_fields(server, capsys):
     with pytest.raises(SystemExit) as excinfo:
         main(["list", "--socket", str(server.socket_path), "--json"])
@@ -170,6 +172,7 @@ def test_list_against_absent_socket_prints_clear_message_and_stable_exit_code(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_list_uses_socket_env_var_when_no_flag_given(server, monkeypatch, capsys):
     monkeypatch.setenv("MBREGISTRY_SOCKET", str(server.socket_path))
 
@@ -179,6 +182,7 @@ def test_list_uses_socket_env_var_when_no_flag_given(server, monkeypatch, capsys
     assert excinfo.value.code == EXIT_OK
 
 
+@pytest.mark.requires_af_unix
 def test_list_flag_overrides_socket_env_var(server, tmp_path, monkeypatch, capsys):
     # The env var points at a socket that doesn't exist; the --flag points
     # at the real one and must win.

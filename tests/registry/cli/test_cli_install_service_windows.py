@@ -80,12 +80,17 @@ def test_windows_branch_exec_path_invokes_run_with_the_windows_service_flag(monk
     )
 
 
-def test_cmd_install_service_still_writes_systemd_unit_and_udev_rule_off_windows(tmp_path):
-    # sys.platform is left alone here -- this dev host's own real
-    # platform -- regression guard for the pre-ticket-005 behavior,
-    # already covered exhaustively by test_cli_install_service.py; this
-    # is a light smoke check that the new win32 branch didn't disturb
-    # the fallthrough.
+def test_cmd_install_service_still_writes_systemd_unit_and_udev_rule_off_windows(
+    tmp_path, monkeypatch
+):
+    # Ticket 006 correction: this used to leave sys.platform alone,
+    # relying on the dev host's own real platform -- which broke on the
+    # windows-latest CI job, where sys.platform genuinely is "win32".
+    # This test's own subject is the *off-Windows* fallthrough
+    # (regression guard for the pre-ticket-005 behavior, already covered
+    # exhaustively by test_cli_install_service.py), so it now forces a
+    # non-"win32" platform explicitly -- deterministic on every CI leg.
+    monkeypatch.setattr(cli.sys, "platform", "linux")
     unit_output = tmp_path / "mbregistry.service"
     udev_output = tmp_path / "99-mbregistry-cmsis-dap.rules"
     parser = cli.build_parser()

@@ -597,6 +597,7 @@ def server(socket_dir, store):
     srv.stop()
 
 
+@pytest.mark.requires_af_unix
 def test_names_get_reports_not_registered(server, capsys):
     with pytest.raises(SystemExit) as excinfo:
         cli_mod.main(["names", "get", "tovez", "--socket", str(server.socket_path)])
@@ -604,6 +605,7 @@ def test_names_get_reports_not_registered(server, capsys):
     assert "not in the name registry" in capsys.readouterr().err
 
 
+@pytest.mark.requires_af_unix
 def test_names_set_get_list_clear_round_trip(server, store, capsys):
     with pytest.raises(SystemExit) as excinfo:
         cli_mod.main(["names", "set", "tovez", "20", "30", "--socket", str(server.socket_path)])
@@ -632,6 +634,7 @@ def test_names_set_get_list_clear_round_trip(server, store, capsys):
     assert store.get_name("tovez") is None
 
 
+@pytest.mark.requires_af_unix
 def test_names_list_reports_when_empty(server, capsys):
     with pytest.raises(SystemExit) as excinfo:
         cli_mod.main(["names", "list", "--socket", str(server.socket_path)])
