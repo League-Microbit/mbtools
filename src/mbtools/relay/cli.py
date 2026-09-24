@@ -263,9 +263,16 @@ def _interactive(channel: ByteChannel, data_queue: "queue.Queue[bytes | None]",
     already running on ``channel``'s own background read thread -- see
     :func:`_run_session`) since :class:`~mbtools.relay.protocol.ByteChannel`
     is push-based, not a selectable fd. Falls back to a plain (non-raw,
-    non-``select``) read loop when ``sys.stdin`` has no real file
-    descriptor (piped input, or a test double) -- the same "no real tty,
-    nothing to set raw" case ``os.isatty`` already exists to detect.
+    non-``select``) read loop whenever ``sys.stdin`` is not a tty --
+    gated on ``is_tty``, not merely on whether ``fileno()`` succeeded:
+    a redirected file, a pipe, or ``/dev/null`` all have a real file
+    descriptor but are not ttys, and ``select``/``termios``/``tty`` are
+    only imported in the ``is_tty`` branch below (found the hard way,
+    sprint 005 ticket 010's hardware acceptance pass -- ``mbrelay
+    connect`` with stdin redirected from ``/dev/null`` used to crash
+    with ``AttributeError: 'NoneType' object has no attribute
+    'select'`` because the old condition, ``stdin_fd is not None``, is
+    true in exactly that non-tty case).
     """
     import io
     import os
@@ -303,7 +310,7 @@ def _interactive(channel: ByteChannel, data_queue: "queue.Queue[bytes | None]",
                 sys.stdout.write(item.decode("utf-8", "replace"))
                 sys.stdout.flush()
 
-            if stdin_fd is not None:
+            if is_tty:
                 readable, _, _ = select.select([stdin_fd], [], [], 0.05)
                 if stdin_fd not in readable:
                     continue

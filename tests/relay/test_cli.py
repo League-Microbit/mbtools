@@ -355,6 +355,43 @@ def test_local_connect_end_to_end(monkeypatch, capsys):
     assert "answered PING" in err
 
 
+def test_interactive_session_survives_non_tty_real_fd_stdin(monkeypatch, capsys):
+    """Regression test (sprint 005 ticket 010, found on real hardware):
+    a redirected file, a pipe, or ``/dev/null`` gives ``sys.stdin`` a
+    real file descriptor (``fileno()`` succeeds) while ``os.isatty()``
+    is still ``False`` -- unlike the ``_immediate_stdin_eof`` autouse
+    fixture's ``io.StringIO("")``, which has no ``fileno()`` at all and
+    so never exercised this branch. Before the fix, ``_interactive``
+    chose its ``select``-based read loop whenever ``stdin_fd is not
+    None`` (true here), but only imports ``select``/``termios``/``tty``
+    when ``is_tty`` is also true (false here) -- crashing with
+    ``AttributeError: 'NoneType' object has no attribute 'select'`` on
+    the very first loop iteration. This is exactly what happened running
+    ``mbrelay connect`` with stdin redirected from ``/dev/null`` during
+    this ticket's hardware acceptance pass.
+    """
+    import os
+
+    devnull = open(os.devnull, "r")
+    monkeypatch.setattr(sys, "stdin", devnull)
+    try:
+        assert devnull.fileno() is not None
+        assert os.isatty(devnull.fileno()) is False
+
+        fake_channel = FakeByteChannel(full_script(20, 30))
+        monkeypatch.setattr(cli_mod, "_open_local_channel", lambda port: fake_channel)
+        client = FakeRegistryClient(devices=[LOCAL_RELAY], names={"tovez": NAME_ENTRY_TOVEZ})
+        args = _connect_args("tovez")
+
+        code = cli_mod._run_connect(client, cli_mod.parse_target("tovez"), args)
+
+        assert code == EXIT_OK
+        err = capsys.readouterr().err
+        assert "relay closed the connection" not in err
+    finally:
+        devnull.close()
+
+
 def test_local_connect_never_calls_open_remote_channel(monkeypatch):
     fake_channel = FakeByteChannel(full_script(20, 30))
     monkeypatch.setattr(cli_mod, "_open_local_channel", lambda port: fake_channel)
