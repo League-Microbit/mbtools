@@ -35,8 +35,14 @@ __all__ = [
 
 #: Column order for :func:`render_table` -- UC-004's STATE/NAME/UID/
 #: FIRMWARE/PORT convention, unchanged from sprint 001's ``mbregistry
-#: list``.
-TABLE_HEADERS = ["STATE", "NAME", "UID", "FIRMWARE", "PORT"]
+#: list``, plus sprint 003's HOST column (ticket 010) inserted just
+#: before PORT -- PORT stays the last column deliberately (rather than
+#: appending HOST at the very end), since an existing pre-sprint-003
+#: test (``tests/registry/render/test_render.py``'s own "uses port and
+#: dash when absent") asserts a row *ends with* its PORT cell; keeping
+#: PORT last is what makes that assertion -- and any other caller making
+#: the same "PORT is the last column" assumption -- still true.
+TABLE_HEADERS = ["STATE", "NAME", "UID", "FIRMWARE", "HOST", "PORT"]
 
 
 def _sort_devices(devices: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -52,20 +58,51 @@ def _sort_devices(devices: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _state_cell(device: dict[str, Any]) -> str:
     """UC-004's STATE column: ``free`` / ``locked by <kind> pid <n>`` /
-    ``no-firmware`` / ``gone``. Lock status (folded into the ``list``
-    response by ``api._device_dict``) takes precedence over
-    ``connected_no_firmware`` -- a device can be locked (e.g. mid-flash)
-    while its last-known state is still "no firmware", and the lock is
-    the more useful thing to show.
+    ``no-firmware`` / ``gone`` / ``peer unreachable``. Lock status
+    (folded into the ``list`` response by ``api._device_dict``) takes
+    precedence over ``connected_no_firmware`` -- a device can be locked
+    (e.g. mid-flash) while its last-known state is still "no firmware",
+    and the lock is the more useful thing to show.
+
+    Sprint 003 (ticket 010): a peer-owned row (``device["host"]`` set)
+    reads a different pair of fields for both checks, per sprint.md
+    Decision 3 -- ``peer_reachable``/``remote_lock_kind``/
+    ``remote_lock_display`` (a replicated display cache) instead of
+    ``lock_kind``/``lock_pid`` (which would require a live cross-host
+    call this module never makes). ``peer_reachable is False`` wins over
+    every other check, including a cached ``disconnected`` state or lock
+    display -- per the ticket's own Testing note, "regardless of its
+    last-known state/lock cache": once the link to the owning host is
+    down, nothing this row already knows is trustworthy enough to show
+    instead.
     """
+    host = device.get("host")
+    if host is not None and not device.get("peer_reachable", True):
+        return "peer unreachable"
     if device["state"] == STATE_DISCONNECTED:
         return "gone"
-    lock_kind = device.get("lock_kind")
-    if lock_kind:
-        return f"locked by {lock_kind} pid {device.get('lock_pid')}"
+    if host is not None:
+        lock_kind = device.get("remote_lock_kind")
+        if lock_kind:
+            return f"locked by {lock_kind} {device.get('remote_lock_display')}"
+    else:
+        lock_kind = device.get("lock_kind")
+        if lock_kind:
+            return f"locked by {lock_kind} pid {device.get('lock_pid')}"
     if device["state"] == STATE_CONNECTED_NO_FIRMWARE:
         return "no-firmware"
     return "free"
+
+
+def _host_cell(device: dict[str, Any]) -> str:
+    """HOST column (ticket 010): ``"local"`` for a ``host IS NULL`` row
+    (this registry's own device), the owning peer's hostname otherwise.
+    ``"local"`` rather than a blank cell -- documented choice, per the
+    ticket's "implementer's call" -- so the column always shows a
+    resolvable value and an empty cell is never ambiguous with a missing
+    column.
+    """
+    return device.get("host") or "local"
 
 
 def _firmware_cell(device: dict[str, Any]) -> str:
@@ -130,6 +167,7 @@ def render_table(devices: list[dict[str, Any]]) -> str:
             d.get("device_name") or "-",
             d.get("short_uid") or d["uid"][-8:],
             _firmware_cell(d),
+            _host_cell(d),
             d.get("port") or "-",
         ]
         for d in devices

@@ -39,6 +39,10 @@ from mbtools.registry.store import Store
 
 UID = "9900" + "0000" + "11112222" + "3333444455556666" + "77778888" + "6e052820"
 UID2 = "aa11" + "0000" + "11112222" + "3333444455556666" + "77778888" + "6e052820"
+# A peer-owned uid (ticket 010) -- never inserted by the `store` fixture
+# itself, so it only exists in a test that explicitly calls
+# `store.upsert_remote_attached`.
+UID_REMOTE = "bb11" + "0000" + "11112222" + "3333444455556666" + "77778888" + "6e052820"
 VID_PID = "0d28:0204"
 PID_A = 1001
 PID_B = 1002
@@ -312,6 +316,110 @@ def test_find_unknown_device_returns_not_found(make_server):
         "code": CODE_NOT_FOUND,
         "error": "no such device: 'does-not-exist'",
     }
+    client.close()
+
+
+# ---------------------------------------------------------------------------
+# HOST column feed, remote lock-state cache, peer endpoint (ticket 010)
+# ---------------------------------------------------------------------------
+
+
+def test_list_local_row_has_no_host_no_endpoint_and_reachable_true(make_server):
+    srv = make_server()
+    client = _Client(srv.socket_path)
+
+    resp = client.request({"op": "list"})
+
+    assert resp["ok"] is True
+    by_uid = {d["uid"]: d for d in resp["devices"]}
+    assert by_uid[UID]["host"] is None
+    assert by_uid[UID]["endpoint"] is None
+    assert by_uid[UID]["peer_reachable"] is True
+    client.close()
+
+
+def test_find_local_device_endpoint_is_absent_or_null(make_server):
+    srv = make_server()
+    client = _Client(srv.socket_path)
+
+    resp = client.request({"op": "find", "uid": UID})
+
+    assert resp["ok"] is True
+    assert resp["device"].get("endpoint") is None
+    client.close()
+
+
+def test_find_remote_owned_device_includes_endpoint_from_peer_table(make_server, store):
+    store.record_peer_seen("loki", "loki:8900")
+    store.upsert_remote_attached(UID_REMOTE, "loki", "/dev/ttyACM9", VID_PID)
+    srv = make_server()
+    client = _Client(srv.socket_path)
+
+    resp = client.request({"op": "find", "uid": UID_REMOTE})
+
+    assert resp["ok"] is True
+    assert resp["device"]["host"] == "loki"
+    assert resp["device"]["endpoint"] == "loki:8900"
+    assert resp["device"]["peer_reachable"] is True
+    client.close()
+
+
+def test_list_remote_owned_row_never_makes_a_live_lock_call(make_server, store):
+    """Ticket 010 acceptance criterion: a remote-owned row's lock_kind/
+    lock_pid come from no live LockManager call -- they stay None
+    regardless of the store's cached remote_lock_kind/remote_lock_display,
+    which land in their own, separate fields instead.
+    """
+    store.record_peer_seen("loki", "loki:8900")
+    store.upsert_remote_attached(UID_REMOTE, "loki", "/dev/ttyACM9", VID_PID)
+    store.apply_remote_lock_state(UID_REMOTE, KIND_SERIAL, "pid 555")
+    srv = make_server()
+    client = _Client(srv.socket_path)
+
+    resp = client.request({"op": "list"})
+
+    by_uid = {d["uid"]: d for d in resp["devices"]}
+    remote = by_uid[UID_REMOTE]
+    assert remote["lock_kind"] is None
+    assert remote["lock_pid"] is None
+    assert remote["remote_lock_kind"] == KIND_SERIAL
+    assert remote["remote_lock_display"] == "pid 555"
+    client.close()
+
+
+def test_list_remote_owned_row_with_no_matching_peer_row_reports_unreachable(
+    make_server, store
+):
+    # A `host` value with no matching `peer` row (shouldn't happen in
+    # steady state, but a race could leave one transiently) is treated
+    # as unreachable rather than assumed reachable -- reachability can't
+    # be confirmed either way, so the conservative default wins.
+    store.upsert_remote_attached(UID_REMOTE, "ghost-host", "/dev/ttyACM9", VID_PID)
+    srv = make_server()
+    client = _Client(srv.socket_path)
+
+    resp = client.request({"op": "list"})
+
+    by_uid = {d["uid"]: d for d in resp["devices"]}
+    assert by_uid[UID_REMOTE]["peer_reachable"] is False
+    assert by_uid[UID_REMOTE]["endpoint"] is None
+    client.close()
+
+
+def test_list_remote_owned_row_unreachable_when_peer_marked_unreachable(
+    make_server, store
+):
+    store.record_peer_seen("loki", "loki:8900")
+    store.mark_peer_unreachable("loki")
+    store.upsert_remote_attached(UID_REMOTE, "loki", "/dev/ttyACM9", VID_PID)
+    srv = make_server()
+    client = _Client(srv.socket_path)
+
+    resp = client.request({"op": "list"})
+
+    by_uid = {d["uid"]: d for d in resp["devices"]}
+    assert by_uid[UID_REMOTE]["peer_reachable"] is False
+    assert by_uid[UID_REMOTE]["endpoint"] == "loki:8900"
     client.close()
 
 

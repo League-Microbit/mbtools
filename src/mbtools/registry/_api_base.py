@@ -164,11 +164,39 @@ class BaseAPIServer:
         folded in — ``list``/``get``/``find``'s acceptance criterion, so
         a STATE column never needs a second round-trip. Callers hold
         ``self._lock`` already.
+
+        ``record.host is None`` (a locally-owned device): ``lock_kind``/
+        ``lock_pid`` come from a live :meth:`LockManager.status` call, as
+        before this ticket. ``record.host is not None`` (peer-owned, per
+        sprint.md Decision 3): there is no live call to make for a device
+        this registry doesn't own, so ``lock_kind``/``lock_pid`` stay
+        ``None`` (``registry.render``, ticket 010, reads the record's own
+        ``remote_lock_kind``/``remote_lock_display`` cache columns for
+        that case instead — already present via ``asdict(record)``
+        below). Two more fields are folded in for a remote-owned row,
+        looked up from ``store``'s ``peer`` table by ``record.host``:
+        ``endpoint`` (``host:remote_api_port``, what ticket 011/012/013's
+        remote-client code needs to know where to connect — ``None`` for
+        a local row) and ``peer_reachable`` (``store.PeerRecord.reachable``,
+        what ``registry.render``'s "peer unreachable" rendering keys off
+        — ``True`` for a local row, since there is no peer link to lose;
+        ``False`` if ``host`` names a peer this store has no ``peer`` row
+        for at all, treated the same as "known unreachable" since
+        reachability can't be confirmed either way).
         """
-        holder = self._locks.status(record.uid)
         d = asdict(record)
-        d["lock_kind"] = holder.kind if holder is not None else None
-        d["lock_pid"] = holder.pid if holder is not None else None
+        if record.host is None:
+            holder = self._locks.status(record.uid)
+            d["lock_kind"] = holder.kind if holder is not None else None
+            d["lock_pid"] = holder.pid if holder is not None else None
+            d["endpoint"] = None
+            d["peer_reachable"] = True
+        else:
+            d["lock_kind"] = None
+            d["lock_pid"] = None
+            peer = self._store.get_peer(record.host)
+            d["endpoint"] = peer.endpoint if peer is not None else None
+            d["peer_reachable"] = peer.reachable if peer is not None else False
         return d
 
     def _resolve_visible(
