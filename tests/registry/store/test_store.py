@@ -9,6 +9,7 @@ no mock database layer, since SQLite itself is the thing being tested.
 from __future__ import annotations
 
 import itertools
+import sys
 
 import pytest
 
@@ -53,6 +54,16 @@ def test_schema_created_on_first_use(tmp_path):
     assert db_path.exists()
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "DEFAULT_DB_PATH is bound once, at real import time, from "
+        "registry.paths.default_db_path()'s own platform dispatch -- "
+        "on real Windows it is genuinely a %ProgramData%-rooted path, "
+        "not /var/lib/... (see that function's own docstring); this "
+        "test's subject is the non-Windows default specifically"
+    ),
+)
 def test_default_db_path_is_var_lib_mbregistry():
     assert str(store_mod.DEFAULT_DB_PATH) == "/var/lib/mbregistry/devices.db"
 

@@ -129,6 +129,7 @@ def _seed_device(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_mbdeploy_list_table_identical_to_mbregistry_list(
     server, store, locks, capsys
 ):
@@ -153,6 +154,7 @@ def test_mbdeploy_list_table_identical_to_mbregistry_list(
     assert "locked by flash pid 4821" in deploy_out
 
 
+@pytest.mark.requires_af_unix
 def test_mbdeploy_list_json_identical_to_mbregistry_list(server, store, capsys):
     uid = _uid("json1111")
     _seed_device(store, uid, device_name="vevov")
@@ -268,6 +270,7 @@ def test_build_missing_build_py_is_a_clear_error_not_a_traceback(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_debug_takes_lock_before_running_and_releases_after_success(
     server, store, locks, monkeypatch, capsys
 ):
@@ -308,6 +311,7 @@ def test_debug_takes_lock_before_running_and_releases_after_success(
     assert locks.status(uid) is None  # released after the session ends
 
 
+@pytest.mark.requires_af_unix
 def test_debug_releases_lock_after_a_nonzero_pyocd_exit(
     server, store, locks, monkeypatch
 ):
@@ -325,6 +329,7 @@ def test_debug_releases_lock_after_a_nonzero_pyocd_exit(
     assert locks.status(uid) is None
 
 
+@pytest.mark.requires_af_unix
 def test_debug_releases_lock_on_sigint_and_reports_interrupted(
     server, store, locks, monkeypatch, capsys
 ):
@@ -348,6 +353,7 @@ def test_debug_releases_lock_on_sigint_and_reports_interrupted(
     assert locks.status(uid) is None  # no leaked lock on an interrupted session
 
 
+@pytest.mark.requires_af_unix
 def test_debug_against_already_locked_device_fails_fast_no_retry(
     server, store, locks, monkeypatch, capsys
 ):

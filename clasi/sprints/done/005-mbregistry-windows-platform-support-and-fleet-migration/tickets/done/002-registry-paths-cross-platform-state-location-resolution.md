@@ -1,7 +1,7 @@
 ---
 id: '002'
 title: 'registry.paths: cross-platform state-location resolution'
-status: open
+status: done
 use-cases:
 - SUC-002
 depends-on: []
@@ -66,21 +66,21 @@ the stakeholder.
 
 ## Acceptance Criteria
 
-- [ ] `paths.default_db_path()` returns exactly today's
+- [x] `paths.default_db_path()` returns exactly today's
       `/var/lib/mbregistry/devices.db` on Linux/macOS — verified by a
       test asserting `registry.store.DEFAULT_DB_PATH` is unchanged from
       its value before this ticket.
-- [ ] `paths.default_socket_path()` returns exactly today's
+- [x] `paths.default_socket_path()` returns exactly today's
       `/run/mbregistry/api.sock` on Linux/macOS — same
       no-behavior-change guarantee for `registry.api.DEFAULT_SOCKET_PATH`.
-- [ ] `paths.default_db_path()` on a simulated Windows platform returns
+- [x] `paths.default_db_path()` on a simulated Windows platform returns
       a path rooted at `%ProgramData%` (or its default fallback if the
       env var is unset).
-- [ ] `paths.default_pipe_name()` returns a fixed, documented named-pipe
+- [x] `paths.default_pipe_name()` returns a fixed, documented named-pipe
       path string, callable on any platform.
-- [ ] Module docstring explicitly states the Windows `ProgramData` path
+- [x] Module docstring explicitly states the Windows `ProgramData` path
       is an assumption, not a stakeholder-confirmed decision.
-- [ ] Every existing test in `tests/registry/store/` and
+- [x] Every existing test in `tests/registry/store/` and
       `tests/registry/api/` still passes unmodified (no behavior change
       on existing platforms).
 
@@ -102,3 +102,53 @@ the stakeholder.
 - This module has no I/O and no dependency on `pyserial`/anything
   platform-library-specific — pure path/string computation — so it needs
   no lazy-import guard the way `usbwatch`/`identity` do for `pyserial`.
+
+**Implemented (this ticket):**
+- New `src/mbtools/registry/paths.py`: `default_db_path()`,
+  `default_socket_path()`, `default_pipe_name()`, each dispatching on
+  `sys.platform == "win32"` exactly mirroring `registry.api
+  .default_peer_pid`'s existing platform-dispatch style. No circular
+  -import risk from the note on ticket 001 (`store` importing `identity`
+  at module scope) — `paths.py` imports nothing from `mbtools` at all,
+  only `os`/`sys`/`pathlib`, so it can be imported from `store.py`,
+  `api.py`, or anywhere else without regard to import order.
+- `registry.store.DEFAULT_DB_PATH` and `registry.api.DEFAULT_SOCKET_PATH`
+  now call through to `paths.default_db_path()`/`default_socket_path()`
+  respectively at module scope, exactly as the ticket's Approach
+  specifies. Verified byte-for-byte unchanged on this dev host
+  (Darwin): both still evaluate to `/var/lib/mbregistry/devices.db` and
+  `/run/mbregistry/api.sock`.
+- `default_socket_path()` raises `NotImplementedError` on Windows (the
+  first of the two options the ticket's Approach offered, "raise
+  clearly if called"), rather than the "simply not be called there"
+  alternative — this ticket doesn't wire any Windows call site, so
+  either choice is equally inert here; ticket 005 picks whichever shape
+  fits `cli.py`'s platform branch.
+- **Flag for ticket 005/006**: because `registry.api.DEFAULT_SOCKET_PATH`
+  is now computed at *module import time* by calling through to
+  `default_socket_path()`, simply importing `mbtools.registry.api` on a
+  real Windows interpreter will raise `NotImplementedError` immediately
+  — before any Windows-specific code path is reached. This is a
+  consequence of following the ticket's literal instruction to "call
+  through" at the existing module-scope constant site; it was not
+  something this ticket's own acceptance criteria required testing
+  (they only cover Linux/macOS behavior for `DEFAULT_SOCKET_PATH`, plus
+  Windows behavior for `default_db_path()`/`default_pipe_name()`, which
+  don't raise). Ticket 005 (wiring Windows support into
+  `cli.py`/`run`/`install-service`) and ticket 006 (`windows-latest` CI
+  job actually importing `mbtools.registry.api` during test collection)
+  should account for this — e.g. by never importing `registry.api` on
+  Windows (using `registry.api_windows` exclusively there), or by making
+  `DEFAULT_SOCKET_PATH`'s computation lazy/guarded if `api.py` ends up
+  needing to be import-safe on Windows too.
+- New `tests/registry/paths/test_paths.py` (13 tests): both platform
+  branches of all three functions via `monkeypatch.setattr(paths_module
+  .sys, "platform", ...)`, mirroring `tests/registry/api/test_api.py`'s
+  existing `default_peer_pid` platform-monkeypatch precedent; plus two
+  cross-check tests asserting `registry.store.DEFAULT_DB_PATH` and
+  `registry.api.DEFAULT_SOCKET_PATH` equal the `paths` module's own
+  return values on the platform actually running the test.
+- Scoped run: `uv run pytest tests/registry/paths/ tests/registry/store/
+  tests/registry/api/` — 144 passed, 1 skipped (pre-existing skip,
+  unrelated). Full suite: `uv run pytest -q` — 796 passed, 2 skipped
+  (pre-existing skips, unrelated to this ticket).

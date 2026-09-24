@@ -134,6 +134,7 @@ class _RaisingStdin:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_connect_holds_dtr_rts_low_by_default(server, store, client):
     _seed_device(store)
 
@@ -149,6 +150,7 @@ def test_connect_holds_dtr_rts_low_by_default(server, store, client):
         session.close()
 
 
+@pytest.mark.requires_af_unix
 def test_connect_locks_the_device_for_the_session(server, store, locks, client):
     _seed_device(store)
 
@@ -168,6 +170,7 @@ def test_connect_locks_the_device_for_the_session(server, store, locks, client):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_reset_on_linux_sends_a_break_not_a_reopen(server, store, client):
     _seed_device(store)
 
@@ -188,6 +191,7 @@ def test_reset_on_linux_sends_a_break_not_a_reopen(server, store, client):
         session.close()
 
 
+@pytest.mark.requires_af_unix
 def test_reset_on_macos_closes_and_reopens_not_a_break(server, store, client):
     _seed_device(store)
 
@@ -226,6 +230,7 @@ def test_reset_on_macos_closes_and_reopens_not_a_break(server, store, client):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_already_locked_fails_fast_and_never_opens_the_port(server, store, locks, client):
     _seed_device(store)
     locks.acquire(UID, KIND_FLASH, _local_holder(4242))
@@ -249,6 +254,7 @@ def test_already_locked_fails_fast_and_never_opens_the_port(server, store, locks
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_lock_released_on_explicit_close(server, store, locks, client):
     _seed_device(store)
 
@@ -261,6 +267,7 @@ def test_lock_released_on_explicit_close(server, store, locks, client):
     assert locks.status(UID) is None
 
 
+@pytest.mark.requires_af_unix
 def test_close_is_idempotent(server, store, locks, client):
     _seed_device(store)
 
@@ -272,6 +279,7 @@ def test_close_is_idempotent(server, store, locks, client):
     assert locks.status(UID) is None
 
 
+@pytest.mark.requires_af_unix
 def test_lock_released_after_simulated_ctrl_c_in_interact(
     server, store, locks, client, monkeypatch
 ):
@@ -294,6 +302,7 @@ def test_lock_released_after_simulated_ctrl_c_in_interact(
     assert locks.status(UID) is None
 
 
+@pytest.mark.requires_af_unix
 def test_lock_released_even_if_open_fails(server, store, locks, client):
     _seed_device(store)
 

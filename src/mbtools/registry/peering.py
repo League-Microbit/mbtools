@@ -206,6 +206,7 @@ from mbtools.registry.identity import ProbeResult
 from mbtools.registry.store import (
     STATE_CONNECTED,
     STATE_CONNECTED_NO_FIRMWARE,
+    STATE_DISCONNECTED,
     DeviceRecord,
     Entry,
     Store,
@@ -470,6 +471,23 @@ def _probe_result_from_dict(data: dict[str, Any]) -> ProbeResult:
     )
 
 
+def _attributed_to(store: Store, uid: str | None, host: str) -> bool:
+    """True if ``uid`` is either unknown to ``store`` or currently
+    attributed to ``host`` -- sprint 005 ticket 011's ownership gate for
+    :func:`_apply_event`'s detach/identity/lock_state branches (and
+    :func:`_apply_snapshot_device`'s state layer).
+
+    An *unknown* uid returns ``True`` deliberately -- this function only
+    decides whether ``host``'s report is safe to apply, and for that case
+    the caller's own store method still raises ``KeyError``, which
+    :func:`_apply_event` catches and logs as the pre-existing "unknown
+    uid" drop. Only a *known* uid attributed to some other host (``None``
+    for locally-owned, or a different peer's name) returns ``False``.
+    """
+    record = store.get(uid) if uid is not None else None
+    return record is None or record.host == host
+
+
 def _apply_snapshot_device(store: Store, host: str, data: dict[str, Any]) -> None:
     """Apply one device dict from a peer's snapshot reply into ``store``,
     tagged with ``host`` -- ticket 005's acceptance criterion "every
@@ -480,17 +498,39 @@ def _apply_snapshot_device(store: Store, host: str, data: dict[str, Any]) -> Non
     uid this store has never seen), then layers the announcement/state on
     top -- mirroring exactly what a local ``daemon.run_once()`` cycle
     would have done to reach this same state.
+
+    The announcement/state layer is only applied if ``uid`` is actually
+    attributed to ``host`` on this store's side *after* the upsert above
+    (sprint 005 ticket 011): when ``upsert_remote_attached`` rejected the
+    claim -- ``uid`` is locally owned and connected here -- ``host``'s own
+    ``state`` field (e.g. a stale "disconnected", exactly the shape
+    ``hodr``'s snapshot sent for a board it no longer has, per this
+    ticket's root-cause chain) must not be layered onto *our* row via
+    ``mark_remote_detached``/``apply_remote_probe`` either. Without this
+    check the rejection above only stopped the ``host`` column from being
+    overwritten -- the state-clobber the rejection exists to prevent would
+    still land through this second call, reproducing the exact "pool
+    reports 0 devices" symptom this ticket fixes.
     """
-    store.upsert_remote_attached(
-        data["uid"], host, data.get("port"), data.get("vid_pid")
-    )
+    uid = data["uid"]
+    store.upsert_remote_attached(uid, host, data.get("port"), data.get("vid_pid"))
+    record = store.get(uid)
+    if record is None or record.host != host:
+        logger.warning(
+            "peering: dropping snapshot state for uid %s from %s -- "
+            "attributed to %s here",
+            uid,
+            host,
+            record.host if record is not None else "<unknown>",
+        )
+        return
     state = data.get("state")
     if state == STATE_CONNECTED:
-        store.apply_remote_probe(data["uid"], _probe_result_from_dict(data))
+        store.apply_remote_probe(uid, _probe_result_from_dict(data))
     elif state == STATE_CONNECTED_NO_FIRMWARE:
-        store.apply_remote_probe(data["uid"], None)
+        store.apply_remote_probe(uid, None)
     elif state == "disconnected":
-        store.mark_remote_detached(data["uid"])
+        store.mark_remote_detached(uid)
     # "attached_unprobed": upsert_remote_attached above already covers it.
 
 
@@ -531,6 +571,20 @@ def _apply_event(store: Store, host: str, event: dict[str, Any]) -> None:
     precursor a row can arrive ahead of), so a malformed one (missing
     ``name``/``channel``/``group``) is checked explicitly rather than
     left to raise -- logged and dropped the same way, for the same reason.
+
+    A "detach"/"identity"/"lock_state" event for a uid this store *does*
+    know about, but doesn't currently attribute to ``host``, is dropped
+    the same way (sprint 005 ticket 011): such a uid is either locally
+    owned here or attributed to a different peer, and ``host``'s report
+    about it is stale/foreign either way -- the same "local wins" (and,
+    by extension, "the attributed owner wins") principle
+    :meth:`~mbtools.registry.store.Store._upsert_device` enforces for the
+    "attach" case, extended to the events that mutate an existing row
+    without going through that method. Without this check a peer's
+    detach for a uid it no longer owns could still mark this store's
+    locally-owned (or third-party-owned) copy disconnected, even though
+    the "attach" ownership check alone stops the ``host`` column itself
+    from being reassigned.
     """
     event_type = event.get("type")
     uid = event.get("uid")
@@ -540,15 +594,36 @@ def _apply_event(store: Store, host: str, event: dict[str, Any]) -> None:
                 uid, host, event.get("port"), event.get("vid_pid")
             )
         elif event_type == EVENT_DETACH:
-            store.mark_remote_detached(uid)
+            if _attributed_to(store, uid, host):
+                store.mark_remote_detached(uid)
+            else:
+                logger.warning(
+                    "peering: dropping detach for uid %s from %s -- not attributed to it here",
+                    uid,
+                    host,
+                )
         elif event_type == EVENT_IDENTITY:
-            state = event.get("state")
-            if state == STATE_CONNECTED:
-                store.apply_remote_probe(uid, _probe_result_from_dict(event))
-            elif state == STATE_CONNECTED_NO_FIRMWARE:
-                store.apply_remote_probe(uid, None)
+            if _attributed_to(store, uid, host):
+                state = event.get("state")
+                if state == STATE_CONNECTED:
+                    store.apply_remote_probe(uid, _probe_result_from_dict(event))
+                elif state == STATE_CONNECTED_NO_FIRMWARE:
+                    store.apply_remote_probe(uid, None)
+            else:
+                logger.warning(
+                    "peering: dropping identity for uid %s from %s -- not attributed to it here",
+                    uid,
+                    host,
+                )
         elif event_type == EVENT_LOCK_STATE:
-            store.apply_remote_lock_state(uid, event.get("kind"), event.get("display"))
+            if _attributed_to(store, uid, host):
+                store.apply_remote_lock_state(uid, event.get("kind"), event.get("display"))
+            else:
+                logger.warning(
+                    "peering: dropping lock_state for uid %s from %s -- not attributed to it here",
+                    uid,
+                    host,
+                )
         elif event_type == EVENT_NAME_SET:
             name, channel, group = event.get("name"), event.get("channel"), event.get("group")
             if name is None or channel is None or group is None:
@@ -1473,7 +1548,19 @@ class PeerDiscovery:
         ``EVENT_IDENTITY``; the payload fields sent are exactly what
         :func:`_apply_event`'s matching branch reads back out on the
         receiving side.
+
+        An ``EVENT_ATTACH``/``EVENT_IDENTITY`` publish for a record whose
+        ``state`` is ``disconnected`` is suppressed (sprint 005 ticket
+        011): such a record is a locally-owned row this host no longer
+        has attached, and publishing it would re-assert ownership of it
+        on every peer -- the same stale-claim bug
+        :meth:`~mbtools.registry.store.Store.snapshot_local_devices`
+        avoids on the snapshot path. This does not lose the disconnect
+        notification -- a detach fires its own ``EVENT_DETACH`` publish
+        through this same method, which is never suppressed.
         """
+        if event_type in (EVENT_ATTACH, EVENT_IDENTITY) and record.state == STATE_DISCONNECTED:
+            return
         if event_type == EVENT_ATTACH:
             payload = {"uid": record.uid, "port": record.port, "vid_pid": record.vid_pid}
         elif event_type == EVENT_DETACH:

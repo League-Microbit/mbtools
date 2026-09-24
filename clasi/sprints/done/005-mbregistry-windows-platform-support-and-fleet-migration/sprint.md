@@ -1,7 +1,7 @@
 ---
 id: '005'
 title: mbregistry Windows platform support and fleet migration
-status: ticketing
+status: done
 branch: sprint/005-mbregistry-windows-platform-support-and-fleet-migration
 use-cases:
 - SUC-001
@@ -14,6 +14,7 @@ issues:
 - mbregistry-windows-platform-support.md
 - relay-in-data-plane-can-be-misidentified-by-reprobe.md
 - mbtools-fleet-deployment-tooling-and-migration-docs.md
+- peer-sync-overwrites-ownership-of-locally-attached-devices.md
 ---
 <!-- CLASI: Before changing code or making plans, review the SE process in CLAUDE.md -->
 
@@ -65,6 +66,26 @@ image), exercised against the five test hosts, plus a migration runbook
 the stakeholder can execute against the real fleet — including `torture`
 — on their own schedule, outside this sprint.
 
+**Amendment (mid-sprint, ticket 011): `torture` is now an authorized
+test host for one specific purpose.** The "does not touch `torture`"
+boundary above was written when `torture` was still running the old
+`mbrelay.service`. That has since changed, outside this sprint, by the
+stakeholder's own action: `torture`'s legacy `mbrelay.service` has
+already been replaced by `mbregistry`. That migration is what surfaced
+`peer-sync-overwrites-ownership-of-locally-attached-devices.md`,
+discovered during ticket 007's hardware work — `torture`'s relay pool
+went to zero devices because a stale remote sync from `hodr` overwrote
+ownership of `torture`'s own locally-attached relays. The stakeholder
+has since designated `torture` an authorized test host for verifying
+that fix (new ticket 011) and removed the relay named `getez` from it,
+leaving 3 relays as the concrete verification devices for tickets
+011/010. The rest of the original boundary still holds: this sprint
+does not apply its five-test-host deployment tooling to `torture`, does
+not execute the wider production fleet cutover (`docs/migration.md`'s
+runbook remains the stakeholder's own action, on their own schedule),
+and does not touch any other production host. `torture` is in scope
+only for ticket 011's fix and ticket 010's re-verification of it.
+
 **Hard constraint carried from planning: there is no Windows test
 machine available to this project.** Windows work in this sprint must be
 built and verified with fakes/mocks for the OS-specific seams (USB event
@@ -112,10 +133,14 @@ short of real USB/SCM hardware.
   the fleet (cut-over order, `torture` last, verifying robot-console
   against sprint 004's compatibility pool first, rollback, and the exact
   wiki/doc text to paste into both wikis) — on their own schedule,
-  outside this sprint's write scope. This sprint does not touch
-  `torture`, its `mbrelay.service`, `Busboombot/mbdeploy`,
-  `League-Robotics/microbit-radio-relay`, `robot-console`, the docs hub,
-  or the Robot Garage wiki.
+  outside this sprint's write scope. This sprint does not apply its
+  five-test-host deployment tooling to `torture`, and does not touch
+  `Busboombot/mbdeploy`, `League-Robotics/microbit-radio-relay`,
+  `robot-console`, the docs hub, or the Robot Garage wiki. Ticket 011 is
+  the one authorized exception to "does not touch `torture`" — see the
+  Problem section's amendment: `torture` already runs `mbregistry` (the
+  stakeholder migrated it outside this sprint), and ticket 011 fixes and
+  hardware-verifies a real ownership defect found there.
 - Add a concise README usage section (install, the four commands, and
   the common flows: `list`, `deploy --repo`, `mbserial`, `mbrelay connect
   robot@host`, peering/`--peer`, ports) — no machine specifics, since
@@ -165,13 +190,20 @@ short of real USB/SCM hardware.
 
 ### Out of Scope
 
-- Any further protocol or peering changes — this sprint consumes sprint
-  003's peering/remote-lock machinery and sprint 004's `mbrelay`/
-  robot-console-compatibility work as-is.
+- Any further protocol or peering changes beyond ticket 011's ownership
+  fix — this sprint otherwise consumes sprint 003's peering/remote-lock
+  machinery and sprint 004's `mbrelay`/robot-console-compatibility work
+  as-is. (Amendment: ticket 011, added mid-sprint for the newly linked
+  `peer-sync-overwrites-ownership-of-locally-attached-devices.md` issue,
+  is a deliberate, narrow exception — a correctness fix to
+  `store._upsert_device`/`peering._apply_snapshot_device`/`_apply_event`
+  and the daemon event publishers, not a new peering feature.)
 - Real Windows hardware verification — no test machine is available;
   see "Problem" above.
-- Touching `torture` (the production relay host) or its
-  `mbrelay.service`, or any fleet host other than the five test hosts.
+- Touching `torture` (the production relay host) beyond ticket 011's fix
+  and ticket 010's re-verification of it (see the Problem section's
+  amendment), or touching any fleet host other than the five test hosts
+  and `torture`.
 - Modifying `Busboombot/mbdeploy`, `League-Robotics/microbit-radio-relay`,
   or `robot-console` — other repositories outside this project's write
   scope.
@@ -647,9 +679,17 @@ Before tickets can be created, all of the following must be true:
 | 007 | Idempotent fleet deployment tooling for the five test hosts | — |
 | 008 | Migration runbook (`docs/migration.md`) | 007 |
 | 009 | README usage section | — |
-| 010 | Hardware acceptance: five test hosts (`docs/acceptance/005-hardware.md`) | 001, 007, 008 |
+| 010 | Hardware acceptance: five test hosts (`docs/acceptance/005-hardware.md`) | 001, 007, 008, 011 |
+| 011 | Fix: local ownership wins over stale peer sync | — |
 
 Tickets execute serially in the order listed. Ticket 001 (the re-probe
 fix) is deliberately first, ahead of any Windows work, per team-lead
 scoping — it is the daemon's shared, heavily-tested probe pipeline that
 every later ticket in this sprint builds alongside, not on top of.
+Ticket 011 was added after `peer-sync-overwrites-ownership-of-locally
+-attached-devices.md` (found during ticket 007's own hardware work, on
+`torture`) was linked to this sprint as an urgent correctness fix; it
+has no dependency on 008/009 and, per the listed execution order, is
+picked up next, with 010 now also depending on it so the sprint's final
+hardware-acceptance pass re-verifies the fix on `torture`'s real relay
+pool.

@@ -425,12 +425,12 @@ class RelayPool:
         ``state == STATE_CONNECTED`` is this module's own addition beyond
         ``relay.cli``'s filter (which only checks ``role``/lock, since it
         goes through a registry ``list`` op that already reflects live
-        state at read time): ``store.snapshot_local_devices()`` includes
-        every local row regardless of state (a disconnected board keeps
-        its last-known ``role``/``port`` for diagnostics -- ``store.
-        py``'s own ``DeviceRecord`` docstring), so without this check a
-        just-unplugged board's stale row would be offered and immediately
-        fail to open.
+        state at read time): ``store.snapshot_local_devices()`` excludes
+        fully ``disconnected`` local rows (sprint 005 ticket 011), but
+        still includes ``attached_unprobed``/``connected_no_firmware``
+        ones -- a board mid-probe or that failed to announce is not yet
+        (or never) actually usable, so without this check a not-yet-ready
+        board's row would be offered and immediately fail to open.
         """
         for record in self._store.snapshot_local_devices():
             if record.state != STATE_CONNECTED:

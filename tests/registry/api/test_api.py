@@ -249,6 +249,7 @@ def test_start_makes_the_socket_connectable_by_non_owning_users(make_server):
     assert mode & 0o777 == 0o666
 
 
+@pytest.mark.requires_af_unix
 def test_stop_joins_connection_handler_threads_before_returning(make_server):
     """Regression test for a flaky ``IndexError`` in
     ``store._row_to_record`` traced to a shutdown-ordering race: ``stop()``
@@ -278,6 +279,7 @@ def test_stop_joins_connection_handler_threads_before_returning(make_server):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_list_includes_every_device_with_lock_status_folded_in(make_server, locks):
     srv = make_server(peer_pid_fn=_sequential_peer_pid_fn([PID_A]))
     locks.acquire(UID, KIND_SERIAL, _local_holder(PID_A))
@@ -295,6 +297,7 @@ def test_list_includes_every_device_with_lock_status_folded_in(make_server, lock
     client.close()
 
 
+@pytest.mark.requires_af_unix
 def test_find_by_uid_short_uid_and_device_name(make_server):
     srv = make_server()
     client = _Client(srv.socket_path)
@@ -308,6 +311,7 @@ def test_find_by_uid_short_uid_and_device_name(make_server):
     client.close()
 
 
+@pytest.mark.requires_af_unix
 def test_find_unknown_device_returns_not_found(make_server):
     srv = make_server()
     client = _Client(srv.socket_path)
@@ -327,6 +331,7 @@ def test_find_unknown_device_returns_not_found(make_server):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_list_local_row_has_no_host_no_endpoint_and_reachable_true(make_server):
     srv = make_server()
     client = _Client(srv.socket_path)
@@ -341,6 +346,7 @@ def test_list_local_row_has_no_host_no_endpoint_and_reachable_true(make_server):
     client.close()
 
 
+@pytest.mark.requires_af_unix
 def test_find_local_device_endpoint_is_absent_or_null(make_server):
     srv = make_server()
     client = _Client(srv.socket_path)
@@ -352,6 +358,7 @@ def test_find_local_device_endpoint_is_absent_or_null(make_server):
     client.close()
 
 
+@pytest.mark.requires_af_unix
 def test_find_remote_owned_device_includes_endpoint_from_peer_table(make_server, store):
     store.record_peer_seen("loki", "loki:8900")
     store.upsert_remote_attached(UID_REMOTE, "loki", "/dev/ttyACM9", VID_PID)
@@ -367,6 +374,7 @@ def test_find_remote_owned_device_includes_endpoint_from_peer_table(make_server,
     client.close()
 
 
+@pytest.mark.requires_af_unix
 def test_list_remote_owned_row_never_makes_a_live_lock_call(make_server, store):
     """Ticket 010 acceptance criterion: a remote-owned row's lock_kind/
     lock_pid come from no live LockManager call -- they stay None
@@ -390,6 +398,7 @@ def test_list_remote_owned_row_never_makes_a_live_lock_call(make_server, store):
     client.close()
 
 
+@pytest.mark.requires_af_unix
 def test_list_remote_owned_row_with_no_matching_peer_row_reports_unreachable(
     make_server, store
 ):
@@ -409,6 +418,7 @@ def test_list_remote_owned_row_with_no_matching_peer_row_reports_unreachable(
     client.close()
 
 
+@pytest.mark.requires_af_unix
 def test_list_remote_owned_row_unreachable_when_peer_marked_unreachable(
     make_server, store
 ):
@@ -431,6 +441,7 @@ def test_list_remote_owned_row_unreachable_when_peer_marked_unreachable(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_lock_happy_path(make_server, locks):
     srv = make_server(peer_pid_fn=_sequential_peer_pid_fn([PID_A]))
     client = _Client(srv.socket_path)
@@ -443,6 +454,7 @@ def test_lock_happy_path(make_server, locks):
     client.close()
 
 
+@pytest.mark.requires_af_unix
 def test_lock_already_locked_returns_holder_kind_and_pid(make_server):
     srv = make_server(peer_pid_fn=_sequential_peer_pid_fn([PID_A, PID_B]))
     holder = _Client(srv.socket_path)
@@ -458,6 +470,7 @@ def test_lock_already_locked_returns_holder_kind_and_pid(make_server):
     contender.close()
 
 
+@pytest.mark.requires_af_unix
 def test_lock_unknown_device_is_not_found(make_server):
     srv = make_server()
     client = _Client(srv.socket_path)
@@ -469,6 +482,7 @@ def test_lock_unknown_device_is_not_found(make_server):
     client.close()
 
 
+@pytest.mark.requires_af_unix
 def test_lock_unknown_kind_is_invalid_request(make_server):
     srv = make_server()
     client = _Client(srv.socket_path)
@@ -480,6 +494,7 @@ def test_lock_unknown_kind_is_invalid_request(make_server):
     client.close()
 
 
+@pytest.mark.requires_af_unix
 def test_unlock_releases_own_lock(make_server, locks):
     srv = make_server(peer_pid_fn=_sequential_peer_pid_fn([PID_A]))
     client = _Client(srv.socket_path)
@@ -492,6 +507,7 @@ def test_unlock_releases_own_lock(make_server, locks):
     client.close()
 
 
+@pytest.mark.requires_af_unix
 def test_unlock_by_a_different_connection_cannot_steal_release(make_server, locks):
     srv = make_server(peer_pid_fn=_sequential_peer_pid_fn([PID_A, PID_B]))
     owner = _Client(srv.socket_path)
@@ -512,6 +528,7 @@ def test_unlock_by_a_different_connection_cannot_steal_release(make_server, lock
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_connection_close_releases_only_that_connections_locks(make_server, locks):
     srv = make_server(peer_pid_fn=_sequential_peer_pid_fn([PID_A, PID_B]))
     conn_a = _Client(srv.socket_path)
@@ -533,6 +550,7 @@ def test_connection_close_releases_only_that_connections_locks(make_server, lock
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_flash_without_flash_lock_is_refused(make_server, tmp_path):
     srv = make_server(peer_pid_fn=_sequential_peer_pid_fn([PID_A]))
     client = _Client(srv.socket_path)
@@ -547,6 +565,7 @@ def test_flash_without_flash_lock_is_refused(make_server, tmp_path):
     client.close()
 
 
+@pytest.mark.requires_af_unix
 def test_flash_requires_the_lock_be_held_by_this_connections_own_pid(make_server, locks, tmp_path):
     srv = make_server(peer_pid_fn=_sequential_peer_pid_fn([PID_B]))
     locks.acquire(UID, KIND_FLASH, _local_holder(PID_A))  # some other connection holds it
@@ -561,6 +580,7 @@ def test_flash_requires_the_lock_be_held_by_this_connections_own_pid(make_server
     client.close()
 
 
+@pytest.mark.requires_af_unix
 def test_flash_streams_log_lines_in_order_and_releases_lock_on_completion(make_server, locks, tmp_path):
     lines = ["erasing...", "programming...", "verifying..."]
     srv = make_server(peer_pid_fn=_sequential_peer_pid_fn([PID_A]), runner=_SpyRunner(lines=lines, exit_code=0))
@@ -585,6 +605,7 @@ def test_flash_streams_log_lines_in_order_and_releases_lock_on_completion(make_s
     client.close()
 
 
+@pytest.mark.requires_af_unix
 def test_failed_flash_still_releases_lock(make_server, locks, tmp_path):
     srv = make_server(peer_pid_fn=_sequential_peer_pid_fn([PID_A]), runner=_SpyRunner(exit_code=1))
     client = _Client(srv.socket_path)
@@ -600,6 +621,7 @@ def test_failed_flash_still_releases_lock(make_server, locks, tmp_path):
     client.close()
 
 
+@pytest.mark.requires_af_unix
 def test_flash_hex_validation_error_is_reported_and_releases_lock(make_server, locks, tmp_path):
     srv = make_server(peer_pid_fn=_sequential_peer_pid_fn([PID_A]))
     client = _Client(srv.socket_path)
@@ -615,6 +637,7 @@ def test_flash_hex_validation_error_is_reported_and_releases_lock(make_server, l
     client.close()
 
 
+@pytest.mark.requires_af_unix
 def test_flash_release_triggers_flash_release_callback(tmp_path, socket_dir, store):
     fired = []
     locks = LockManager(flash_release_callback=fired.append)
@@ -644,6 +667,7 @@ def test_flash_release_triggers_flash_release_callback(tmp_path, socket_dir, sto
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_mark_flashed_without_flash_lock_is_refused(make_server, store):
     srv = make_server(peer_pid_fn=_sequential_peer_pid_fn([PID_A]))
     client = _Client(srv.socket_path)
@@ -656,6 +680,7 @@ def test_mark_flashed_without_flash_lock_is_refused(make_server, store):
     client.close()
 
 
+@pytest.mark.requires_af_unix
 def test_mark_flashed_held_by_a_different_connection_is_refused(make_server, locks, store):
     srv = make_server(peer_pid_fn=_sequential_peer_pid_fn([PID_B]))
     locks.acquire(UID, KIND_FLASH, _local_holder(PID_A))  # some other connection holds it
@@ -670,6 +695,7 @@ def test_mark_flashed_held_by_a_different_connection_is_refused(make_server, loc
     client.close()
 
 
+@pytest.mark.requires_af_unix
 def test_mark_flashed_increments_flash_count_and_does_not_touch_the_lock(
     make_server, locks, store
 ):
@@ -687,6 +713,7 @@ def test_mark_flashed_increments_flash_count_and_does_not_touch_the_lock(
     client.close()
 
 
+@pytest.mark.requires_af_unix
 def test_mark_flashed_does_not_invoke_pyocd(make_server):
     runner = _SpyRunner()
     srv = make_server(peer_pid_fn=_sequential_peer_pid_fn([PID_A]), runner=runner)
@@ -699,6 +726,7 @@ def test_mark_flashed_does_not_invoke_pyocd(make_server):
     client.close()
 
 
+@pytest.mark.requires_af_unix
 def test_mark_flashed_does_not_trigger_flash_release_callback(tmp_path, socket_dir, store):
     fired = []
     locks = LockManager(flash_release_callback=fired.append)
@@ -725,6 +753,7 @@ def test_mark_flashed_does_not_trigger_flash_release_callback(tmp_path, socket_d
     srv.stop()
 
 
+@pytest.mark.requires_af_unix
 def test_mark_flashed_unknown_uid_returns_not_found(make_server):
     srv = make_server(peer_pid_fn=_sequential_peer_pid_fn([PID_A]))
     client = _Client(srv.socket_path)
@@ -741,6 +770,7 @@ def test_mark_flashed_unknown_uid_returns_not_found(make_server):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_malformed_json_returns_invalid_request(make_server):
     srv = make_server()
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -754,6 +784,7 @@ def test_malformed_json_returns_invalid_request(make_server):
     sock.close()
 
 
+@pytest.mark.requires_af_unix
 def test_unknown_op_returns_invalid_request(make_server):
     srv = make_server()
     client = _Client(srv.socket_path)
@@ -770,6 +801,7 @@ def test_unknown_op_returns_invalid_request(make_server):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_periodic_sweep_releases_lock_of_a_dead_holder_without_closing_the_connection(make_server, locks):
     dead_pids = {PID_A}
     srv = make_server(
@@ -835,6 +867,7 @@ def test_default_peer_pid_raises_on_unsupported_platform(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_names_get_returns_none_for_an_unregistered_name(make_server):
     srv = make_server()
     client = _Client(srv.socket_path)
@@ -845,6 +878,7 @@ def test_names_get_returns_none_for_an_unregistered_name(make_server):
     client.close()
 
 
+@pytest.mark.requires_af_unix
 def test_names_set_then_get_round_trips_through_the_store(make_server, store):
     srv = make_server()
     client = _Client(srv.socket_path)
@@ -869,6 +903,7 @@ def test_names_set_then_get_round_trips_through_the_store(make_server, store):
     client.close()
 
 
+@pytest.mark.requires_af_unix
 def test_names_clear_drops_the_row(make_server):
     srv = make_server()
     client = _Client(srv.socket_path)
@@ -882,6 +917,7 @@ def test_names_clear_drops_the_row(make_server):
     client.close()
 
 
+@pytest.mark.requires_af_unix
 def test_names_clear_of_an_unregistered_name_is_not_an_error(make_server):
     srv = make_server()
     client = _Client(srv.socket_path)
@@ -892,6 +928,7 @@ def test_names_clear_of_an_unregistered_name_is_not_an_error(make_server):
     client.close()
 
 
+@pytest.mark.requires_af_unix
 def test_names_list_includes_every_row(make_server):
     srv = make_server()
     client = _Client(srv.socket_path)
@@ -906,6 +943,7 @@ def test_names_list_includes_every_row(make_server):
     client.close()
 
 
+@pytest.mark.requires_af_unix
 def test_names_set_rejects_a_malformed_name(make_server):
     srv = make_server()
     client = _Client(srv.socket_path)
@@ -917,6 +955,7 @@ def test_names_set_rejects_a_malformed_name(make_server):
     client.close()
 
 
+@pytest.mark.requires_af_unix
 def test_names_get_requires_name(make_server):
     srv = make_server()
     client = _Client(srv.socket_path)
@@ -928,6 +967,7 @@ def test_names_get_requires_name(make_server):
     client.close()
 
 
+@pytest.mark.requires_af_unix
 def test_names_set_fires_the_name_set_callback_after_the_write_commits(make_server, store):
     calls = []
     srv = make_server(name_set_callback=calls.append)
@@ -943,6 +983,7 @@ def test_names_set_fires_the_name_set_callback_after_the_write_commits(make_serv
     client.close()
 
 
+@pytest.mark.requires_af_unix
 def test_names_clear_fires_the_name_clear_callback(make_server):
     calls = []
     srv = make_server(name_clear_callback=calls.append)
@@ -955,6 +996,7 @@ def test_names_clear_fires_the_name_clear_callback(make_server):
     client.close()
 
 
+@pytest.mark.requires_af_unix
 def test_names_callbacks_default_to_none_and_are_never_required(make_server):
     """A server built without name_set_callback/name_clear_callback (every
     pre-ticket-005 construction) still serves names_set/names_clear --

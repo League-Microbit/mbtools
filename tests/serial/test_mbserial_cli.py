@@ -141,6 +141,7 @@ def test_registry_unavailable_reports_no_daemon(tmp_path, capsys):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_already_locked_fails_fast_naming_holder(server, store, locks, capsys):
     _seed_device(store)
     locks.acquire(UID, KIND_FLASH, _local_holder(5150))
@@ -158,6 +159,7 @@ def test_already_locked_fails_fast_naming_holder(server, store, locks, capsys):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_interactive_session_end_to_end(server, store, locks, monkeypatch, capsys):
     _seed_device(store)
     _install_fake_pyserial(monkeypatch)
@@ -177,6 +179,7 @@ def test_interactive_session_end_to_end(server, store, locks, monkeypatch, capsy
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_one_shot_message_prints_reply_lines(server, store, locks, monkeypatch, capsys):
     _seed_device(store)
     _install_fake_pyserial(
@@ -203,6 +206,7 @@ def test_one_shot_message_prints_reply_lines(server, store, locks, monkeypatch, 
     assert locks.status(UID) is None
 
 
+@pytest.mark.requires_af_unix
 def test_one_shot_no_reply_is_reported_and_unlocked(
     server, store, locks, monkeypatch, capsys
 ):
@@ -233,6 +237,7 @@ def test_one_shot_no_reply_is_reported_and_unlocked(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_reset_flag_reaches_connect_and_resets_the_board(
     server, store, locks, monkeypatch
 ):
@@ -259,3 +264,29 @@ def test_reset_flag_reaches_connect_and_resets_the_board(
     reset_happened = bool(opened[-1].break_calls) or len(opened) > 1
     assert reset_happened
     assert locks.status(UID) is None
+
+
+# ---------------------------------------------------------------------------
+# local-registry address resolution on Windows (ticket 006, team-lead scope)
+# ---------------------------------------------------------------------------
+
+
+def test_cli_resolves_windows_pipe_name_with_no_socket_override(monkeypatch):
+    """Regression test for the gap ticket 005 flagged and ticket 006 closed:
+    ``cmd_connect`` used to call ``resolve_socket_path(args.socket,
+    _SOCKET_ENV_VAR, DEFAULT_SOCKET_PATH)`` directly -- ``DEFAULT_SOCKET_PATH``
+    is ``None`` on ``sys.platform == "win32"``, so with no ``--socket``/
+    ``$MBREGISTRY_SOCKET`` override that call raised ``TypeError`` from
+    ``Path(None)`` before ever reaching ``RegistryClient``. ``cli.py`` now
+    resolves through ``registry.client.resolve_local_api_address``
+    (imported as ``cli_mod.resolve_local_api_address``) instead, which
+    dispatches on ``sys.platform`` first and returns the Windows named-pipe
+    default rather than raising.
+    """
+    import sys
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.delenv("MBREGISTRY_SOCKET", raising=False)
+    result = cli_mod.resolve_local_api_address(None, cli_mod._SOCKET_ENV_VAR)
+    assert result == r"\\.\pipe\mbregistry"
+    assert isinstance(result, str)

@@ -238,6 +238,7 @@ def _seed_owned_device(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_remote_relay_guard_refuses_before_lock_or_hex_resolution(
     local_server, local_store, remote_server, owning_store, owning_locks, capsys
 ):
@@ -273,6 +274,7 @@ def test_remote_relay_guard_refuses_before_lock_or_hex_resolution(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_remote_device_locked_error_names_host_not_null_pid(
     local_server, local_store, remote_server, owning_store, capsys
 ):
@@ -318,6 +320,7 @@ def test_remote_device_locked_error_names_host_not_null_pid(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_owning_host_unreachable_at_connect_reports_cleanly(
     local_server, local_store, capsys
 ):
@@ -347,6 +350,7 @@ def test_owning_host_unreachable_at_connect_reports_cleanly(
     assert "loki" in err
 
 
+@pytest.mark.requires_af_unix
 def test_owning_host_unreachable_mid_flash_reports_cleanly(
     local_server, local_store, remote_server, owning_store, owning_locks,
     monkeypatch, capsys,
@@ -385,6 +389,7 @@ def test_owning_host_unreachable_mid_flash_reports_cleanly(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_remote_flash_success_increments_flash_count_server_side(
     local_server, local_store, remote_server, owning_store, owning_locks,
     monkeypatch, tmp_path, capsys,
@@ -429,6 +434,7 @@ def test_remote_flash_success_increments_flash_count_server_side(
     assert owning_locks.status(uid) is None  # unlocked afterwards
 
 
+@pytest.mark.requires_af_unix
 def test_remote_flash_pyocd_failure_uses_generic_message(
     local_server, local_store, remote_server, owning_store, owning_locks,
     monkeypatch, tmp_path, capsys,
@@ -537,6 +543,7 @@ def _run_owning_daemon_and_remote_api(tmp_path, uid, announcements):
     return store, remote_api, thread, stop_event
 
 
+@pytest.mark.requires_af_unix
 def test_remote_deploy_hex_end_to_end_reports_new_announcement(
     tmp_path, local_socket_dir, monkeypatch, capsys
 ):

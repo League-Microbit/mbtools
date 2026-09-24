@@ -1,0 +1,67 @@
+name: CI
+
+# Sprint 005 ticket 006: the project's baseline CI -- runs the full
+# mbtools test suite on ubuntu-latest, macos-latest, and windows-latest.
+# The windows-latest leg is this sprint's one piece of real,
+# non-hardware verification of the Windows-specific code from tickets
+# 002-005: it proves that code imports and runs correctly under actual
+# Windows/CPython (the ctypes/kernel32 calls in registry.api_windows,
+# the sc.exe-text rendering in registry.service_windows) against fakes,
+# without needing Windows hardware. See docs/acceptance/005-hardware.md
+# for what a green run here does NOT prove (no real USB micro:bit, no
+# real SCM restart-on-crash behavior).
+#
+# `push` has no branch filter so pushing any branch -- including a
+# sprint branch under active development -- triggers a run directly;
+# `pull_request` is scoped to the default branch, matching the standard
+# convention. Together these satisfy "triggers on push/PR to the
+# default branch" without blocking iteration on a feature branch before
+# it's merged.
+
+on:
+  push:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # A hung test should fail loudly, not burn the whole job's default
+    # 6h runner allowance. pytest-timeout (pyproject.toml's `[tool.pytest
+    # .ini_options] timeout = 60`) is the first line of defense --  it
+    # turns a hang into a named per-test failure -- this is the backstop
+    # for a hang pytest-timeout itself can't catch (e.g. within a fixture
+    # teardown running outside the timed test body).
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+
+      - name: Run the test suite
+        # -v (not -q -v together -- pytest's verbosity is additive/
+        # subtractive across -v/-q, and the two cancel back out to the
+        # grouped-dots-per-file default, which hid every failing test's
+        # actual name behind an unlabeled `F`/`E` in the windows-latest
+        # investigation this fixed) so a failure names its own test.
+        #
+        # scripts/run_tests_ci.py, not a bare `pytest` invocation: see
+        # that script's own docstring -- pytest itself finished this
+        # suite in ~132s on windows-latest, but the job then sat idle
+        # for another ~18 minutes (killed by timeout-minutes) waiting on
+        # Python's normal interpreter shutdown. The wrapper forces an
+        # immediate os._exit() with pytest's own exit code the moment
+        # pytest.main() returns, sidestepping that shutdown hang instead
+        # of relying on timeout-minutes as anything but a last-resort
+        # backstop.
+        run: uv run python scripts/run_tests_ci.py -v --tb=short -ra --timeout=60

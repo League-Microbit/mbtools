@@ -309,6 +309,7 @@ def test_two_remote_sessions_conflict_and_holder_is_session_shaped(remote_server
     contender.close()
 
 
+@pytest.mark.requires_af_unix
 def test_local_holder_beats_remote_contender_with_unchanged_2_key_shape(
     remote_server, local_server
 ):

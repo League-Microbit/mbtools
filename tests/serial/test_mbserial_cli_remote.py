@@ -194,6 +194,7 @@ def _seed_owned_device(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_remote_device_locked_error_names_host_not_null_pid(
     local_server, local_store, remote_server, owning_store, capsys
 ):
@@ -227,6 +228,7 @@ def test_remote_device_locked_error_names_host_not_null_pid(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_owning_host_unreachable_at_connect_reports_cleanly(local_server, local_store, capsys):
     uid = _uid("unreachr")
     probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -250,6 +252,7 @@ def test_owning_host_unreachable_at_connect_reports_cleanly(local_server, local_
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_remote_interactive_session_end_to_end(
     local_server, local_store, remote_server, owning_store, owning_locks, monkeypatch, capsys
 ):
@@ -270,6 +273,7 @@ def test_remote_interactive_session_end_to_end(
     _wait_until(lambda: owning_locks.status(uid) is None)
 
 
+@pytest.mark.requires_af_unix
 def test_remote_one_shot_message_prints_reply_lines(
     local_server, local_store, remote_server, owning_store, owning_locks, capsys
 ):
@@ -310,6 +314,7 @@ def test_remote_one_shot_message_prints_reply_lines(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_remote_reset_flag_sends_a_break_over_the_wire(
     local_server, local_store, remote_server, owning_store, owning_locks,
     fake_serials, monkeypatch,

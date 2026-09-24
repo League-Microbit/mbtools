@@ -305,6 +305,7 @@ def test_assemble_registry_lock_display_callback_reaches_peering(tmp_path, socke
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_two_pipelines_connected_via_peer_flag_equivalent_converge(tmp_path, socket_dir, capsys):
     uid_a = _uid("peera111")
     uid_b = _uid("peerb222")

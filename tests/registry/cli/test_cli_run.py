@@ -112,6 +112,7 @@ def _wait_until(predicate, timeout=5.0, interval=0.01):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_run_then_list_smoke(tmp_path, socket_dir, capsys):
     """``mbregistry run``'s own pipeline, driven in a background thread,
     responds to ``mbregistry list`` from a second connection while it is
@@ -162,6 +163,7 @@ def test_run_then_list_smoke(tmp_path, socket_dir, capsys):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_af_unix
 def test_concurrent_daemon_cycles_and_api_calls_do_not_race(tmp_path, socket_dir):
     """Hammers ``daemon.run_once()`` from one thread while several client
     threads concurrently call ``list``/``lock``/``unlock`` over the same

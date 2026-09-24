@@ -188,13 +188,25 @@ def probe(
     *,
     serial_factory: Callable[..., Any] | None = None,
     settle_s: float | None = None,
+    reset_first: bool = False,
 ) -> ProbeResult | None:
     """Open ``port``, send ``HELLO``, and parse the announcement.
 
     Opens with ``dsrdtr=False, rtscts=False`` and DTR/RTS held low (per
-    brief §3.2 step 4 / spec cross-cutting §4), waits :data:`_SETTLE_DELAY_S`
-    for a spontaneous announcement, resets the input buffer once, then
-    writes ``HELLO\\n`` and reads lines for up to ``timeout_s`` (one "read
+    brief §3.2 step 4 / spec cross-cutting §4). If ``reset_first`` is
+    true, asserts a serial ``BREAK`` for :data:`mbtools.serial.connect
+    .BREAK_DURATION` seconds (the same duration ``serial.connect`` and
+    ``relay.protocol`` already use for a BREAK-based reset) immediately
+    after ``open()`` and before anything else -- forcing a board that is
+    parked in its data plane (e.g. a relay mid-forward) back into its own
+    command plane before ``HELLO`` is ever written, so a radio-forwarded
+    fragment of another device's announcement can never be read as this
+    board's own identity. ``reset_first`` defaults to ``False``, in which
+    case this function's behavior, byte for byte, is unchanged from
+    before this parameter existed -- no ``send_break`` call, same
+    read-window/retry logic. Then waits :data:`_SETTLE_DELAY_S` for a
+    spontaneous announcement, resets the input buffer once, then writes
+    ``HELLO\\n`` and reads lines for up to ``timeout_s`` (one "read
     window"), returning as soon as a line parses against either dialect.
 
     If that first window ends with nothing usable -- silence, or only a
@@ -255,6 +267,17 @@ def probe(
         return None
 
     try:
+        if reset_first:
+            # Deferred import: mbtools.serial.connect imports
+            # mbtools.registry.client -> ... -> mbtools.registry.store,
+            # which imports *this* module at module scope (ProbeResult,
+            # short_uid) -- a top-level import here would be circular.
+            # Importing inside the function, at call time rather than at
+            # import time, breaks the cycle; every module involved is
+            # already fully loaded by the time any caller actually probes.
+            from mbtools.serial.connect import BREAK_DURATION
+
+            ser.send_break(BREAK_DURATION)
         if settle:
             time.sleep(settle)
         ser.reset_input_buffer()

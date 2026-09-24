@@ -182,6 +182,95 @@ def test_upsert_attached_never_sets_host(store):
     assert record.host is None
 
 
+# ---------------------------------------------------------------------------
+# Local ownership wins over stale peer sync (sprint 005 ticket 011) --
+# the torture/hodr production bug: a remote snapshot/event must never
+# overwrite a row this host currently owns and has attached, but a
+# disconnected local row must still hand over cleanly, and ownership must
+# be able to move back and forth as boards actually move between hosts.
+# ---------------------------------------------------------------------------
+
+
+def test_upsert_remote_attached_does_not_overwrite_local_connected_row(store):
+    # The torture/hodr scenario: torture has UID attached locally and
+    # connected; a stale remote claim from hodr must be rejected outright.
+    store.upsert_attached(UID, "/dev/ttyACM0", VID_PID)
+    store.apply_probe_result(UID, _probe("vevov"))
+
+    result = store.upsert_remote_attached(UID, "hodr", "/dev/ttyACM9", VID_PID)
+
+    assert result.host is None
+    assert result.port == "/dev/ttyACM0"
+    record = store.get(UID)
+    assert record.host is None
+    assert record.port == "/dev/ttyACM0"
+    assert record.state == STATE_CONNECTED
+    assert record.device_name == "vevov"
+
+
+def test_upsert_remote_attached_does_not_overwrite_local_attached_unprobed_row(store):
+    # Same rejection, but before the local row has even been probed yet --
+    # "connected" isn't the only state a local claim must be defended in.
+    store.upsert_attached(UID, "/dev/ttyACM0", VID_PID)
+
+    store.upsert_remote_attached(UID, "hodr", "/dev/ttyACM9", VID_PID)
+
+    record = store.get(UID)
+    assert record.host is None
+    assert record.state == STATE_ATTACHED_UNPROBED
+
+
+def test_upsert_remote_attached_takes_over_local_disconnected_row(store):
+    # Hand-over: a local row this host no longer has attached is fair game
+    # for a remote claim -- fix point 3.
+    store.upsert_attached(UID, "/dev/ttyACM0", VID_PID)
+    store.apply_probe_result(UID, _probe("vevov"))
+    store.mark_disconnected(UID)
+
+    record = store.upsert_remote_attached(UID, "hodr", "/dev/ttyACM9", VID_PID)
+
+    assert record.host == "hodr"
+    assert record.port == "/dev/ttyACM9"
+    assert record.state == STATE_ATTACHED_UNPROBED
+    assert record.last_probe == 0.0
+    # Announcement history survives the hand-over, same "never clobber
+    # what we don't have fresh data for" rule as every other reattach.
+    assert record.device_name == "vevov"
+
+
+def test_upsert_attached_restores_local_ownership_after_remote_takeover(store):
+    # The reverse move: once a peer has taken over a uid, this host's own
+    # usbwatch reattaching it must win it back, whatever the mirrored
+    # remote row's current state.
+    store.upsert_attached(UID, "/dev/ttyACM0", VID_PID)
+    store.mark_disconnected(UID)
+    store.upsert_remote_attached(UID, "hodr", "/dev/ttyACM9", VID_PID)
+    store.apply_remote_probe(UID, _probe("vevov"))
+    assert store.get(UID).host == "hodr"
+    assert store.get(UID).state == STATE_CONNECTED
+
+    record = store.upsert_attached(UID, "/dev/ttyACM0", VID_PID)
+
+    assert record.host is None
+    assert record.port == "/dev/ttyACM0"
+
+
+def test_ping_pong_local_remote_local_ends_with_correct_owner(store):
+    # local -> remote -> local round-trip must end owned by whoever
+    # currently has the board attached, at every step.
+    store.upsert_attached(UID, "/dev/ttyACM0", VID_PID)
+    assert store.get(UID).host is None
+
+    store.mark_disconnected(UID)
+    store.upsert_remote_attached(UID, "hodr", "/dev/ttyACM9", VID_PID)
+    assert store.get(UID).host == "hodr"
+
+    store.mark_disconnected(UID)
+    store.upsert_attached(UID, "/dev/ttyACM0", VID_PID)
+    assert store.get(UID).host is None
+    assert store.get(UID).port == "/dev/ttyACM0"
+
+
 def test_mark_remote_detached_sets_disconnected_and_never_deletes(store):
     store.upsert_remote_attached(UID, "loki", "/dev/ttyACM0", VID_PID)
 
@@ -349,6 +438,21 @@ def test_snapshot_local_devices_excludes_remote_rows(store):
 def test_snapshot_local_devices_empty_when_all_remote(store):
     store.upsert_remote_attached(UID, "loki", "/dev/ttyACM0", VID_PID)
     assert store.snapshot_local_devices() == []
+
+
+def test_snapshot_local_devices_excludes_disconnected_local_rows(store):
+    # Fix point 2: a local row this host no longer has attached must not
+    # be advertised as an active claim of ownership -- the hodr half of
+    # the production bug (hodr kept re-publishing stale disconnected rows
+    # for boards it tested in earlier sprints).
+    store.upsert_attached(UID, "/dev/ttyACM0", VID_PID)
+    store.upsert_attached(UID2, "/dev/ttyACM1", VID_PID)
+    store.mark_disconnected(UID)
+
+    snapshot = store.snapshot_local_devices()
+
+    uids = {d.uid for d in snapshot}
+    assert uids == {UID2}
 
 
 # ---------------------------------------------------------------------------

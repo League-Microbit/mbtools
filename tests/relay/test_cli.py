@@ -355,6 +355,43 @@ def test_local_connect_end_to_end(monkeypatch, capsys):
     assert "answered PING" in err
 
 
+def test_interactive_session_survives_non_tty_real_fd_stdin(monkeypatch, capsys):
+    """Regression test (sprint 005 ticket 010, found on real hardware):
+    a redirected file, a pipe, or ``/dev/null`` gives ``sys.stdin`` a
+    real file descriptor (``fileno()`` succeeds) while ``os.isatty()``
+    is still ``False`` -- unlike the ``_immediate_stdin_eof`` autouse
+    fixture's ``io.StringIO("")``, which has no ``fileno()`` at all and
+    so never exercised this branch. Before the fix, ``_interactive``
+    chose its ``select``-based read loop whenever ``stdin_fd is not
+    None`` (true here), but only imports ``select``/``termios``/``tty``
+    when ``is_tty`` is also true (false here) -- crashing with
+    ``AttributeError: 'NoneType' object has no attribute 'select'`` on
+    the very first loop iteration. This is exactly what happened running
+    ``mbrelay connect`` with stdin redirected from ``/dev/null`` during
+    this ticket's hardware acceptance pass.
+    """
+    import os
+
+    devnull = open(os.devnull, "r")
+    monkeypatch.setattr(sys, "stdin", devnull)
+    try:
+        assert devnull.fileno() is not None
+        assert os.isatty(devnull.fileno()) is False
+
+        fake_channel = FakeByteChannel(full_script(20, 30))
+        monkeypatch.setattr(cli_mod, "_open_local_channel", lambda port: fake_channel)
+        client = FakeRegistryClient(devices=[LOCAL_RELAY], names={"tovez": NAME_ENTRY_TOVEZ})
+        args = _connect_args("tovez")
+
+        code = cli_mod._run_connect(client, cli_mod.parse_target("tovez"), args)
+
+        assert code == EXIT_OK
+        err = capsys.readouterr().err
+        assert "relay closed the connection" not in err
+    finally:
+        devnull.close()
+
+
 def test_local_connect_never_calls_open_remote_channel(monkeypatch):
     fake_channel = FakeByteChannel(full_script(20, 30))
     monkeypatch.setattr(cli_mod, "_open_local_channel", lambda port: fake_channel)
@@ -597,6 +634,7 @@ def server(socket_dir, store):
     srv.stop()
 
 
+@pytest.mark.requires_af_unix
 def test_names_get_reports_not_registered(server, capsys):
     with pytest.raises(SystemExit) as excinfo:
         cli_mod.main(["names", "get", "tovez", "--socket", str(server.socket_path)])
@@ -604,6 +642,7 @@ def test_names_get_reports_not_registered(server, capsys):
     assert "not in the name registry" in capsys.readouterr().err
 
 
+@pytest.mark.requires_af_unix
 def test_names_set_get_list_clear_round_trip(server, store, capsys):
     with pytest.raises(SystemExit) as excinfo:
         cli_mod.main(["names", "set", "tovez", "20", "30", "--socket", str(server.socket_path)])
@@ -632,8 +671,37 @@ def test_names_set_get_list_clear_round_trip(server, store, capsys):
     assert store.get_name("tovez") is None
 
 
+@pytest.mark.requires_af_unix
 def test_names_list_reports_when_empty(server, capsys):
     with pytest.raises(SystemExit) as excinfo:
         cli_mod.main(["names", "list", "--socket", str(server.socket_path)])
     assert excinfo.value.code == EXIT_OK
     assert "no names registered" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# local-registry address resolution on Windows (ticket 006, team-lead scope)
+# ---------------------------------------------------------------------------
+
+
+def test_cli_resolves_windows_pipe_name_with_no_socket_override(monkeypatch):
+    """Regression test for the gap ticket 005 flagged and ticket 006 closed:
+    every ``mbrelay`` call site that builds a :class:`RegistryClient`
+    (``cmd_connect``/``_with_client``) used to call ``resolve_socket_path(
+    args.socket, _SOCKET_ENV_VAR, DEFAULT_SOCKET_PATH)`` directly --
+    ``DEFAULT_SOCKET_PATH`` is ``None`` on ``sys.platform == "win32"``, so
+    with no ``--socket``/``$MBREGISTRY_SOCKET`` override that call raised
+    ``TypeError`` from ``Path(None)`` before ever reaching
+    ``RegistryClient``. ``cli.py`` now resolves through
+    ``registry.client.resolve_local_api_address`` (imported as
+    ``cli_mod.resolve_local_api_address``) instead, which dispatches on
+    ``sys.platform`` first and returns the Windows named-pipe default
+    rather than raising.
+    """
+    import sys
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.delenv("MBREGISTRY_SOCKET", raising=False)
+    result = cli_mod.resolve_local_api_address(None, cli_mod._SOCKET_ENV_VAR)
+    assert result == r"\\.\pipe\mbregistry"
+    assert isinstance(result, str)

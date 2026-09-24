@@ -28,10 +28,19 @@ dedicated to mbtools testing; you may flash them freely.
 | `hodr` | Debian 13, aarch64 (Pi), Python 3.13 | `/dev/ttyACM0` | Nolanet node |
 | `magni` | Debian 13, aarch64 (Pi), Python 3.13 | `/dev/ttyACM0` | Nolanet node |
 | `braeburn` | macOS 15, x86_64, `uv` installed | `/dev/cu.usbmodem*` | The macOS test target |
+| `torture` | Ubuntu 24.04, x86_64, Python 3.12 | `/dev/ttyACM0`-`/dev/ttyACM3` (four RADIOBRIDGE relays) | Former production relay host (stakeholder decision, 2026-09-24 -- see sprint 005 ticket 007's Implementation Notes); the legacy `mbrelay.service` (`/usr/local/bin/mbrelay`, ports 8760/8761) is stopped and disabled here (unit file and binary left in place for rollback) -- `mbregistry.service` now owns the relays instead |
 
 Hostnames resolve on the garage LAN; don't hard-code IP addresses in this repo
 (it is public). Per-host details live on the Robot Garage wiki
 (<http://robot-garage.home/doku.php?id=mbdeploy>).
+
+`torture` is reached the same way as the other five hosts (`ssh torture`, user
+`eric`, passwordless sudo) but is **not** interchangeable with them for
+ordinary test runs: it is the fleet's real (former) relay host, not a
+dedicated per-developer test board, and its four relays are shared, scarce
+hardware -- don't reflash them with other firmware unless a test really needs
+it (project CLAUDE.md's standing hardware-testing rule), and prefer the other
+five hosts for routine `mbtools` development/testing.
 
 The **old** `mbdeploy serve` (`mbdeploy.service`, user `jtl`,
 `/home/jtl/mbdeploy`) was retired on all four Nolanet nodes during sprint
@@ -126,6 +135,61 @@ doesn't show an active lock because ``STATE_DISCONNECTED`` renders as
 cross-checking `dmesg` and/or `mbregistry list --json`'s `lock_kind`/
 `remote_lock_kind` fields, which aren't subject to the table's same
 "gone wins" precedence.
+
+**Fixed, sprint 005 ticket 011** (was: "known real bug, found during
+ticket 007's torture hardware pass"): a physical board's uid previously
+known to *another* peer host (e.g. tested there in an earlier sprint,
+then physically moved) used to keep losing local ownership to that
+peer's stale re-broadcast row — `Store._upsert_device` now rejects a
+remote claim against a row this host owns locally and has connected
+(logged and dropped), `snapshot_local_devices`/`publish_daemon_event`
+no longer advertise a disconnected local row as an active claim, and
+`Daemon.run_once`'s own attach/detach diff is now scoped to
+locally-owned rows so a uid merely mirrored from a peer can never block
+this host from reclaiming a board it has physically attached. Verified
+on `torture` after deploying the fix to all six hosts: all three of its
+physical relays (uids `4f02a351`/`52f41cc6`/`f92f913d`) show
+`host=local` in `torture`'s own `mbregistry list`, `host=torture` on
+every other host's, and the relay pool (port 7444) hands out all three
+on connect instead of "0 devices". See the ticket's Implementation
+Notes (`clasi/sprints/005-mbregistry-windows-platform-support-and-fleet-migration/tickets/done/011-fix-local-ownership-wins-over-stale-peer-sync.md`)
+for the full root-cause trace, including a second gap (daemon.py's
+`previously_attached` set) found only by this hardware pass.
+**Re-verified, sprint 005 ticket 010's own hardware acceptance pass**:
+still holds after a second `scripts/deploy-host.sh torture` redeploy —
+all three relays still `host=local` on `torture`, `host=torture`
+everywhere else, pool still hands out all three (see
+`docs/acceptance/005-hardware.md`).
+
+**Fixed, sprint 005 ticket 010**: `mbrelay connect`'s interactive
+session (`relay.cli._interactive`) crashed with `AttributeError:
+'NoneType' object has no attribute 'select'` whenever `sys.stdin` had a
+real file descriptor but was not a tty (a redirected file, a pipe, or
+`/dev/null` — exactly what a script or non-interactive SSH command
+gives it). The old condition chose the `select`-based read loop based
+on `stdin_fd is not None`, but `select`/`termios`/`tty` are only
+imported in the separate `is_tty` branch. Fixed by gating on `is_tty`
+instead; see `docs/acceptance/005-hardware.md` Scenario 3 for the full
+trace and the new regression test (`tests/relay/test_cli.py::
+test_interactive_session_survives_non_tty_real_fd_stdin`).
+
+**Known paper-cut, not fixed (ticket 010)**: a bare `mbregistry`/
+`mbserial`/etc. client command on `braeburn` (macOS) without an
+explicit `--socket` flag fails with `registry unavailable at
+/run/mbregistry/api.sock: No such file or directory` — macOS has no
+`/run` directory at all, but `registry.paths.default_socket_path()`
+returns `/run/mbregistry/api.sock` unconditionally on every non-Windows
+platform (existing, not new, behavior — ticket 002's own acceptance
+criteria required it stay unchanged on macOS/Linux).
+`scripts/deploy-host.sh` already works around this operationally
+(`braeburn`'s daemon is launched with an explicit `--socket
+/tmp/mbregistry/api.sock`), but a manual client invocation on
+`braeburn` needs the same `--socket` flag passed by hand. Not fixed
+here: doing so would resolve `docs/design/specification.md`'s own
+still-open question #7 ("whether macOS is a supported daemon
+platform... is unresolved"), out of a hardware-acceptance ticket's
+scope to decide unilaterally. See `docs/acceptance/005-hardware.md`
+Scenario 3.
 
 ## Firmware for tests (GitHub release assets — use `MICROBIT.hex`)
 

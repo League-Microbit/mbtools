@@ -1,5 +1,5 @@
 ---
-status: in-progress
+status: done
 split_from: mbregistry-device-registry-daemon.md
 sprint: '005'
 tickets:
