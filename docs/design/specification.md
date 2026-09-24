@@ -304,10 +304,16 @@ events. See
 
 ### 6.6 robot-console compatibility
 robot-console relies on the `_mbrelay._tcp` pool port with
-reset-by-reconnect, TXT `registry=`, and `GET /names/<name>`. Decide
-between a compatibility endpoint hosted by the registry, migrating
-robot-console, or a transition period. See the full contract in
-[robot-console compatibility contract](#8-robot-console-compatibility-contract)
+reset-by-reconnect, TXT `registry=`, and `GET /names/<name>`. Resolved
+(sprint 004 Decision 1, see
+[Open decisions §6](#6-where-does-the-relay-pool-live-and-what-about-robot-console-resolved-sprint-004)):
+hosted inside `mbregistry` as `registry.console_compat.relay_pool.
+RelayPool` (the pool port, ticket 006) and `registry.console_compat.
+names_api` (the `/names/<name>` HTTP endpoint, ticket 007). Neither
+listener checks `--auth-token` — robot-console has no mechanism to send
+one, matching legacy `mbrelay`'s own no-auth posture for this exact
+surface (sprint.md's Migration Concerns). See the full contract in
+[robot-console compatibility contract](#7-robot-console-compatibility-contract)
 below — breaking it silently mistunes moved robots.
 
 ### 6.7 Port from
@@ -486,17 +492,27 @@ leave the data plane. The registry's stream protocol needs an
 out-of-band control channel: a framed protocol, WebSocket control
 messages, or RFC 2217 (which pyserial supports). No mechanism is chosen.
 
-### 6. Where does the relay pool live, and what about robot-console?
-With one daemon, "give me any free relay" becomes a client-side query
-plus a lock. robot-console, however, expects an `_mbrelay._tcp` pool
-port and `/names` HTTP (see
-[cross-cutting §7](#7-robot-console-compatibility-contract)).
-- Options on the table: the registry hosts a compatibility endpoint;
-  robot-console migrates to the registry API; or a transition period
-  runs both. None is chosen.
-- The name registry (robot → channel/group) also needs a home. "A table
-  in the registry database, replicated to peers, is the natural fit" —
-  stated as a fit, not a decision.
+### 6. Where does the relay pool live, and what about robot-console? (resolved, sprint 004)
+Decided: the registry hosts a compatibility endpoint, inside `mbregistry`
+itself (sprint 004 sprint.md Decision 1) — not a robot-console migration,
+and not a transition period running both `mbrelay` and `mbregistry` side
+by side (that would reintroduce the exact port-collision problem this
+project exists to fix). Implemented as `registry.console_compat.
+relay_pool.RelayPool` (ticket 006): the `_mbrelay._tcp` pool-port TCP
+listener, wired into `mbregistry run`'s assembly alongside `daemon`/
+`api`/`remote_api`/`peering`, sharing their one `threading.RLock`. It
+serves only this host's own local relays (Decision 5 — no cross-host
+relay proxying), on `RelayPool.DEFAULT_POOL_PORT` (`7444`, distinct from
+legacy `mbrelay`'s `8760` — Decision 6), and advertises
+`RelayPool.DEFAULT_NAMES_API_PORT` (`7445`) in its TXT `registry=` key
+for the `names_api` HTTP listener ticket 007 adds. See
+[cross-cutting §7](#7-robot-console-compatibility-contract) for the
+contract this satisfies, and `registry.console_compat.relay_pool`'s own
+module docstring for the full per-connection sequence.
+- The name registry (robot → channel/group) also has a home: a
+  `name_registry` table in the registry database (`registry.store`,
+  sprint 004 ticket 001), replicated to peers over the existing ZMQ
+  event bus (ticket 002) — see §6.5 above.
 
 ### 7. Platforms
 Linux and Windows are required for the daemon. macOS is where the tools

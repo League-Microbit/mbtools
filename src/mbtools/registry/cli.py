@@ -71,6 +71,11 @@ from mbtools.registry.client import (
 )
 from mbtools.registry.client import SOCKET_ENV_VAR as _SOCKET_ENV_VAR
 from mbtools.registry.client import resolve_socket_path
+from mbtools.registry.console_compat.relay_pool import (
+    DEFAULT_NAMES_API_PORT,
+    DEFAULT_POOL_PORT,
+    RelayPool,
+)
 from mbtools.registry.daemon import DEFAULT_INTERVAL_S, Daemon
 from mbtools.registry.flash import FlashOp
 from mbtools.registry.peering import (
@@ -91,6 +96,7 @@ __all__ = [
     "cmd_install_service",
     "assemble_daemon_and_api",
     "assemble_registry",
+    "assemble_relay_pool",
     "render_systemd_unit",
     "DEFAULT_UNIT_PATH",
 ]
@@ -346,6 +352,7 @@ def assemble_registry(
     zeroconf: Any = None,
     zmq: Any = None,
     stream_serial_factory: Any = None,
+    lock: threading.RLock | None = None,
 ) -> tuple[Daemon, RegistryAPIServer, RemoteAPIServer, PeerDiscovery]:
     """Ticket 009's real assembly: everything :func:`assemble_daemon_and_api`
     already builds, *plus* a :class:`~mbtools.registry.remote_api.RemoteAPIServer`
@@ -391,6 +398,19 @@ def assemble_registry(
     so it can never be confused with this function's own ``serial_factory``
     (the daemon's probe-path seam, an entirely different concern).
 
+    ``lock`` (sprint 004, ticket 006), if given, is used as the shared
+    ``threading.RLock`` instead of one freshly constructed here -- this is
+    what lets :func:`cmd_run` extend the exact same lock to a
+    ``console_compat.relay_pool.RelayPool`` too (via
+    :func:`assemble_relay_pool`), matching every other component this
+    function already shares one lock across. Every pre-ticket-006 caller/
+    test that omits it is unaffected -- a fresh ``RLock`` is still built
+    exactly as before, and this function's own return value/arity is
+    unchanged (a ``RelayPool`` is assembled and returned separately, by
+    :func:`assemble_relay_pool`, not folded into this tuple -- changing
+    this function's own 4-tuple return would break every existing caller
+    that unpacks it).
+
     Callers do not start or stop any of the four returned objects --
     that stays their own responsibility, matching
     :func:`assemble_daemon_and_api`'s own convention. Shutdown order
@@ -401,7 +421,7 @@ def assemble_registry(
     ``api.stop()``, then ``store.close()`` last, since nothing may still
     be touching ``store`` by the time it closes.
     """
-    shared_lock = threading.RLock()
+    shared_lock = lock if lock is not None else threading.RLock()
 
     peer_discovery = PeerDiscovery(
         store=store,
@@ -442,6 +462,54 @@ def assemble_registry(
     return daemon, api, remote_api, peer_discovery
 
 
+def assemble_relay_pool(
+    *,
+    store: Store,
+    locks: Any,
+    lock: threading.RLock,
+    host: str = "0.0.0.0",
+    port: int = DEFAULT_POOL_PORT,
+    names_api_port: int = DEFAULT_NAMES_API_PORT,
+    instance_host: str | None = None,
+    advertise_address: str | None = None,
+    zeroconf: Any = None,
+) -> RelayPool:
+    """Sprint 004 ticket 006: build the ``console_compat.relay_pool.
+    RelayPool`` that gives robot-console (unmodified) a freshly-reset,
+    normalized local relay per TCP connection -- see that module's own
+    docstring for the full contract.
+
+    A separate assembly function, not folded into :func:`assemble_registry`
+    itself, so that function's own return value/arity stays exactly as
+    every pre-ticket-006 caller/test already unpacks it (see its own
+    ``lock`` parameter docstring note). :func:`cmd_run` calls this
+    function with ``store``/``locks=daemon.locks``/the same ``lock`` it
+    passed to :func:`assemble_registry`, so a ``relay``-kind lock acquired
+    here is checked against, and visible to, every other component that
+    shares the one ``LockManager`` table (``LockManager`` has no internal
+    lock of its own -- every access to it, from any component, must go
+    through this same ``threading.RLock``, per ``registry.locks``'s own
+    module docstring).
+
+    ``store``/``locks`` are injected, never constructed here, mirroring
+    every other ``assemble_*`` function in this module. ``host``/``port``/
+    ``names_api_port``/``instance_host``/``advertise_address``/``zeroconf``
+    are forwarded verbatim to :class:`RelayPool` -- see its own
+    constructor docstring for each one's meaning and default.
+    """
+    return RelayPool(
+        store=store,
+        locks=locks,
+        host=host,
+        port=port,
+        names_api_port=names_api_port,
+        instance_host=instance_host,
+        advertise_address=advertise_address,
+        lock=lock,
+        zeroconf=zeroconf,
+    )
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     """``mbregistry run`` -- the daemon's actual entry point. Constructs
     the real production pipeline (:class:`~mbtools.registry.usbwatch.PollingPortWatcher`,
@@ -479,6 +547,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         return EXIT_ERROR
 
     store = Store(db_path)
+    shared_lock = threading.RLock()
     daemon, api, remote_api, peering = assemble_registry(
         store=store,
         usbwatch=PollingPortWatcher(),
@@ -487,7 +556,23 @@ def cmd_run(args: argparse.Namespace) -> int:
         peer_pub_port=peer_pub_port,
         peer_snapshot_port=peer_snapshot_port,
         auth_token=auth_token,
+        lock=shared_lock,
     )
+
+    # Sprint 004 ticket 006: the robot-console-compatibility pool port,
+    # alongside daemon/api/remote_api/peering above, sharing the same
+    # shared_lock -- see assemble_relay_pool's own docstring. --no-relay-
+    # pool is this ticket's own "disable it if no local relay hardware is
+    # expected on a host" escape hatch (the ticket's own Files-to-modify
+    # note); every other host still gets it by default, matching
+    # peering's own "always started, never opt-in" precedent above.
+    relay_pool: RelayPool | None = None
+    if not args.no_relay_pool:
+        relay_pool = assemble_relay_pool(
+            store=store,
+            locks=daemon.locks,
+            lock=shared_lock,
+        )
 
     stop_event = threading.Event()
 
@@ -507,6 +592,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     api.start()
     remote_api.start()
     peering.start()
+    if relay_pool is not None:
+        relay_pool.start()
 
     # --peer HOST[:PORT] (repeatable): explicit peers on top of whatever
     # mDNS finds on its own. This host's own resolved
@@ -524,24 +611,30 @@ def cmd_run(args: argparse.Namespace) -> int:
         peering.connect_peer(host, host, peer_pub_port, peer_snapshot_port, remote_port=port)
 
     peer_note = f", {len(peer_specs)} explicit peer(s)" if peer_specs else ""
+    pool_note = (
+        f", relay pool on {relay_pool.bound_port}" if relay_pool is not None else ""
+    )
     print(
         f"mbregistry: listening on {socket_path} (local api), "
         f"{remote_api.bound_port} (remote api), store at {db_path}, "
         f"peering active (pub {peer_pub_port}, snapshot {peer_snapshot_port}"
-        f"{peer_note})",
+        f"{peer_note}){pool_note}",
         file=sys.stderr,
     )
     try:
         daemon.run(interval_s=args.interval, stop=stop_event.is_set)
     finally:
         # Stop order matters (this ticket's own acceptance criterion):
-        # peering and remote_api can each still touch store/locks up
-        # until they're stopped, so both must be stopped -- and every
-        # thread they own joined -- before api.stop() and, last of all,
-        # store.close(). api.stop() already joins its own handler
-        # threads (unchanged from before this ticket); peering.stop()/
-        # remote_api.stop() do the same for their own threads (see each
-        # class's own "stoppable, every thread joined" docstring note).
+        # peering, remote_api, and the relay pool can each still touch
+        # store/locks up until they're stopped, so all three must be
+        # stopped -- and every thread they own joined -- before api.stop()
+        # and, last of all, store.close(). api.stop() already joins its
+        # own handler threads (unchanged from before this ticket);
+        # peering.stop()/remote_api.stop()/relay_pool.stop() do the same
+        # for their own threads (see each class's own "stoppable, every
+        # thread joined" docstring note).
+        if relay_pool is not None:
+            relay_pool.stop()
         peering.stop()
         remote_api.stop()
         api.stop()
@@ -697,6 +790,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "shared secret required of remote-api/peering connections "
             f"(default unset -- no auth, or ${_TOKEN_ENV_VAR})"
+        ),
+    )
+    run_p.add_argument(
+        "--no-relay-pool",
+        action="store_true",
+        help=(
+            "disable the robot-console-compatibility relay pool "
+            "(_mbrelay._tcp) -- set this on a host with no local relay "
+            "hardware"
         ),
     )
     run_p.set_defaults(func=cmd_run)
