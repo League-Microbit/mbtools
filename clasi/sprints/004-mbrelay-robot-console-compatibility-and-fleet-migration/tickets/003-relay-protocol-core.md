@@ -1,8 +1,9 @@
 ---
 id: '003'
 title: Relay protocol core
-status: open
-use-cases: [SUC-001]
+status: in-progress
+use-cases:
+- SUC-001
 depends-on: []
 github-issue: ''
 issue: mbrelay-relay-protocol-client-over-mbregistry.md
@@ -49,20 +50,20 @@ only new code needed to run it against a registry-owned connection.
 
 ## Acceptance Criteria
 
-- [ ] `RelayControl.reset_and_normalize()` against a fake in-memory
+- [x] `RelayControl.reset_and_normalize()` against a fake in-memory
       `ByteChannel` runs BREAK/reset, `HELLO` (with the documented
       BREAK-fallback-after-retries behavior), `!VER?`, then
       `!MODE RAW250` / `!FRAG OFF` / `!ECHO OFF` / `!P 7` / `!C 0` in that
       order, one command at a time, then verifies via a standalone `?`.
-- [ ] `clear_stored_config()` sends `!DEFAULTS`.
-- [ ] `hello()` retries per the ported `hello_attempts` config and falls
+- [x] `clear_stored_config()` sends `!DEFAULTS`.
+- [x] `hello()` retries per the ported `hello_attempts` config and falls
       back to a BREAK if nothing answers.
-- [ ] `normalize()` raises `RelayError` if verification doesn't confirm
+- [x] `normalize()` raises `RelayError` if verification doesn't confirm
       `DEFAULT_CFG` after retries.
-- [ ] `BannerInfo.parse()` correctly parses both announcement dialects
+- [x] `BannerInfo.parse()` correctly parses both announcement dialects
       relevant to relay boards (`DEVICE:RADIOBRIDGE:...` and the older
       `RADIORELAY` role).
-- [ ] No import of `inventory.py`, `firmware.py`, `admin.py`, or any
+- [x] No import of `inventory.py`, `firmware.py`, `admin.py`, or any
       mDNS-advertiser code exists anywhere in the new module.
 
 ## Testing
@@ -75,3 +76,53 @@ only new code needed to run it against a registry-owned connection.
   hello/normalize/query/reset_and_normalize/clear_stored_config, the
   BREAK-fallback path, and both banner dialects.
 - **Verification command**: `uv run pytest tests/relay/test_protocol.py`
+
+## Implementation Notes
+
+Interface decisions later tickets (004 channel adapters, 005 mbrelay CLI,
+006/007 console-compat) depend on:
+
+- **Synchronous, not asyncio.** The legacy `relay.py`/`transport.py` were
+  built on an asyncio event loop (`add_reader`, `asyncio.Event`). Nothing
+  else in `mbtools` uses asyncio (`serial.connect` is plain
+  blocking/threaded; `registry.store` documents itself as thread-safe via
+  an internal `RLock`), so `relay.protocol` is the blocking/threaded
+  equivalent: `ByteChannel`'s methods are all synchronous (`open`/`close`/
+  `send_break`/`drain` are plain calls, not coroutines), and
+  `Reader.wait_for` uses `threading.Event`/`time.monotonic` instead of
+  `asyncio.Event`/the event loop clock. Ticket 004's `LocalRelayChannel`/
+  `RemoteRelayChannel` must implement the sync `ByteChannel` Protocol
+  accordingly — no `async def` anywhere in this seam.
+- **`reset_and_normalize(channel, clear_stored=True)` takes an
+  already-constructed `ByteChannel` directly** — no `(factory, port)`
+  pair like the legacy `SerialChannelFactory.open(port)` pattern.
+  `ChannelFactory` is still ported (interface only, per the ticket's
+  Approach) but nothing in `relay.protocol` calls it; ticket 004's
+  adapters are each constructed already knowing what they open (a local
+  port path, or a registry-obtained remote stream), so there is no
+  separate factory step to fit in. Same for `probe(channel)`.
+- **`reset_and_normalize()` now also queries `!VER?`**, between `HELLO`
+  and the `NORMALIZE_STEPS` batch, so the returned `BannerInfo.firmware`
+  is always populated on acquire — this is a deliberate deviation from
+  the legacy `relay.py`, where only `probe()` queried firmware version
+  and `reset_and_normalize()` did not. Made to match sprint.md's Solution
+  section ("resets and normalizes on acquire (BREAK/reset, HELLO, !VER?,
+  RAW250/frag-off/echo-off/P7/ch0-grp10)") and this ticket's own
+  acceptance criterion, which lists `!VER?` in the sequence.
+- **`RelayControl.__init__` takes timing kwargs directly** (`open_settle`,
+  `hello_timeout`, `hello_attempts`, `post_close_settle`,
+  `break_duration`, `break_settle`, all in seconds, defaults matching the
+  legacy repo's `SerialConfig` defaults) rather than a `cfg.serial`
+  object — no `relay.config` module is planned in sprint.md's Step 3
+  module table, so there is nothing to duck-type against. `post_close_settle`
+  is accepted and stored but unused within this module, same as upstream
+  (it exists for a caller doing its own close/reopen dance around this
+  class, e.g. a future release path).
+- `BANNER_RE`/`IDENTITY_RE` are local copies in `relay.protocol`, not
+  imported from anywhere — this is the ticket's one explicitly-planned
+  deviation from zero-duplication (the alternative was importing
+  `inventory.py`, which the ticket explicitly forbids).
+- `mbtools.relay.naming` (ticket 001) is unrelated to this module — no
+  import needed or added; `relay.protocol` has no address-derivation
+  logic of its own, matching the legacy `relay.py` (which didn't import
+  `naming.py` either).
