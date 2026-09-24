@@ -1,7 +1,7 @@
 ---
 id: '004'
 title: Windows service install via SCM (registry.service_windows)
-status: open
+status: done
 use-cases:
 - SUC-002
 depends-on:
@@ -62,26 +62,26 @@ so it does not need to reference this module.
 
 ## Acceptance Criteria
 
-- [ ] `render_windows_service_install()` returns deterministic text
+- [x] `render_windows_service_install()` returns deterministic text
       containing a valid `sc.exe create` invocation naming the service
       `mbregistry`, a `binPath=` pointing at `mbregistry run` (or the
       given `exec_path`), and `start= auto`.
-- [ ] `render_windows_service_failure_actions()` returns a valid
+- [x] `render_windows_service_failure_actions()` returns a valid
       `sc.exe failure` invocation with a restart action and a non-zero
       `reset=` window — a real systemd-`Restart=`-equivalent policy, not
       a placeholder.
-- [ ] Calling either render function performs **no** actual SCM
+- [x] Calling either render function performs **no** actual SCM
       operation, no subprocess execution, and requires no Administrator
       privilege or real Windows APIs — pure string construction,
       testable on macOS/Linux CI exactly like `render_systemd_unit()`
       already is.
-- [ ] `cmd_install_service_windows` prints both rendered command blocks
+- [x] `cmd_install_service_windows` prints both rendered command blocks
       (create + failure-actions) to the operator, exactly mirroring
       `cmd_install_service`'s existing "print, don't execute" shape for
       systemd/udev — never itself invokes `sc.exe`.
-- [ ] No `pywin32` (or any other new third-party package) import
+- [x] No `pywin32` (or any other new third-party package) import
       anywhere in this module.
-- [ ] Module docstring states the Decision-3 rationale (SCM over Task
+- [x] Module docstring states the Decision-3 rationale (SCM over Task
       Scheduler) in one or two sentences, so a future reader doesn't
       re-litigate it without cause.
 
@@ -111,3 +111,59 @@ so it does not need to reference this module.
   this ticket's own `cmd_install_service_windows` a plain, directly
   testable function so ticket 005's wiring is a thin dispatch, not new
   logic.
+
+**Implementation additions beyond this ticket's own text (team-lead
+dispatch item, mirroring ticket 003's own precedent of carrying an
+"additional item" beyond a ticket's literal scope — see
+`tests/test_windows_import_safety.py`'s module docstring):**
+
+- **The dispatcher problem, and why it matters even though this ticket
+  only renders text.** A plain console program (`python -m
+  mbtools.registry.cli run`, exactly what `render_windows_service_install`'s
+  default `exec_path` invokes) registered via `sc.exe create` is *not*
+  a real Windows service: the SCM expects the started process to call
+  `StartServiceCtrlDispatcherW` within ~30s and report `SERVICE_RUNNING`
+  via `RegisterServiceCtrlHandlerExW`/`SetServiceStatus`; a process that
+  never does this is killed with error 1053. Unlike the systemd case
+  (any foreground process is a valid `ExecStart=`), this means the
+  rendered SCM commands alone would be internally inconsistent — a
+  `start= auto` + restart-on-failure registration for a process the SCM
+  always kills at ~30s regardless of the restart policy.
+- **Choice made**: `service_windows.py` also provides
+  `run_as_windows_service(main, *, service_name=SERVICE_NAME, win32=None)`,
+  a minimal ctypes-only implementation of the
+  `StartServiceCtrlDispatcherW`/`RegisterServiceCtrlHandlerExW`/
+  `SetServiceStatus` sequence, built the same way
+  `registry.api_windows._Win32PipeAPI` wraps its own Win32 calls: real
+  ctypes bindings live in `_Win32ServiceAPI`, only ever constructed on
+  real Windows, behind an injectable `win32=` seam. `main(stop_event)`
+  is called once `SERVICE_RUNNING` has been reported; the stop-event is
+  set (and `SERVICE_STOP_PENDING` reported) when the SCM delivers
+  `SERVICE_CONTROL_STOP`. Ticket 005 wires this into `cmd_run`'s Windows
+  branch — this ticket only builds and tests the primitive.
+- **Alternative rejected**: documenting an external service-wrapper
+  binary (NSSM/WinSW) instead — rejected because it would add a new
+  fleet-wide *binary* dependency, exactly the concern Decision 1 exists
+  to avoid, whereas `ctypes.windll.advapi32` is the same category of
+  call `api_windows.py` already makes.
+- **Import-safety**: unlike `api_windows.py`'s module-scope `if
+  sys.platform == "win32": _kernel32 = ctypes.windll.kernel32` guard
+  (which required excluding that module from
+  `tests/test_windows_import_safety.py`'s generic reimport sweep, since
+  the guard's own condition is what the sweep flips), every
+  `ctypes.windll`/`ctypes.WINFUNCTYPE` lookup in `service_windows.py`
+  is lazy — inside `_Win32ServiceAPI`'s methods, never at module scope.
+  Confirmed: `service_windows` needed **no** exclusion from that sweep
+  test (`uv run pytest tests/test_windows_import_safety.py` passes
+  unmodified with the new module in place).
+- **Tested with fakes**: `tests/registry/service_windows/
+  test_service_windows.py` drives `run_as_windows_service` against a
+  `_FakeWin32ServiceAPI` double (mirrors `api_windows.py`'s own
+  fake-transport tests) — proves the status-transition sequence
+  (`SERVICE_RUNNING` → optional `SERVICE_STOP_PENDING` →
+  `SERVICE_STOPPED`, including on `main` raising) and the
+  `SERVICE_CONTROL_STOP` → stop-event wiring, without any real Windows
+  API. **Not proven** without hardware: that `_Win32ServiceAPI`'s real
+  ctypes bindings actually match `advapi32.dll`'s calling convention —
+  flagged "not hardware-verified" pending ticket 006's `windows-latest`
+  CI job, mirroring `api_windows.py`'s own caveat.
