@@ -129,10 +129,27 @@ logger = logging.getLogger(__name__)
 #: Linux/macOS per sprint.md's Design Rationale "file layout (ASSUMPTION)"
 #: -- purely-live state, cleared at boot. Every test overrides this to a
 #: ``tmp_path``. Not meaningful on Windows (no Unix socket namespace) --
-#: see ``registry.paths.default_socket_path``'s docstring; importing this
-#: module on Windows will raise until a later ticket resolves how the
-#: Windows platform branch avoids evaluating this constant.
-DEFAULT_SOCKET_PATH = default_socket_path()
+#: see ``registry.paths.default_socket_path``'s docstring, which raises
+#: ``NotImplementedError`` if actually called on ``win32``.
+#:
+#: **Ticket 003's import-safety fix**: this module must import cleanly
+#: on every platform (``registry.client``, ``registry.cli``,
+#: ``deploy.cli``, ``relay.cli``, and ``serial.cli`` all import
+#: ``DEFAULT_SOCKET_PATH`` from here at module scope -- ticket 002 left
+#: this constant calling ``default_socket_path()`` unconditionally at
+#: import time, which raises immediately on Windows, before any of
+#: those modules' own Windows-aware code ever runs; see ticket 002's own
+#: Implementation Notes "Flag for ticket 005/006"). Sourcing this from
+#: ``sys.platform`` directly, mirroring ``default_peer_pid``'s own
+#: platform-dispatch style just below, rather than calling through
+#: ``default_socket_path()`` and catching its ``NotImplementedError`` --
+#: a call-then-catch here would still construct and immediately discard
+#: a real exception on every Windows import, which is noisier than
+#: simply not asking the question. ``None`` on Windows: there is no
+#: socket path to have a default for there -- callers on Windows use
+#: ``registry.paths.default_pipe_name``/``registry.api_windows`` instead
+#: (ticket 005's ``cli.py`` platform branch).
+DEFAULT_SOCKET_PATH: Path | None = None if sys.platform == "win32" else default_socket_path()
 
 #: How often the background liveness sweep runs. Generous relative to a
 #: human noticing a stuck lock, cheap enough to not matter at this

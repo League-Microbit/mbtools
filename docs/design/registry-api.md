@@ -11,12 +11,17 @@ binary framed sub-protocol (`mbtools.registry.stream_frame`) for serial
 data and out-of-band control, and, local-socket-only as of sprint 004
 ticket 005, four name-registry ops (`names_get`/`names_set`/
 `names_clear`/`names_list` — see "Name-registry ops" below) that are not
-device ops at all. Written down here — not only in code — per
+device ops at all. Since sprint 005 ticket 003,
+`mbtools.registry.api_windows.WindowsPipeAPIServer` is a third server
+sharing that same dispatch implementation, over a Windows named pipe
+instead of a Unix socket — the local-socket transport's Windows
+counterpart, not a fourth independent protocol (see "Windows named-pipe
+transport" below). Written down here — not only in code — per
 sprint.md's Open Question #1: this becomes a de facto contract sprint
 002's client tools (`mbdeploy`, `mbserial`, and sprint 004's `mbrelay`)
 must speak. Except where noted, everything below describes the local
-Unix socket; "Remote TCP control plane" covers only where the TCP
-transport differs.
+Unix socket; "Remote TCP control plane" and "Windows named-pipe
+transport" cover only where those transports differ.
 
 ## Transport
 
@@ -726,6 +731,66 @@ and knows it happened in one op, unlike local `mbdeploy`'s two-call
 `flash` + `mark_flashed` pattern. The staged hex temp file is deleted
 afterwards regardless of outcome; a file staged but never flashed (the
 connection disconnected first) is deleted when that connection closes.
+
+## Windows named-pipe transport (sprint 005, ticket 003)
+
+`mbtools.registry.api_windows.WindowsPipeAPIServer` is the Windows
+counterpart to the local Unix-socket server described everywhere above:
+the same `list`/`find`/`lock`/`unlock`/`mark_flashed`/name-registry ops,
+the same newline-delimited-JSON framing, the same one-connection-is-
+one-session lock lifetime — only the transport differs, a Win32 named
+pipe (`\\.\pipe\mbregistry` by default,
+`mbtools.registry.paths.default_pipe_name()`) instead of an `AF_UNIX`
+socket. It shares the same dispatch implementation
+(`registry._api_base.BaseAPIServer`) the Unix-socket and remote-TCP
+servers do — see this document's opening paragraph.
+
+**Not exposed here: `flash`.** Unlike the local Unix socket, this
+server does not wire in `registry.flash.FlashOp` — `flash` is
+`RegistryAPIServer`'s own addition (ticket 008), not part of
+`BaseAPIServer`, and this sprint's own scope statement for ticket 003
+("adds no protocol/op logic of its own") did not ask for it. A `flash`
+request over the named pipe gets the same `invalid_request` response as
+any other unrecognized op.
+
+**Transport, standard library only (sprint.md Decision 1 — no
+`pywin32`)**: `ctypes.windll.kernel32`'s `CreateNamedPipeW`/
+`ConnectNamedPipe`/`ReadFile`/`WriteFile`/`DisconnectNamedPipe`/
+`CloseHandle`, plus `GetNamedPipeClientProcessId` for the peer-identity
+wiring below and `OpenProcess`/`GetExitCodeProcess` for the liveness
+sweep. The pipe is opened in byte mode (`PIPE_TYPE_BYTE`), not message
+mode — this protocol frames on its own `\n` characters, the same as the
+Unix-socket transport, so the pipe is a plain byte stream underneath,
+with no second framing layer.
+
+**Peer-PID identification, the named-pipe counterpart to "Peer-PID
+identification" above**: `GetNamedPipeClientProcessId` reads the
+connecting client's PID from the kernel on each accepted connection —
+never taken from the client — mirroring `SO_PEERCRED`/`LOCAL_PEERPID`'s
+"kernel-verified, never a client-supplied PID" property exactly.
+`WindowsPipeAPIServer(peer_pid_fn=...)` is injectable the same way
+`RegistryAPIServer(peer_pid_fn=...)` is, for the same testing reason.
+
+**Security descriptor (sprint.md Open Questions)**: `CreateNamedPipeW`'s
+default security descriptor is broader than the Unix socket's
+filesystem-permission-based access control (there is no `chmod`
+equivalent for a named pipe), so this server always passes an explicit,
+restrictive `SECURITY_ATTRIBUTES` — built via
+`ConvertStringSecurityDescriptorToSecurityDescriptorW` from a fixed SDDL
+string (`D:P(A;;GA;;;BA)(A;;GA;;;OW)`: a protected DACL granting access
+only to built-in Administrators and the pipe's own owner) — rather than
+shipping the OS default unexamined. This is this sprint's ASSUMPTION for
+"owner + local administrators, or equivalent"; it is not verifiable
+against a real ACL without Windows hardware (no Windows hardware exists
+for this project — see `mbtools.registry.api_windows`'s own module
+docstring, "What is not proven").
+
+**No hardware verification path.** Every other transport described in
+this document (`AF_UNIX`, TCP) is exercised by this project's own
+hardware-acceptance hosts (`docs/acceptance/*-hardware.md`). This one is
+not: there is no Windows hardware acceptance target. Ticket 006's
+`windows-latest` GitHub Actions CI job is the first, and only, real
+verification this transport's `ctypes` bindings get.
 
 ## Exit codes
 

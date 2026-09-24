@@ -83,12 +83,22 @@ SOCKET_ENV_VAR = "MBREGISTRY_SOCKET"
 def resolve_socket_path(
     flag_value: str | None,
     env_var: str = SOCKET_ENV_VAR,
-    default: str | Path = DEFAULT_SOCKET_PATH,
+    default: str | Path | None = DEFAULT_SOCKET_PATH,
 ) -> Path:
     """``flag_value`` wins if given; else ``$env_var`` if set; else
     ``default``. The one place socket-path precedence is decided, shared
     by every caller (``registry.cli``'s ``list``/``run``, and sprint
     002's ``mbdeploy``/``mbserial``) so it can't drift between them.
+
+    ``default`` is ``None`` on Windows (``DEFAULT_SOCKET_PATH`` is not
+    meaningful there -- see ``api.py``'s own docstring on that constant)
+    -- calling this with no ``flag_value``/``env_var`` override on
+    Windows raises ``TypeError`` from ``Path(None)`` below rather than
+    silently returning a nonsense path. No caller in this sprint's scope
+    (ticket 003) reaches that on Windows; ticket 005's Windows platform
+    branch in ``cli.py`` is where a Windows-aware caller resolves the
+    named pipe (``registry.paths.default_pipe_name``) instead of calling
+    this function at all.
     """
     if flag_value:
         return Path(flag_value)
@@ -194,6 +204,31 @@ class RegistryClient:
     :meth:`close`. Every method returns a plain Python value (a list of
     dicts, or a dict) on success and raises a typed exception on failure
     -- no raw socket or JSON leaks past this class's boundary.
+
+    **Windows gap (sprint 005)**: :meth:`connect` only ever constructs an
+    ``AF_UNIX`` socket -- there is no ``sys.platform == "win32"`` branch
+    here that speaks to ``registry.api_windows.WindowsPipeAPIServer``'s
+    named pipe, even though this module now *imports* cleanly on Windows
+    (ticket 003's import-safety fix -- see ``api.py``'s own docstring on
+    ``DEFAULT_SOCKET_PATH``). Calling :meth:`connect` on real Windows
+    still raises (``socket.AF_UNIX`` construction fails there). Wiring
+    this class to reach the named pipe -- reusing
+    ``api_windows._Win32PipeAPI``'s ``read_file``/``write_file`` and
+    adding a client-side ``CreateFileW`` open call, then the matching
+    ``_PipeLineReader``/``_PipeWriter`` framing that module already has
+    -- is a natural, self-contained follow-up, but is deliberately left
+    undone here: this class's ``socket_path: str | Path`` constructor
+    parameter round-trips a pipe-name string (``registry.paths
+    .default_pipe_name()``'s ``r"\\\\.\\pipe\\mbregistry"``) through
+    ``pathlib.Path`` today, and ``Path``'s own normalization of a UNC-
+    shaped string on a real ``WindowsPath`` is exactly the kind of thing
+    this project cannot verify without Windows hardware (no Windows
+    hardware exists for this project -- same caveat
+    ``registry.api_windows``'s own module docstring makes throughout).
+    No ticket in this sprint currently owns this gap (ticket 005's own
+    scope is ``cmd_run``/``cmd_install_service`` -- the daemon side, not
+    this client) -- flagged here as a clear seam for whichever ticket
+    picks it up next, rather than guessed at blind.
     """
 
     def __init__(self, socket_path: str | Path) -> None:
