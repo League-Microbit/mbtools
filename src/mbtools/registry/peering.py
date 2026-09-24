@@ -202,6 +202,7 @@ import zeroconf as _real_zeroconf
 import zmq as _real_zmq
 from zmq.utils.monitor import recv_monitor_message
 
+from mbtools.registry.netaddr import local_ip
 from mbtools.registry.identity import ProbeResult
 from mbtools.registry.store import (
     STATE_CONNECTED,
@@ -294,21 +295,8 @@ _DEFAULT_SELF_CHECK_INTERVAL_S = 60.0
 
 
 def _local_ip() -> str:
-    """Best-effort LAN IPv4 address (not ``127.0.0.1``) for this host.
-
-    Ported from ``mbdeploy/mdns.py``'s ``_local_ip`` -- the standard
-    "connect a UDP socket, read back the local endpoint" trick (no packets
-    actually sent). Falls back to resolving this host's own name if that
-    fails (e.g. no route to the public internet).
-    """
-    s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
-    except OSError:
-        return _socket.gethostbyname(_socket.gethostname())
-    finally:
-        s.close()
+    """This host's LAN IPv4 address, see :func:`mbtools.registry.netaddr.local_ip`."""
+    return local_ip()
 
 
 def _short_hostname() -> str:

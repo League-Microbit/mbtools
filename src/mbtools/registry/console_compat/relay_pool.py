@@ -109,6 +109,7 @@ from uuid import uuid4
 
 import zeroconf as _real_zeroconf
 
+from mbtools.registry.netaddr import local_ip
 from mbtools.registry.locks import KIND_RELAY, HolderRef, LockManager
 from mbtools.registry.store import STATE_CONNECTED, DeviceRecord, Store
 from mbtools.relay.channel import LocalRelayChannel
@@ -167,21 +168,8 @@ def _is_relay_role(role: "str | None") -> bool:
 
 
 def _local_ip() -> str:
-    """Best-effort LAN IPv4 address (not ``127.0.0.1``) for this host.
-
-    Local copy of ``registry.peering``'s own ``_local_ip`` (itself ported
-    from ``mbdeploy/mdns.py``) -- the standard "connect a UDP socket, read
-    back the local endpoint" trick (no packets actually sent). Falls back
-    to resolving this host's own name if that fails.
-    """
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
-    except OSError:
-        return socket.gethostbyname(socket.gethostname())
-    finally:
-        s.close()
+    """This host's LAN IPv4 address, see :func:`mbtools.registry.netaddr.local_ip`."""
+    return local_ip()
 
 
 def _short_hostname() -> str:
