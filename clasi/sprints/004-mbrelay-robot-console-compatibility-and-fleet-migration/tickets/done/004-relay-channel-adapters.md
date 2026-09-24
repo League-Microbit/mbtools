@@ -1,7 +1,7 @@
 ---
 id: '004'
 title: Relay channel adapters
-status: in-progress
+status: done
 use-cases:
 - SUC-001
 depends-on:
