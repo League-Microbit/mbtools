@@ -340,3 +340,86 @@ def test_locked_device_does_not_block_probing_other_devices(store):
     assert script.calls == 1
     assert store.get(UID).state == STATE_ATTACHED_UNPROBED
     assert store.get(UID2).state == STATE_CONNECTED
+
+
+# ---------------------------------------------------------------------------
+# event_callback hook (ticket 005) -- fires on attach/detach/identity,
+# never called when not registered (every test above leaves it unset).
+# ---------------------------------------------------------------------------
+
+
+def test_event_callback_fires_attach_then_identity_in_one_cycle(store):
+    usbwatch = FakeUSBSource([[_port_info()]])
+    script = _ProbeScript([ANNOUNCEMENT])
+    events: list[tuple[str, str, str]] = []
+
+    def on_event(event_type, record):
+        events.append((event_type, record.uid, record.state))
+
+    daemon = _make_daemon(usbwatch, store, script, event_callback=on_event)
+
+    daemon.run_once()  # attach + probe, in the same cycle
+
+    assert events == [
+        ("attach", UID, STATE_ATTACHED_UNPROBED),
+        ("identity", UID, STATE_CONNECTED),
+    ]
+
+
+def test_event_callback_fires_detach(store):
+    usbwatch = FakeUSBSource([[_port_info()], []])
+    script = _ProbeScript([ANNOUNCEMENT])
+    events: list[tuple[str, str]] = []
+    daemon = _make_daemon(
+        usbwatch, store, script, event_callback=lambda t, r: events.append((t, r.uid))
+    )
+
+    daemon.run_once()  # attach + probe
+    events.clear()
+    daemon.run_once()  # detach
+
+    assert events == [("detach", UID)]
+
+
+def test_event_callback_fires_identity_on_flash_reprobe_timeout_giveup(store):
+    """The flash-reprobe-timeout give-up path also calls
+    ``store.apply_probe_result`` (with a ``None`` result) -- a peer needs
+    to learn about that ``connected_no_firmware`` transition exactly like
+    any other completed probe."""
+    usbwatch = FakeUSBSource([[_port_info()], []])  # never comes back
+    script = _ProbeScript([ANNOUNCEMENT])
+    clock = _Clock(start=0.0)
+    events: list[tuple[str, str, str]] = []
+    daemon = _make_daemon(
+        usbwatch,
+        store,
+        script,
+        flash_reprobe_timeout_s=5.0,
+        now_fn=clock,
+        event_callback=lambda t, r: events.append((t, r.uid, r.state)),
+    )
+
+    daemon.run_once()  # attach + probe #1
+    daemon.locks.acquire(UID, KIND_FLASH, _local_holder(777))
+    daemon.locks.release(UID, _local_holder(777))
+    daemon.run_once()  # detach seen
+    events.clear()
+
+    clock.advance(10.0)
+    daemon.run_once()  # gives up -> identity event with connected_no_firmware
+
+    assert events == [("identity", UID, STATE_CONNECTED_NO_FIRMWARE)]
+
+
+def test_no_event_callback_registered_is_a_silent_no_op(store):
+    """Every test above this section constructs a daemon with no
+    ``event_callback`` at all -- this test just makes the "unaffected by
+    default" contract explicit rather than implicit."""
+    usbwatch = FakeUSBSource([[_port_info()], []])
+    script = _ProbeScript([ANNOUNCEMENT])
+    daemon = _make_daemon(usbwatch, store, script)  # no event_callback
+
+    daemon.run_once()
+    daemon.run_once()  # detach -- would raise if daemon assumed a callback exists
+
+    assert store.get(UID).state == STATE_DISCONNECTED

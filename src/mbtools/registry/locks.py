@@ -44,6 +44,23 @@ that fires exactly once whenever a ``flash``-kind lock is released,
 naming the uid -- mirroring the ``now_fn`` injectable-seam convention
 ``store``/``identity``/``usbwatch`` already establish, rather than a
 general pub/sub API this ticket doesn't need.
+
+**Lock-display hook (ticket 005)**: a second, independent callback,
+``lock_display_callback``, fires on every successful :meth:`acquire` and
+every actual (not no-op) :meth:`release`/:meth:`sweep`-driven release,
+regardless of ``kind`` -- unlike ``flash_release_callback``, which only
+ever fires for ``flash``-kind releases. It carries ``(uid, kind,
+display)``: on an acquire, ``kind`` is the newly-held lock's kind and
+``display`` is a rendered, human-readable holder description (never the
+raw :class:`HolderRef` -- a peer that only needs to *show* "locked by pid
+4821" must never be handed something it could replay to actually act on
+the lock); on a release, both ``kind`` and ``display`` are ``None``,
+signaling "no longer locked" to a cache keyed the same way. This is
+where ``registry.peering`` (ticket 005) attaches its PUB-socket
+``lock_state`` publish call for ticket 009's assembly to wire up --
+mirrors sprint.md Decision 3 ("remote lock display is a replicated
+cache, not a live cross-host call"); this module itself never imports or
+knows about ``peering``/ZeroMQ.
 """
 
 from __future__ import annotations
@@ -174,15 +191,24 @@ class LockManager:
     once whenever a ``flash``-kind lock on that uid is released (via
     either :meth:`release` or :meth:`sweep`) -- this is where
     ``daemon``'s (ticket 006) flash-triggered re-probe hook attaches.
+
+    ``lock_display_callback``, if given, is called with ``(uid, kind,
+    display)`` on every successful :meth:`acquire` and every actual
+    release (any kind, via either :meth:`release` or :meth:`sweep`) --
+    see the module docstring's "Lock-display hook" note. Defaults to
+    ``None`` (no-op) so every pre-ticket-005 caller/test is unaffected.
     """
 
     def __init__(
         self,
         *,
         flash_release_callback: Callable[[str], None] | None = None,
+        lock_display_callback: Callable[[str, str | None, str | None], None]
+        | None = None,
     ) -> None:
         self._locks: dict[str, LockStatus] = {}
         self._flash_release_callback = flash_release_callback
+        self._lock_display_callback = lock_display_callback
 
     def acquire(self, uid: str, kind: str, holder: HolderRef) -> bool:
         """Grant an exclusive lock of ``kind`` on ``uid`` to ``holder``.
@@ -195,11 +221,17 @@ class LockManager:
         origin (Decision 2: one table is what makes a local and a remote
         request mutually exclusive on the same uid). State is left
         untouched on failure: the existing holder keeps its lock.
+
+        Fires ``lock_display_callback(uid, kind, display)`` (see the
+        module docstring's "Lock-display hook" note) on success, never on
+        a :class:`LockHeldError` failure.
         """
         current = self._locks.get(uid)
         if current is not None:
             raise LockHeldError(uid, current)
         self._locks[uid] = LockStatus(kind=kind, holder=holder)
+        if self._lock_display_callback is not None:
+            self._lock_display_callback(uid, kind, _describe_holder(holder))
         return True
 
     def release(self, uid: str, holder: HolderRef) -> bool:
@@ -256,12 +288,16 @@ class LockManager:
 
     def _release(self, uid: str, holder: LockStatus) -> None:
         """Shared release mechanics: drop the table entry, then fire the
-        flash-release callback if ``holder`` was flash-kind.
+        flash-release callback if ``holder`` was flash-kind, then fire
+        the lock-display callback (any kind) with ``(uid, None, None)``
+        -- "no longer locked".
 
         Both public release paths (:meth:`release`, :meth:`sweep`) funnel
-        through here so the callback can't be fired from one path and
+        through here so neither callback can be fired from one path and
         skipped from the other.
         """
         del self._locks[uid]
         if holder.kind == KIND_FLASH and self._flash_release_callback is not None:
             self._flash_release_callback(uid)
+        if self._lock_display_callback is not None:
+            self._lock_display_callback(uid, None, None)

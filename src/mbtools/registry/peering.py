@@ -9,12 +9,42 @@ discovering a peer (never itself) it records ``host``/``endpoint`` into
 ``store``'s ``peer`` table via :meth:`~mbtools.registry.store.Store.
 record_peer_seen`.
 
-This ticket (004) is discovery only. The ZeroMQ snapshot exchange and
-live event bus that actually *use* a discovered peer are ticket 005's
-job, kept in a separate module since discovery and replication change for
-different reasons (sprint.md Step 1-2) — this module never opens a ZMQ
-socket, and nothing here decides what a peer's devices look like, only
-that it exists and how to reach it.
+Ticket 004 was discovery only. Ticket 005 (this revision) adds the
+ZeroMQ half in the same module (Step 1-2 groups "peer discovery" and
+"event replication" as one module, ``registry.peering``, "since neither
+is independently useful — discovery without replication finds a peer and
+does nothing with it"): one PUB socket every registry binds (publishing
+its own local attach/detach/identity-change events, via
+:class:`~mbtools.registry.daemon.Daemon`'s ``event_callback`` hook, plus
+lock-acquire/lock-release *display* events via
+:class:`~mbtools.registry.locks.LockManager`'s ``lock_display_callback``
+hook), a REQ/REP snapshot endpoint a newly-discovered peer queries once
+before subscribing, and the code that applies an incoming peer's
+snapshot/events into ``store`` via ticket 001's
+``upsert_remote_attached``/``mark_remote_detached``/``apply_remote_probe``/
+``apply_remote_lock_state``. Also implements the peer-vanish policy
+(Decision 5): a detected link drop calls
+``store.mark_peer_unreachable(host)`` — never a device-row mutation — and
+a later reconnect re-runs the snapshot exchange and calls
+``store.mark_peer_reachable(host)``.
+
+**Subscribe-before-snapshot ordering**: :class:`_PeerLink` connects and
+subscribes its SUB socket *before* sending the REQ snapshot request —
+the classic ZeroMQ "Clone pattern" ordering — so an event the peer
+publishes in the gap between subscribing and the snapshot reply arriving
+is queued by the SUB socket's own buffer rather than lost, instead of
+being silently missed by connecting SUB only after the snapshot already
+arrived.
+
+**Peer-vanish detection**: each peer's SUB socket carries a ZeroMQ
+monitor socket (``get_monitor_socket()``) watched on its own thread for
+``zmq.EVENT_DISCONNECTED`` — a real socket-level event, not a guessed
+timeout, per this ticket's acceptance criteria. Heartbeat options
+(``ZMQ_HEARTBEAT_IVL``/``TIMEOUT``/``TTL``, best-effort — not fatal if
+unsupported) are also set on the SUB socket so a hard network drop (not
+just a peer's graceful socket close) still surfaces as
+``EVENT_DISCONNECTED`` within a bounded time rather than only detecting
+a clean shutdown.
 
 **Advertising a single IPv4** (per the programmer brief for this ticket:
 two of this project's hardware hosts, loki/magni, each resolve to two
@@ -55,18 +85,37 @@ names, exercising the TXT-parsing and store-recording logic
 (:class:`_BrowseListener`, driven directly via its ``add_service``
 callback) without opening any real mDNS socket, mirroring every other
 module's injectable-dependency convention (e.g.
-:func:`mbtools.registry.identity.probe`'s ``serial_factory``).
+:func:`mbtools.registry.identity.probe`'s ``serial_factory``). The new
+``zmq`` constructor parameter (ticket 005) mirrors the same convention
+and defaults to the real ``pyzmq`` package, but every test in this
+ticket's own test module exercises it against real loopback sockets
+(ephemeral, ``tcp://127.0.0.1:0``) rather than a fake -- per this
+ticket's own testing guidance, "at least one two-process integration
+test" is required for peering, and unlike zeroconf's discovery-only
+concern, the ZeroMQ half's whole job (snapshot convergence, live event
+application, vanish detection) is only meaningfully proven against real
+sockets.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import socket as _socket
-from typing import Any
+import threading
+from typing import Any, Callable
 
 import zeroconf as _real_zeroconf
+import zmq as _real_zmq
+from zmq.utils.monitor import recv_monitor_message
 
-from mbtools.registry.store import Store
+from mbtools.registry.identity import ProbeResult
+from mbtools.registry.store import (
+    STATE_CONNECTED,
+    STATE_CONNECTED_NO_FIRMWARE,
+    DeviceRecord,
+    Store,
+)
 
 __all__ = [
     "PeerDiscovery",
@@ -77,6 +126,10 @@ __all__ = [
     "TXT_REMOTE_PORT",
     "TXT_PUB_PORT",
     "TXT_SNAPSHOT_PORT",
+    "EVENT_ATTACH",
+    "EVENT_DETACH",
+    "EVENT_IDENTITY",
+    "EVENT_LOCK_STATE",
 ]
 
 logger = logging.getLogger(__name__)
@@ -105,6 +158,32 @@ TXT_SNAPSHOT_PORT = "snapshot_port"
 #: How long a discovered instance's full ``ServiceInfo`` (address/port/TXT)
 #: is given to resolve before giving up on that one discovery event.
 _DEFAULT_RESOLVE_TIMEOUT_MS = 3000
+
+# Event-bus message ``"type"`` values (Step 5: "Publishes this host's own
+# attach/detach/identity-change events ... and lock-acquire/lock-release
+# display events"). ``EVENT_LOCK_STATE`` is deliberately distinct from
+# the other three per this ticket's acceptance criteria.
+EVENT_ATTACH = "attach"
+EVENT_DETACH = "detach"
+EVENT_IDENTITY = "identity"
+EVENT_LOCK_STATE = "lock_state"
+
+#: How long a snapshot REQ waits for its peer's REP reply before giving up.
+_DEFAULT_SNAPSHOT_TIMEOUT_MS = 5000
+
+#: Poll/receive timeout (ms) used throughout this module's background
+#: loops (REP handler, SUB receiver, monitor watcher) -- bounds how
+#: quickly each thread notices its own stop event without busy-waiting.
+_LOOP_POLL_TIMEOUT_MS = 200
+
+# Best-effort ZMQ heartbeat options (see the module docstring's
+# "Peer-vanish detection" note) -- (attribute name on the ``zmq`` module,
+# value in milliseconds).
+_HEARTBEAT_OPTS_MS = (
+    ("HEARTBEAT_IVL", 2000),
+    ("HEARTBEAT_TIMEOUT", 5000),
+    ("HEARTBEAT_TTL", 6000),
+)
 
 
 def _local_ip() -> str:
@@ -198,6 +277,133 @@ def _peer_host_from_name(name: str, service_type: str) -> str:
     return name.rstrip(".")
 
 
+# ---------------------------------------------------------------------------
+# ticket 005: snapshot payload construction and event/snapshot application
+# ---------------------------------------------------------------------------
+#
+# Two related but distinct shapes flow through this module:
+#
+# - A *snapshot* device dict (:func:`_snapshot_payload` /
+#   :func:`_apply_snapshot_device`) carries a locally-owned row's full
+#   identity, including ``port``/``vid_pid`` -- it is what a newly-joined
+#   peer needs to bootstrap a remote-owned row from nothing.
+# - A live *event* dict (:func:`_apply_event`, published by
+#   :meth:`PeerDiscovery.publish_daemon_event`/``publish_lock_event``)
+#   carries only what changed for that one event type. In particular an
+#   "identity" event never repeats ``port``/``vid_pid`` -- applying it
+#   must not overwrite those fields on a row an earlier "attach" event
+#   (or the initial snapshot) already established, which is why identity
+#   application is *not* routed through the same "upsert with port"
+#   helper the snapshot path uses.
+
+
+def _snapshot_payload(store: Store) -> list[dict[str, Any]]:
+    """This host's own devices (``store.snapshot_local_devices()``),
+    shaped for the wire -- what the REP handler sends back to a peer's
+    snapshot request, and what :func:`_apply_snapshot_device` consumes on
+    the receiving end.
+    """
+    return [
+        {
+            "uid": record.uid,
+            "port": record.port,
+            "vid_pid": record.vid_pid,
+            "state": record.state,
+            "role": record.role,
+            "common_name": record.common_name,
+            "device_name": record.device_name,
+            "serial_payload": record.serial_payload,
+            "raw_announcement": record.raw_announcement,
+        }
+        for record in store.snapshot_local_devices()
+    ]
+
+
+def _probe_result_from_dict(data: dict[str, Any]) -> ProbeResult:
+    """Reconstruct a :class:`~mbtools.registry.identity.ProbeResult` from
+    a snapshot/event dict's announcement fields -- shared by
+    :func:`_apply_snapshot_device` and :func:`_apply_event`'s "identity"
+    case. Blank fields round-trip as blank strings, matching
+    ``identity.probe``'s own "malformed announcement" case (a line
+    arrived but didn't parse -- fields blank, not missing).
+    """
+    return ProbeResult(
+        role=data.get("role") or "",
+        common_name=data.get("common_name") or "",
+        device_name=data.get("device_name") or "",
+        serial=data.get("serial_payload") or "",
+        raw=data.get("raw_announcement") or "",
+    )
+
+
+def _apply_snapshot_device(store: Store, host: str, data: dict[str, Any]) -> None:
+    """Apply one device dict from a peer's snapshot reply into ``store``,
+    tagged with ``host`` -- ticket 005's acceptance criterion "every
+    device in the snapshot is applied via ``upsert_remote_attached``/
+    ``apply_remote_probe``, tagged with the peer's host".
+
+    Always upserts first (establishing ``port``/``vid_pid`` even for a
+    uid this store has never seen), then layers the announcement/state on
+    top -- mirroring exactly what a local ``daemon.run_once()`` cycle
+    would have done to reach this same state.
+    """
+    store.upsert_remote_attached(
+        data["uid"], host, data.get("port"), data.get("vid_pid")
+    )
+    state = data.get("state")
+    if state == STATE_CONNECTED:
+        store.apply_remote_probe(data["uid"], _probe_result_from_dict(data))
+    elif state == STATE_CONNECTED_NO_FIRMWARE:
+        store.apply_remote_probe(data["uid"], None)
+    elif state == "disconnected":
+        store.mark_remote_detached(data["uid"])
+    # "attached_unprobed": upsert_remote_attached above already covers it.
+
+
+def _apply_event(store: Store, host: str, event: dict[str, Any]) -> None:
+    """Apply one live event dict (from a peer's PUB stream) into
+    ``store``, tagged with ``host`` -- ticket 005's acceptance criterion
+    "applies each subsequent attach/detach/identity/lock_state event the
+    same way [as the snapshot]".
+
+    A reference to a uid this store has never heard of (an "identity"/
+    "detach"/"lock_state" event arriving before the "attach" that should
+    have preceded it -- possible in principle if a peer's own event
+    ordering is ever violated, though the subscribe-before-snapshot
+    ordering this module uses is designed to avoid it in practice) is
+    logged and dropped rather than raised: a single missed/reordered
+    event must not crash the receive loop it arrived on, and the peer's
+    next full snapshot (a fresh discovery, or a reconnect after a vanish)
+    naturally repairs any resulting gap.
+    """
+    event_type = event.get("type")
+    uid = event.get("uid")
+    try:
+        if event_type == EVENT_ATTACH:
+            store.upsert_remote_attached(
+                uid, host, event.get("port"), event.get("vid_pid")
+            )
+        elif event_type == EVENT_DETACH:
+            store.mark_remote_detached(uid)
+        elif event_type == EVENT_IDENTITY:
+            state = event.get("state")
+            if state == STATE_CONNECTED:
+                store.apply_remote_probe(uid, _probe_result_from_dict(event))
+            elif state == STATE_CONNECTED_NO_FIRMWARE:
+                store.apply_remote_probe(uid, None)
+        elif event_type == EVENT_LOCK_STATE:
+            store.apply_remote_lock_state(uid, event.get("kind"), event.get("display"))
+        else:
+            logger.warning("peering: unknown event type %r from %s", event_type, host)
+    except KeyError:
+        logger.warning(
+            "peering: %s event for unknown uid %s from %s; dropping",
+            event_type,
+            uid,
+            host,
+        )
+
+
 class _BrowseListener:
     """``zeroconf.ServiceBrowser``'s callback target.
 
@@ -211,6 +417,14 @@ class _BrowseListener:
     the full ``ServiceInfo``, exclude this instance's own advertisement,
     parse the TXT record's ``remote_port``, and call
     ``store.record_peer_seen(host, endpoint)``.
+
+    ``on_peer_ready`` (ticket 005, optional -- ``None`` reproduces ticket
+    004's discovery-only behavior exactly, which is what every ticket-004
+    test still exercises) is called with ``(host, address, pub_port,
+    snapshot_port)`` after ``record_peer_seen`` succeeds, whenever the
+    discovered TXT record's ``pub_port``/``snapshot_port`` both parse --
+    this is :meth:`PeerDiscovery.connect_peer`, wired by
+    :meth:`PeerDiscovery.start`.
     """
 
     def __init__(
@@ -221,12 +435,14 @@ class _BrowseListener:
         own_address: str,
         own_port: int,
         resolve_timeout_ms: int = _DEFAULT_RESOLVE_TIMEOUT_MS,
+        on_peer_ready: Callable[[str, str, int, int], None] | None = None,
     ) -> None:
         self._store = store
         self._service_type = service_type
         self._own_address = own_address
         self._own_port = own_port
         self._resolve_timeout_ms = resolve_timeout_ms
+        self._on_peer_ready = on_peer_ready
 
     def add_service(self, zc: Any, type_: str, name: str) -> None:
         info = zc.get_service_info(type_, name, timeout=self._resolve_timeout_ms)
@@ -276,18 +492,215 @@ class _BrowseListener:
         endpoint = f"{address}:{remote_port_str}"
         self._store.record_peer_seen(host, endpoint)
 
+        if self._on_peer_ready is None:
+            return
+        pub_port_str = txt.get(TXT_PUB_PORT)
+        snapshot_port_str = txt.get(TXT_SNAPSHOT_PORT)
+        try:
+            pub_port = int(pub_port_str) if pub_port_str is not None else None
+            snapshot_port = int(snapshot_port_str) if snapshot_port_str is not None else None
+        except ValueError:
+            pub_port = None
+            snapshot_port = None
+        if pub_port is None or snapshot_port is None:
+            logger.warning(
+                "peering: discovered %s with no resolvable %s/%s TXT value; "
+                "peer recorded but no live link established",
+                name,
+                TXT_PUB_PORT,
+                TXT_SNAPSHOT_PORT,
+            )
+            return
+        self._on_peer_ready(host, address, pub_port, snapshot_port)
+
+
+class _PeerLink:
+    """One peer's live ZeroMQ link: SUB-subscribe first, REQ snapshot
+    fetch, then ongoing SUB consumption plus a monitor-socket watch for
+    ``zmq.EVENT_DISCONNECTED`` (see the module docstring's "Subscribe-
+    before-snapshot ordering" and "Peer-vanish detection" notes).
+
+    Owned exclusively by :class:`PeerDiscovery` (constructed and started
+    by :meth:`PeerDiscovery.connect_peer`, never directly by a caller
+    outside this module) -- ``start()``/``stop()`` mirror every other
+    module's thread-lifecycle convention: stoppable, every thread joined
+    with a timeout before ``stop()`` returns, both idempotent.
+    """
+
+    def __init__(
+        self,
+        *,
+        host: str,
+        store: Store,
+        zmq_module: Any,
+        context: Any,
+        pub_address: str,
+        snapshot_address: str,
+        on_unreachable: Callable[[str], None] | None,
+        on_reachable: Callable[[str], None] | None,
+        snapshot_timeout_ms: int = _DEFAULT_SNAPSHOT_TIMEOUT_MS,
+    ) -> None:
+        self._host = host
+        self._store = store
+        self._zmq = zmq_module
+        self._ctx = context
+        self._pub_address = pub_address
+        self._snapshot_address = snapshot_address
+        self._on_unreachable = on_unreachable
+        self._on_reachable = on_reachable
+        self._snapshot_timeout_ms = snapshot_timeout_ms
+
+        self._sub_socket: Any = None
+        self._monitor_socket: Any = None
+        self._stop_event = threading.Event()
+        self._recv_thread: threading.Thread | None = None
+        self._monitor_thread: threading.Thread | None = None
+        self._started = False
+
+    def start(self) -> None:
+        if self._started:
+            return
+        self._started = True
+        self._stop_event.clear()
+
+        self._sub_socket = self._ctx.socket(self._zmq.SUB)
+        self._sub_socket.setsockopt(self._zmq.SUBSCRIBE, b"")
+        self._sub_socket.setsockopt(self._zmq.RCVTIMEO, _LOOP_POLL_TIMEOUT_MS)
+        self._set_heartbeat_opts(self._sub_socket)
+        self._sub_socket.connect(self._pub_address)
+
+        self._monitor_socket = self._sub_socket.get_monitor_socket()
+        self._monitor_socket.setsockopt(self._zmq.RCVTIMEO, _LOOP_POLL_TIMEOUT_MS)
+        self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self._monitor_thread.start()
+
+        # Snapshot fetch happens *after* the SUB connect+subscribe above
+        # -- see the module docstring's "Subscribe-before-snapshot
+        # ordering" note.
+        self._fetch_snapshot()
+
+        self._recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
+        self._recv_thread.start()
+
+    def _set_heartbeat_opts(self, sock: Any) -> None:
+        for opt_name, value_ms in _HEARTBEAT_OPTS_MS:
+            opt = getattr(self._zmq, opt_name, None)
+            if opt is None:
+                continue  # older libzmq without heartbeat support
+            try:
+                sock.setsockopt(opt, value_ms)
+            except Exception:
+                logger.debug("peering: %s unsupported on this SUB socket", opt_name)
+
+    def _fetch_snapshot(self) -> None:
+        req = self._ctx.socket(self._zmq.REQ)
+        req.setsockopt(self._zmq.LINGER, 0)
+        req.setsockopt(self._zmq.RCVTIMEO, self._snapshot_timeout_ms)
+        req.setsockopt(self._zmq.SNDTIMEO, self._snapshot_timeout_ms)
+        try:
+            req.connect(self._snapshot_address)
+            req.send(b"snapshot")
+            reply = req.recv()
+        except self._zmq.error.Again:
+            logger.warning(
+                "peering: snapshot request to %s (%s) timed out",
+                self._host,
+                self._snapshot_address,
+            )
+            return
+        finally:
+            req.close(linger=0)
+
+        try:
+            devices = json.loads(reply.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            logger.exception("peering: malformed snapshot reply from %s", self._host)
+            return
+
+        for device in devices:
+            try:
+                _apply_snapshot_device(self._store, self._host, device)
+            except Exception:
+                logger.exception(
+                    "peering: failed applying snapshot device %r from %s",
+                    device.get("uid"),
+                    self._host,
+                )
+
+        if self._on_reachable is not None:
+            self._on_reachable(self._host)
+
+    def _recv_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                message = self._sub_socket.recv()
+            except self._zmq.error.Again:
+                continue
+            except self._zmq.error.ZMQError:
+                break  # socket closed by stop()
+            try:
+                event = json.loads(message.decode("utf-8"))
+                _apply_event(self._store, self._host, event)
+            except Exception:
+                logger.exception("peering: failed applying event from %s", self._host)
+
+    def _monitor_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                event = recv_monitor_message(self._monitor_socket)
+            except self._zmq.error.Again:
+                continue
+            except self._zmq.error.ZMQError:
+                break  # socket closed by stop()
+            if event.get("event") == self._zmq.EVENT_DISCONNECTED:
+                logger.warning(
+                    "peering: link to %s (%s) dropped", self._host, self._pub_address
+                )
+                if self._on_unreachable is not None:
+                    self._on_unreachable(self._host)
+
+    def stop(self) -> None:
+        """Stop both background threads (joined, with a timeout) before
+        closing any socket -- a thread must never be left reading from a
+        socket another thread is in the middle of closing. Idempotent.
+        """
+        if not self._started:
+            return
+        self._stop_event.set()
+        if self._recv_thread is not None:
+            self._recv_thread.join(timeout=2.0)
+            self._recv_thread = None
+        if self._monitor_thread is not None:
+            self._monitor_thread.join(timeout=2.0)
+            self._monitor_thread = None
+        if self._sub_socket is not None:
+            try:
+                self._sub_socket.disable_monitor()
+            except Exception:
+                pass
+            self._sub_socket.close(linger=0)
+            self._sub_socket = None
+        if self._monitor_socket is not None:
+            self._monitor_socket.close(linger=0)
+            self._monitor_socket = None
+        self._started = False
+
 
 class PeerDiscovery:
-    """mDNS advertise + browse for ``_mbregistry._tcp`` peer discovery.
+    """mDNS advertise/browse (ticket 004) plus the ZeroMQ PUB/REP event
+    bus and per-peer SUB/REQ links (ticket 005) for ``_mbregistry._tcp``
+    peering.
 
     ``start()``/``stop()`` lifecycle matches
     :class:`~mbtools.registry.api.RegistryAPIServer`'s own convention:
-    ``start()`` is non-blocking (registration and browsing both run on
-    zeroconf's own internal engine/threads -- this class does not spawn
-    an extra thread of its own to poll it), and ``stop()`` unregisters
-    this host's own advertisement, cancels the browser, and closes the
-    injected/owned ``Zeroconf`` instance before returning. Both are
-    idempotent (a second ``start()``/``stop()`` is a no-op).
+    ``start()`` is non-blocking, and ``stop()`` tears everything down --
+    every peer link, the REP handler thread, the PUB/REP sockets and
+    owned ``zmq.Context``, then (as ticket 004 already did) the browser
+    and the injected/owned ``Zeroconf`` instance -- and joins every
+    thread it owns before returning, per this ticket's own "any
+    thread/socket started must be stoppable and joined in tests"
+    requirement. Both are idempotent (a second ``start()``/``stop()`` is
+    a no-op).
 
     ``store`` is an injected reference (the same instance a caller's
     ``mbregistry run`` assembly, or a test, already constructed), never
@@ -306,6 +719,7 @@ class PeerDiscovery:
         snapshot_port: int = DEFAULT_SNAPSHOT_PORT,
         service_type: str = SERVICE_TYPE,
         zeroconf: Any = None,
+        zmq: Any = None,
     ) -> None:
         self._store = store
         self._host = host if host is not None else _short_hostname()
@@ -317,20 +731,49 @@ class PeerDiscovery:
         self._snapshot_port = snapshot_port
         self._service_type = service_type
         self._zc_module = zeroconf if zeroconf is not None else _real_zeroconf
+        self._zmq_module = zmq if zmq is not None else _real_zmq
 
         self._zc: Any = None
         self._own_info: Any = None
         self._browser: Any = None
         self._started = False
 
+        # -- ticket 005: ZeroMQ event bus state --
+        self._zmq_ctx: Any = None
+        self._pub_socket: Any = None
+        self._pub_lock = threading.Lock()
+        self._rep_socket: Any = None
+        self._rep_thread: threading.Thread | None = None
+        self._rep_stop_event = threading.Event()
+        self._peer_links: dict[str, _PeerLink] = {}
+        self._peer_links_lock = threading.Lock()
+
     # -- lifecycle -----------------------------------------------------
 
     def start(self) -> None:
-        """Register this host's own advertisement and start browsing.
-        Returns immediately -- see the class docstring.
+        """Bind the PUB/REP sockets and start the REP handler thread,
+        then register this host's own mDNS advertisement and start
+        browsing. Returns immediately -- see the class docstring.
+
+        The ZeroMQ half starts first because ``_BrowseListener`` (wired
+        below with ``on_peer_ready=self.connect_peer``) can, in
+        principle, fire a discovery callback the instant the browser
+        starts -- :meth:`connect_peer` must have a live ``zmq.Context``
+        to use by then.
         """
         if self._started:
             return
+
+        self._zmq_ctx = self._zmq_module.Context()
+        self._pub_socket = self._zmq_ctx.socket(self._zmq_module.PUB)
+        self._pub_socket.bind(f"tcp://*:{self._pub_port}")
+        self._rep_socket = self._zmq_ctx.socket(self._zmq_module.REP)
+        self._rep_socket.bind(f"tcp://*:{self._snapshot_port}")
+        self._rep_socket.setsockopt(self._zmq_module.RCVTIMEO, _LOOP_POLL_TIMEOUT_MS)
+        self._rep_stop_event.clear()
+        self._rep_thread = threading.Thread(target=self._rep_loop, daemon=True)
+        self._rep_thread.start()
+
         self._zc = self._zc_module.Zeroconf()
 
         txt = {
@@ -353,6 +796,7 @@ class PeerDiscovery:
             service_type=self._service_type,
             own_address=self._advertise_address,
             own_port=self._remote_port,
+            on_peer_ready=self.connect_peer,
         )
         self._browser = self._zc_module.ServiceBrowser(
             self._zc, self._service_type, listener=listener
@@ -361,7 +805,9 @@ class PeerDiscovery:
 
     def stop(self) -> None:
         """Cancel the browser, unregister this host's own advertisement,
-        and close the ``Zeroconf`` instance. Idempotent.
+        and close the ``Zeroconf`` instance (ticket 004), then stop every
+        peer link, the REP handler thread, and close the PUB/REP sockets
+        and owned ``zmq.Context`` (ticket 005). Idempotent.
         """
         if not self._started:
             return
@@ -379,6 +825,27 @@ class PeerDiscovery:
         self._zc = None
         self._own_info = None
         self._browser = None
+
+        with self._peer_links_lock:
+            links = list(self._peer_links.values())
+            self._peer_links.clear()
+        for link in links:
+            link.stop()
+
+        self._rep_stop_event.set()
+        if self._rep_thread is not None:
+            self._rep_thread.join(timeout=2.0)
+            self._rep_thread = None
+        if self._rep_socket is not None:
+            self._rep_socket.close(linger=0)
+            self._rep_socket = None
+        if self._pub_socket is not None:
+            self._pub_socket.close(linger=0)
+            self._pub_socket = None
+        if self._zmq_ctx is not None:
+            self._zmq_ctx.term()
+            self._zmq_ctx = None
+
         self._started = False
 
     def __enter__(self) -> "PeerDiscovery":
@@ -387,3 +854,135 @@ class PeerDiscovery:
 
     def __exit__(self, *exc_info: object) -> None:
         self.stop()
+
+    # -- ticket 005: snapshot REP handler --------------------------------
+
+    def _rep_loop(self) -> None:
+        """Answer every snapshot request with this host's own current
+        devices (:func:`_snapshot_payload`).
+
+        Runs on its own thread against its own socket -- never the PUB
+        socket -- so a slow or stalled requester can never block this
+        host's own event publishing (this ticket's explicit "REP never
+        blocks PUB" acceptance criterion, true by construction: two
+        sockets, two code paths, nothing shared but ``store`` itself,
+        which is already thread-safe -- see ``store.py``'s own "Thread
+        safety" docstring note).
+        """
+        while not self._rep_stop_event.is_set():
+            try:
+                self._rep_socket.recv()
+            except self._zmq_module.error.Again:
+                continue
+            except self._zmq_module.error.ZMQError:
+                break  # socket closed by stop()
+            payload = json.dumps(_snapshot_payload(self._store)).encode("utf-8")
+            self._rep_socket.send(payload)
+
+    # -- ticket 005: peer link lifecycle ---------------------------------
+
+    def connect_peer(self, host: str, address: str, pub_port: int, snapshot_port: int) -> None:
+        """Establish (or re-establish) a live peering link to ``host`` at
+        ``address``'s ``pub_port``/``snapshot_port``.
+
+        This is what a discovered peer's TXT record triggers (wired as
+        ``_BrowseListener``'s ``on_peer_ready`` in :meth:`start`), and
+        what ticket 009's ``--peer HOST:PORT`` CLI flag and a test
+        exercising "no mDNS involved" both call directly -- the one
+        method every path into a live peer link funnels through.
+
+        Safe to call more than once for the same ``host`` (an mDNS
+        ``update_service`` refresh, or an explicit reconnect after a
+        vanish per Decision 5, "a later reconnect ... re-runs the
+        snapshot exchange"): any existing link for that host is stopped
+        first, then a fresh one is started, which always re-does the
+        snapshot exchange and marks the peer reachable again on success.
+        """
+        with self._peer_links_lock:
+            existing = self._peer_links.pop(host, None)
+        if existing is not None:
+            existing.stop()
+
+        link = _PeerLink(
+            host=host,
+            store=self._store,
+            zmq_module=self._zmq_module,
+            context=self._zmq_ctx,
+            pub_address=f"tcp://{address}:{pub_port}",
+            snapshot_address=f"tcp://{address}:{snapshot_port}",
+            on_unreachable=self._on_peer_unreachable,
+            on_reachable=self._on_peer_reachable,
+        )
+        with self._peer_links_lock:
+            self._peer_links[host] = link
+        link.start()
+
+    def _on_peer_unreachable(self, host: str) -> None:
+        try:
+            self._store.mark_peer_unreachable(host)
+        except KeyError:
+            logger.warning("peering: unreachable callback for unknown peer %s", host)
+
+    def _on_peer_reachable(self, host: str) -> None:
+        try:
+            self._store.mark_peer_reachable(host)
+        except KeyError:
+            logger.warning("peering: reachable callback for unknown peer %s", host)
+
+    # -- ticket 005: publishing (this host's own event bus) -------------
+
+    def publish_event(self, event_type: str, payload: dict[str, Any]) -> None:
+        """Publish one event of ``event_type`` on this host's PUB socket,
+        merged with ``{"type": event_type, "host": self._host}``.
+
+        A no-op if :meth:`start` has not been called (or after
+        :meth:`stop`) -- lets a caller hold a reference to an
+        as-yet-unstarted/already-stopped ``PeerDiscovery`` without
+        needing its own None-check. Guarded by :attr:`_pub_lock` since a
+        PUB socket, like every ZMQ socket, is not safe to use
+        concurrently from more than one thread, and this method is
+        called from whichever thread ``daemon``/``locks`` fire their
+        hooks on.
+        """
+        if self._pub_socket is None:
+            return
+        message = json.dumps({"type": event_type, "host": self._host, **payload}).encode(
+            "utf-8"
+        )
+        with self._pub_lock:
+            self._pub_socket.send(message)
+
+    def publish_daemon_event(self, event_type: str, record: DeviceRecord) -> None:
+        """Adapter matching :class:`~mbtools.registry.daemon.Daemon`'s
+        ``event_callback`` signature exactly -- ticket 009's assembly
+        wires this in directly (``Daemon(..., event_callback=peering.
+        publish_daemon_event)``), no glue code needed at the call site.
+
+        ``event_type`` is one of ``EVENT_ATTACH``/``EVENT_DETACH``/
+        ``EVENT_IDENTITY``; the payload fields sent are exactly what
+        :func:`_apply_event`'s matching branch reads back out on the
+        receiving side.
+        """
+        if event_type == EVENT_ATTACH:
+            payload = {"uid": record.uid, "port": record.port, "vid_pid": record.vid_pid}
+        elif event_type == EVENT_DETACH:
+            payload = {"uid": record.uid}
+        else:
+            payload = {
+                "uid": record.uid,
+                "state": record.state,
+                "role": record.role,
+                "common_name": record.common_name,
+                "device_name": record.device_name,
+                "serial_payload": record.serial_payload,
+                "raw_announcement": record.raw_announcement,
+            }
+        self.publish_event(event_type, payload)
+
+    def publish_lock_event(self, uid: str, kind: str | None, display: str | None) -> None:
+        """Adapter matching :class:`~mbtools.registry.locks.LockManager`'s
+        ``lock_display_callback`` signature exactly -- ticket 009's
+        assembly wires this in directly (``LockManager(...,
+        lock_display_callback=peering.publish_lock_event)``).
+        """
+        self.publish_event(EVENT_LOCK_STATE, {"uid": uid, "kind": kind, "display": display})

@@ -304,6 +304,129 @@ def test_flash_callback_fires_exactly_once_per_release():
 
 
 # ---------------------------------------------------------------------------
+# lock-display callback (ticket 005) -- fires on every acquire/release,
+# any kind, carrying (uid, kind, display) -- never the raw HolderRef.
+# ---------------------------------------------------------------------------
+
+
+def test_display_callback_fires_on_acquire_with_local_holder_display():
+    calls = []
+    manager = LockManager(lock_display_callback=lambda *args: calls.append(args))
+
+    manager.acquire(UID, KIND_SERIAL, HOLDER)
+
+    assert calls == [(UID, KIND_SERIAL, f"pid {PID}")]
+
+
+def test_display_callback_fires_on_acquire_with_remote_holder_display():
+    calls = []
+    manager = LockManager(lock_display_callback=lambda *args: calls.append(args))
+    remote_holder = HolderRef(origin="remote", ref="session-abc", host="loki")
+
+    manager.acquire(UID, KIND_FLASH, remote_holder)
+
+    assert calls == [(UID, KIND_FLASH, "session session-abc on loki")]
+
+
+def test_display_callback_never_receives_the_raw_holder_ref():
+    calls = []
+    manager = LockManager(lock_display_callback=lambda *args: calls.append(args))
+
+    manager.acquire(UID, KIND_SERIAL, HOLDER)
+
+    _uid, _kind, display = calls[0]
+    assert isinstance(display, str)
+    assert not isinstance(display, HolderRef)
+
+
+def test_display_callback_fires_on_release_with_none_none():
+    calls = []
+    manager = LockManager(lock_display_callback=lambda *args: calls.append(args))
+    manager.acquire(UID, KIND_SERIAL, HOLDER)
+    calls.clear()
+
+    manager.release(UID, HOLDER)
+
+    assert calls == [(UID, None, None)]
+
+
+def test_display_callback_fires_for_every_kind_not_only_flash():
+    """Unlike ``flash_release_callback``, this hook is kind-agnostic --
+    it must fire for a serial-kind release too."""
+    calls = []
+    manager = LockManager(lock_display_callback=lambda *args: calls.append(args))
+    manager.acquire(UID, KIND_SERIAL, HOLDER)
+    calls.clear()
+
+    manager.release(UID, HOLDER)
+
+    assert calls == [(UID, None, None)]
+
+
+def test_display_callback_not_fired_on_failed_acquire():
+    calls = []
+    manager = LockManager(lock_display_callback=lambda *args: calls.append(args))
+    manager.acquire(UID, KIND_SERIAL, HOLDER)
+    calls.clear()
+
+    with pytest.raises(LockHeldError):
+        manager.acquire(UID, KIND_SERIAL, HOLDER2)
+
+    assert calls == []
+
+
+def test_display_callback_not_fired_on_noop_release():
+    calls = []
+    manager = LockManager(lock_display_callback=lambda *args: calls.append(args))
+    manager.acquire(UID, KIND_SERIAL, HOLDER)
+    calls.clear()
+
+    manager.release(UID, HOLDER2)  # wrong holder -- no-op
+
+    assert calls == []
+
+
+def test_display_callback_fires_on_sweep_release():
+    calls = []
+    manager = LockManager(lock_display_callback=lambda *args: calls.append(args))
+    manager.acquire(UID, KIND_SERIAL, HOLDER)
+    calls.clear()
+
+    manager.sweep(lambda holder: False)  # everyone dead
+
+    assert calls == [(UID, None, None)]
+
+
+def test_both_callbacks_fire_independently_for_flash_release():
+    flash_calls = []
+    display_calls = []
+    manager = LockManager(
+        flash_release_callback=flash_calls.append,
+        lock_display_callback=lambda *args: display_calls.append(args),
+    )
+    manager.acquire(UID, KIND_FLASH, HOLDER)
+    display_calls.clear()  # only the release call is under test here
+
+    manager.release(UID, HOLDER)
+
+    assert flash_calls == [UID]
+    assert display_calls == [(UID, None, None)]
+
+
+def test_no_display_callback_registered_is_a_silent_no_op():
+    """Every test above this section (and every pre-ticket-005 test in
+    this file) constructs a manager with no ``lock_display_callback`` at
+    all -- this test just makes the "unaffected by default" contract
+    explicit rather than implicit."""
+    manager = LockManager()
+
+    manager.acquire(UID, KIND_SERIAL, HOLDER)
+    manager.release(UID, HOLDER)  # would raise if release assumed a callback exists
+
+    assert manager.status(UID) is None
+
+
+# ---------------------------------------------------------------------------
 # real-subprocess liveness integration test
 # ---------------------------------------------------------------------------
 
