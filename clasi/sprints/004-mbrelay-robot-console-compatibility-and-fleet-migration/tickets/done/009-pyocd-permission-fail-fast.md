@@ -1,7 +1,7 @@
 ---
 id: 009
 title: pyOCD permission fail-fast
-status: in-progress
+status: done
 use-cases:
 - SUC-005
 depends-on: []
