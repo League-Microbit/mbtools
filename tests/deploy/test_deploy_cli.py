@@ -56,13 +56,20 @@ from mbtools.registry.api import RegistryAPIServer
 from mbtools.registry.cli import assemble_daemon_and_api
 from mbtools.registry.flash import FlashOp
 from mbtools.registry.identity import ProbeResult
-from mbtools.registry.locks import KIND_FLASH, LockManager
+from mbtools.registry.locks import KIND_FLASH, HolderRef, LockManager
 from mbtools.registry.store import Store
 from mbtools.testing.fakes import FakeSerial, FakeUSBSource
 
 VID_PID = "0d28:0204"
 VID, PID_ = DAPLINK_VID_PID
 ANNOUNCEMENT = "device NEZHA2 robot tovez 1198504156"
+
+
+def _local_holder(pid: int) -> HolderRef:
+    """Mirrors api.py's own ``_local_holder`` construction (ticket 002)
+    for tests that acquire directly against ``LockManager``, bypassing
+    the wire protocol."""
+    return HolderRef(origin="local", ref=str(pid), pid=pid)
 
 
 def _uid(tag: str) -> str:
@@ -256,7 +263,7 @@ def test_relay_guard_refuses_before_lock_or_hex_resolution(
 def test_already_locked_fails_fast_naming_holder(server, store, locks, capsys):
     uid = _uid("locked11")
     _seed_device(store, uid, device_name="tovez")
-    locks.acquire(uid, KIND_FLASH, 9911)
+    locks.acquire(uid, KIND_FLASH, _local_holder(9911))
 
     start = time.monotonic()
     with pytest.raises(SystemExit) as excinfo:

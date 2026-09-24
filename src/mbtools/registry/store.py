@@ -34,6 +34,22 @@ is not re-probed"). ``store`` follows the same convention: a
 ``disconnected`` record is updated, never dropped, and a failed probe
 (``apply_probe_result(uid, None)``) never clobbers an existing
 announcement field it didn't get fresh data for.
+
+**Sprint 003 addition — peers and remote-owned devices.** Per sprint.md's
+Step 5 ("What Changed") and its ERD, this module also persists
+``registry.peering``'s view of the fleet: a nullable ``device.host``
+column (``NULL`` means this row is locally owned; otherwise the owning
+peer's hostname), two display-only cache columns
+(``remote_lock_kind``/``remote_lock_display``) a remote-owned row's
+lock state is mirrored into (never consulted for a local row, which
+always reads live ``LockManager`` state instead — Decision 3), and a new
+``peer`` table tracking every discovered registry's endpoint and
+reachability (Decision 5: a vanished peer is marked unreachable, never
+deleted, matching this module's own "never delete" precedent one level
+up). :meth:`Store.find` gains an optional ``name@host`` suffix and a new
+:class:`AmbiguousNameError` for a bare name that collides across hosts,
+per the stakeholder's explicit ``name@host`` disambiguation requirement
+(SUC-002).
 """
 
 from __future__ import annotations
@@ -48,7 +64,9 @@ from typing import Callable
 from mbtools.registry.identity import ProbeResult, short_uid
 
 __all__ = [
+    "AmbiguousNameError",
     "DeviceRecord",
+    "PeerRecord",
     "Store",
     "STATE_ATTACHED_UNPROBED",
     "STATE_CONNECTED",
@@ -97,6 +115,30 @@ CREATE TABLE IF NOT EXISTS device (
 )
 """
 
+#: The three sprint-003 ``device`` columns (per the ERD), added in place to
+#: an existing sprint-1/2 database. Deliberately *not* folded into
+#: ``_SCHEMA`` above -- ``_SCHEMA``'s ``CREATE TABLE IF NOT EXISTS`` is a
+#: no-op against an already-existing table, so a new column there would
+#: never reach an upgraded database; keeping ``_SCHEMA`` at its original
+#: sprint-1/2 shape and adding these via :meth:`Store._migrate_schema`
+#: unconditionally (see that method's docstring) is what makes a fresh
+#: database and an upgraded one converge on the same schema through the
+#: same code path, per this ticket's acceptance criteria.
+_NEW_DEVICE_COLUMNS: list[tuple[str, str]] = [
+    ("host", "TEXT"),
+    ("remote_lock_kind", "TEXT"),
+    ("remote_lock_display", "TEXT"),
+]
+
+_PEER_SCHEMA = """
+CREATE TABLE IF NOT EXISTS peer (
+    host TEXT PRIMARY KEY,
+    endpoint TEXT NOT NULL,
+    last_seen REAL NOT NULL,
+    reachable INTEGER NOT NULL DEFAULT 0
+)
+"""
+
 
 def format_vid_pid(vid: int, pid: int) -> str:
     """Format a USB (vid, pid) pair the way the ``device.vid_pid`` column
@@ -122,6 +164,16 @@ class DeviceRecord:
     value is a diagnostic nicety and callers must not treat it as live
     without checking ``state`` first. ``last_probe == 0.0`` means "never
     probed" (see :meth:`Store.needs_probe`).
+
+    ``host`` is ``None`` for a device this registry itself owns (attached
+    to a local port); otherwise it is the owning peer's hostname and this
+    row was written by ``registry.peering`` applying a remote snapshot or
+    event (sprint.md Step 5). ``remote_lock_kind``/``remote_lock_display``
+    are a display-only cache of a remote-owned row's lock state, set only
+    by :meth:`Store.apply_remote_lock_state` -- for a local row (``host``
+    is ``None``) they are always ``None`` and must not be consulted;
+    ``list``/``render`` read live ``LockManager`` state for a local row
+    instead (Decision 3).
     """
 
     uid: str
@@ -135,6 +187,9 @@ class DeviceRecord:
     raw_announcement: str | None
     state: str
     error_note: str | None
+    host: str | None
+    remote_lock_kind: str | None
+    remote_lock_display: str | None
     flash_count: int
     first_seen: float
     last_seen: float
@@ -154,11 +209,62 @@ def _row_to_record(row: sqlite3.Row) -> DeviceRecord:
         raw_announcement=row["raw_announcement"],
         state=row["state"],
         error_note=row["error_note"],
+        host=row["host"],
+        remote_lock_kind=row["remote_lock_kind"],
+        remote_lock_display=row["remote_lock_display"],
         flash_count=row["flash_count"],
         first_seen=row["first_seen"],
         last_seen=row["last_seen"],
         last_probe=row["last_probe"],
     )
+
+
+@dataclass(frozen=True)
+class PeerRecord:
+    """One ``peer`` row, per sprint.md's ERD §4 -- a registry this host has
+    discovered (via mDNS or ``--peer``), tracked for
+    ``registry.peering``'s event-bus subscription and reconnect logic.
+
+    ``endpoint`` is ``host:port`` for the peer's ``remote_api`` TCP
+    listener. ``reachable`` is ``False`` for a peer whose live link has
+    dropped (Decision 5: marked unreachable, never deleted -- a
+    reconnect's next :meth:`Store.record_peer_seen` naturally supersedes
+    the stale flag).
+    """
+
+    host: str
+    endpoint: str
+    last_seen: float
+    reachable: bool
+
+
+def _row_to_peer_record(row: sqlite3.Row) -> PeerRecord:
+    return PeerRecord(
+        host=row["host"],
+        endpoint=row["endpoint"],
+        last_seen=row["last_seen"],
+        reachable=bool(row["reachable"]),
+    )
+
+
+class AmbiguousNameError(Exception):
+    """Raised by :meth:`Store.find` when a bare ``device_name`` token (no
+    ``@host`` suffix) matches more than one distinct ``host`` value --
+    including the local ``NULL`` host as one candidate -- per the
+    stakeholder's explicit requirement that a name colliding across hosts
+    must be disambiguated with ``name@host`` (sprint.md SUC-002's
+    postcondition). A ``uid``/``short_uid`` match is never ambiguous by
+    definition (``uid`` is globally unique) and never raises this.
+    """
+
+    def __init__(self, token: str, hosts: list[str | None]) -> None:
+        self.token = token
+        self.hosts = hosts
+        display_hosts = ", ".join("local" if h is None else h for h in hosts)
+        super().__init__(
+            f"device name {token!r} is ambiguous across hosts: {display_hosts} "
+            "-- use 'name@host' to disambiguate"
+        )
 
 
 class Store:
@@ -232,7 +338,36 @@ class Store:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute(_SCHEMA)
+        self._migrate_schema()
         self._conn.commit()
+
+    def _migrate_schema(self) -> None:
+        """Add the sprint-003 ``device`` columns and the ``peer`` table, in
+        place -- never a destructive rebuild, per this module's "never
+        delete, always update in place" precedent (module docstring;
+        sprint.md's Migration Concerns).
+
+        Runs unconditionally, every construction, right after ``_SCHEMA``'s
+        ``CREATE TABLE IF NOT EXISTS device`` -- which only ever creates
+        the *original* sprint-1/2 shape, since ``_SCHEMA`` itself was left
+        unchanged (see ``_NEW_DEVICE_COLUMNS``'s docstring). That means a
+        brand-new database and an already-deployed sprint-1/2 database
+        both arrive here with a ``device`` table missing the three new
+        columns, and both are brought up to the full sprint-003 schema by
+        this one code path -- not a separate "fresh vs. upgrade" branch.
+        Each column is added only if :func:`PRAGMA table_info` doesn't
+        already report it, since SQLite's ``ADD COLUMN`` has no
+        ``IF NOT EXISTS`` on every SQLite version this project's Python
+        targets bundle. ``peer`` uses ``CREATE TABLE IF NOT EXISTS``
+        directly -- already idempotent, no per-column migration needed.
+        """
+        existing_columns = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(device)")
+        }
+        for column, decl in _NEW_DEVICE_COLUMNS:
+            if column not in existing_columns:
+                self._conn.execute(f"ALTER TABLE device ADD COLUMN {column} {decl}")
+        self._conn.execute(_PEER_SCHEMA)
 
     def close(self) -> None:
         """Close the underlying SQLite connection."""
@@ -242,7 +377,8 @@ class Store:
     # -- writes ---------------------------------------------------------
 
     def upsert_attached(self, uid: str, port: str, vid_pid: str) -> DeviceRecord:
-        """Record ``uid`` as currently attached on ``port``.
+        """Record ``uid`` as currently attached on ``port``, as a locally
+        owned device (``host`` stays ``NULL``).
 
         Creates a new ``attached_unprobed`` record for a uid the store has
         never seen, or refreshes ``port``/``last_seen`` on an existing one
@@ -261,6 +397,28 @@ class Store:
         rescanning a device that was attached the whole time) keeps its
         ``state`` and ``last_probe`` untouched -- see the module docstring.
         """
+        return self._upsert_device(uid, None, port, vid_pid)
+
+    def upsert_remote_attached(
+        self, uid: str, host: str, port: str, vid_pid: str
+    ) -> DeviceRecord:
+        """Remote counterpart to :meth:`upsert_attached` -- records ``uid``
+        as attached on peer ``host``, per a snapshot or attach event
+        ``registry.peering`` (ticket 005) applies into this store.
+
+        Same identity fields and the same reattach/probe-eligibility
+        semantics as :meth:`upsert_attached` (new record or a
+        ``disconnected`` -> reattach transition resets ``state``/
+        ``last_probe``; an already-attached remote row's announcement
+        fields are left untouched) -- the only difference is that
+        ``host`` is set to the owning peer's hostname instead of staying
+        ``NULL``.
+        """
+        return self._upsert_device(uid, host, port, vid_pid)
+
+    def _upsert_device(
+        self, uid: str, host: str | None, port: str, vid_pid: str
+    ) -> DeviceRecord:
         with self._lock:
             now = self._now()
             existing = self.get(uid)
@@ -268,25 +426,36 @@ class Store:
                 self._conn.execute(
                     """
                     INSERT INTO device (
-                        uid, short_uid, port, vid_pid, state,
+                        uid, short_uid, port, vid_pid, state, host,
                         flash_count, first_seen, last_seen, last_probe
-                    ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, 0.0)
+                    ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, 0.0)
                     """,
-                    (uid, short_uid(uid), port, vid_pid, STATE_ATTACHED_UNPROBED, now, now),
+                    (
+                        uid,
+                        short_uid(uid),
+                        port,
+                        vid_pid,
+                        STATE_ATTACHED_UNPROBED,
+                        host,
+                        now,
+                        now,
+                    ),
                 )
             elif existing.state == STATE_DISCONNECTED:
                 self._conn.execute(
                     """
                     UPDATE device
-                    SET port = ?, vid_pid = ?, state = ?, last_seen = ?, last_probe = 0.0
+                    SET port = ?, vid_pid = ?, state = ?, host = ?, last_seen = ?,
+                        last_probe = 0.0
                     WHERE uid = ?
                     """,
-                    (port, vid_pid, STATE_ATTACHED_UNPROBED, now, uid),
+                    (port, vid_pid, STATE_ATTACHED_UNPROBED, host, now, uid),
                 )
             else:
                 self._conn.execute(
-                    "UPDATE device SET port = ?, vid_pid = ?, last_seen = ? WHERE uid = ?",
-                    (port, vid_pid, now, uid),
+                    "UPDATE device SET port = ?, vid_pid = ?, host = ?, last_seen = ? "
+                    "WHERE uid = ?",
+                    (port, vid_pid, host, now, uid),
                 )
             self._conn.commit()
             record = self.get(uid)
@@ -393,6 +562,125 @@ class Store:
             assert record is not None
             return record
 
+    def mark_remote_detached(self, uid: str) -> DeviceRecord:
+        """Remote counterpart to :meth:`mark_disconnected` --
+        ``registry.peering`` (ticket 005) calls this when a peer's detach
+        event arrives for one of its remote-owned rows.
+
+        Identical effect to :meth:`mark_disconnected` (``state`` ->
+        ``disconnected``, ``last_seen`` updated, the record never
+        deleted); kept as a separately named method so a call site's
+        intent (a local ``usbwatch`` detach vs. a remote peer event) stays
+        explicit even though the store-side write is the same.
+
+        Raises :class:`KeyError` if ``uid`` has no existing record.
+        """
+        return self.mark_disconnected(uid)
+
+    def apply_remote_probe(self, uid: str, result: ProbeResult | None) -> DeviceRecord:
+        """Remote counterpart to :meth:`apply_probe_result` -- applies a
+        peer-reported probe outcome (from a snapshot or identity-change
+        event) to one of this store's remote-owned rows.
+
+        Identical semantics to :meth:`apply_probe_result`: a successful
+        ``result`` updates the announcement fields and sets
+        ``state="connected"``; ``None`` sets
+        ``state="connected_no_firmware"`` and leaves previously-known
+        announcement fields untouched.
+
+        Raises :class:`KeyError` if ``uid`` has no existing record.
+        """
+        return self.apply_probe_result(uid, result)
+
+    def apply_remote_lock_state(
+        self, uid: str, kind: str | None, display: str | None
+    ) -> DeviceRecord:
+        """Set (or clear, passing ``None``/``None``) the display-only
+        ``remote_lock_kind``/``remote_lock_display`` cache columns on
+        ``uid``'s row.
+
+        Per Decision 3, this is a pure cache write driven by
+        ``registry.peering``'s replicated lock-acquire/lock-release
+        *display* events -- it never calls into ``registry.locks``
+        (``LockManager`` isn't even constructed in this module) and never
+        touches the real lock state, which only the owning host's
+        ``remote_api``/``LockManager`` is authoritative over.
+
+        Raises :class:`KeyError` if ``uid`` has no existing record.
+        """
+        with self._lock:
+            if self.get(uid) is None:
+                raise KeyError(f"store.apply_remote_lock_state: no record for uid {uid!r}")
+            self._conn.execute(
+                "UPDATE device SET remote_lock_kind = ?, remote_lock_display = ? WHERE uid = ?",
+                (kind, display, uid),
+            )
+            self._conn.commit()
+            record = self.get(uid)
+            assert record is not None
+            return record
+
+    def record_peer_seen(self, host: str, endpoint: str) -> PeerRecord:
+        """Record ``host`` as discovered/reconnected at ``endpoint``,
+        creating its ``peer`` row if new, and mark it reachable.
+
+        Called by ``registry.peering`` (ticket 004/005) on mDNS discovery,
+        an explicit ``--peer``, or a successful snapshot/reconnect --
+        every case where this host has just proven it can reach ``host``.
+        """
+        with self._lock:
+            now = self._now()
+            existing = self.get_peer(host)
+            if existing is None:
+                self._conn.execute(
+                    "INSERT INTO peer (host, endpoint, last_seen, reachable) "
+                    "VALUES (?, ?, ?, 1)",
+                    (host, endpoint, now),
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE peer SET endpoint = ?, last_seen = ?, reachable = 1 WHERE host = ?",
+                    (endpoint, now, host),
+                )
+            self._conn.commit()
+            record = self.get_peer(host)
+            assert record is not None
+            return record
+
+    def mark_peer_unreachable(self, host: str) -> PeerRecord:
+        """Set ``host``'s ``peer.reachable`` to false -- the losing side of
+        a dropped ZMQ link calls this (Decision 5), never deleting the
+        peer row or touching any of its devices' ``state`` (only
+        ``registry.render``'s reachability-derived display changes; a
+        real disconnect the owning host itself observed is a separate
+        concern from losing contact with that host).
+
+        Raises :class:`KeyError` if ``host`` has no existing ``peer`` row.
+        """
+        return self._set_peer_reachable(host, False)
+
+    def mark_peer_reachable(self, host: str) -> PeerRecord:
+        """Set ``host``'s ``peer.reachable`` to true, without touching
+        ``endpoint``/``last_seen`` -- use :meth:`record_peer_seen` when a
+        fresh endpoint/last-seen timestamp is also available.
+
+        Raises :class:`KeyError` if ``host`` has no existing ``peer`` row.
+        """
+        return self._set_peer_reachable(host, True)
+
+    def _set_peer_reachable(self, host: str, reachable: bool) -> PeerRecord:
+        with self._lock:
+            if self.get_peer(host) is None:
+                raise KeyError(f"store._set_peer_reachable: no record for host {host!r}")
+            self._conn.execute(
+                "UPDATE peer SET reachable = ? WHERE host = ?",
+                (1 if reachable else 0, host),
+            )
+            self._conn.commit()
+            record = self.get_peer(host)
+            assert record is not None
+            return record
+
     # -- reads ------------------------------------------------------------
 
     def needs_probe(self, uid: str) -> bool:
@@ -426,11 +714,18 @@ class Store:
     def find(self, token: str) -> DeviceRecord | None:
         """Resolve a user-supplied ``token`` to a device record.
 
-        Precedence -- the same family as ``mbdeploy``'s ``resolve_target``,
-        minus its numeric-enum and port-path cases, which don't apply at
-        the store layer (no ``enum`` field here; a port path is resolved
-        by the caller against a live scan, per ``resolve_target``'s own
-        docstring, not looked up in the store):
+        An ``@host`` suffix (e.g. ``"zavaz@loki"``) is checked first: when
+        present, ``token`` is split on the last ``@`` and resolved to the
+        device whose ``device_name`` matches case-insensitively *and*
+        whose ``host`` matches case-insensitively (a bare hostname, not
+        ``host:port``) -- no ``uid``/``short_uid`` check is attempted for
+        an ``@``-suffixed token, since neither ever contains ``@``.
+
+        Without a suffix, precedence is the same family as ``mbdeploy``'s
+        ``resolve_target``, minus its numeric-enum and port-path cases,
+        which don't apply at the store layer (no ``enum`` field here; a
+        port path is resolved by the caller against a live scan, per
+        ``resolve_target``'s own docstring, not looked up in the store):
 
         1. Exact match against ``uid``.
         2. Exact match against ``short_uid``. Note ``short_uid`` is *not*
@@ -440,11 +735,28 @@ class Store:
            match returns whichever row SQLite happens to return first,
            same "good enough for a bench" spirit as the rest of this
            sprint's scale assumptions.
-        3. Case-insensitive match against ``device_name``.
+        3. Case-insensitive match against ``device_name``. If more than
+           one distinct ``host`` value has a device with this name
+           (including the local ``NULL`` host as one candidate), raises
+           :class:`AmbiguousNameError` instead of picking one -- per the
+           stakeholder's explicit ``name@host`` disambiguation
+           requirement (SUC-002). A ``device_name`` collision *within*
+           the same host is not this rule's concern and, like the
+           ``short_uid`` case, returns whichever row SQLite returns
+           first.
 
-        ``None`` if none of the three match.
+        ``None`` if nothing matches.
         """
         with self._lock:
+            if "@" in token:
+                name, _, host = token.rpartition("@")
+                row = self._conn.execute(
+                    "SELECT * FROM device WHERE device_name = ? COLLATE NOCASE "
+                    "AND host = ? COLLATE NOCASE",
+                    (name, host),
+                ).fetchone()
+                return _row_to_record(row) if row is not None else None
+
             row = self._conn.execute(
                 "SELECT * FROM device WHERE uid = ?", (token,)
             ).fetchone()
@@ -452,11 +764,28 @@ class Store:
                 row = self._conn.execute(
                     "SELECT * FROM device WHERE short_uid = ?", (token,)
                 ).fetchone()
-            if row is None:
-                row = self._conn.execute(
-                    "SELECT * FROM device WHERE device_name = ? COLLATE NOCASE", (token,)
-                ).fetchone()
-            return _row_to_record(row) if row is not None else None
+            if row is not None:
+                return _row_to_record(row)
+
+            matches = self._conn.execute(
+                "SELECT * FROM device WHERE device_name = ? COLLATE NOCASE", (token,)
+            ).fetchall()
+            if not matches:
+                return None
+            hosts = [m["host"] for m in matches]
+            distinct_hosts = {h.lower() if h is not None else None for h in hosts}
+            if len(distinct_hosts) > 1:
+                # Dedupe for the error message while preserving each
+                # distinct host's original casing.
+                seen: set[str | None] = set()
+                unique_hosts: list[str | None] = []
+                for h in hosts:
+                    key = h.lower() if h is not None else None
+                    if key not in seen:
+                        seen.add(key)
+                        unique_hosts.append(h)
+                raise AmbiguousNameError(token, unique_hosts)
+            return _row_to_record(matches[0])
 
     def list_devices(self) -> list[DeviceRecord]:
         """Every record, including ``disconnected`` ones (UC-004's "gone,
@@ -468,3 +797,34 @@ class Store:
         with self._lock:
             rows = self._conn.execute("SELECT * FROM device").fetchall()
             return [_row_to_record(row) for row in rows]
+
+    def snapshot_local_devices(self) -> list[DeviceRecord]:
+        """Every locally-owned row (``host IS NULL``), shaped for
+        ``registry.peering``'s snapshot-exchange payload (ticket 005) --
+        what this host hands a newly-joining peer before it subscribes to
+        the live event stream, and what a reconnecting peer's own resync
+        uses too.
+
+        Never includes a row this host itself learned about from some
+        *other* peer -- each registry's snapshot is its own devices only,
+        so a peer applying it always tags the result with the snapshot's
+        source host, never re-propagating a third host's rows.
+        """
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM device WHERE host IS NULL").fetchall()
+            return [_row_to_record(row) for row in rows]
+
+    def list_peers(self) -> list[PeerRecord]:
+        """Every known peer, reachable or not."""
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM peer").fetchall()
+            return [_row_to_peer_record(row) for row in rows]
+
+    def get_peer(self, host: str) -> PeerRecord | None:
+        """Exact lookup by ``host``. ``None`` if this host is not a known
+        peer."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM peer WHERE host = ?", (host,)
+            ).fetchone()
+            return _row_to_peer_record(row) if row is not None else None

@@ -35,7 +35,7 @@ from mbtools.common import (
 from mbtools.registry.api import RegistryAPIServer
 from mbtools.registry.flash import FlashOp
 from mbtools.registry.identity import ProbeResult
-from mbtools.registry.locks import KIND_FLASH, LockManager
+from mbtools.registry.locks import KIND_FLASH, HolderRef, LockManager
 from mbtools.registry.store import Store
 from mbtools.serial import cli as cli_mod
 from mbtools.serial import connect as connect_mod
@@ -44,6 +44,13 @@ from mbtools.testing.fakes import FakeSerial
 VID_PID = "0d28:0204"
 UID = "99000000111122223333444455556666e0528ab"
 PORT = "/dev/ttyACM7"
+
+
+def _local_holder(pid: int) -> HolderRef:
+    """Mirrors api.py's own ``_local_holder`` construction (ticket 002)
+    for tests that acquire directly against ``LockManager``, bypassing
+    the wire protocol."""
+    return HolderRef(origin="local", ref=str(pid), pid=pid)
 
 
 @pytest.fixture
@@ -136,7 +143,7 @@ def test_registry_unavailable_reports_no_daemon(tmp_path, capsys):
 
 def test_already_locked_fails_fast_naming_holder(server, store, locks, capsys):
     _seed_device(store)
-    locks.acquire(UID, KIND_FLASH, 5150)
+    locks.acquire(UID, KIND_FLASH, _local_holder(5150))
 
     with pytest.raises(SystemExit) as excinfo:
         cli_mod.main(["tovez", "--socket", str(server.socket_path)])

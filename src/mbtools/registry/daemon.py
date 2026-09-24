@@ -34,11 +34,15 @@ reused here rather than inventing a new one) instead of waiting forever.
 
 **Detach handling**: a uid that drops out of a scan has any lock it holds
 force-released (a detach is not a graceful release — UC-002's
-postcondition "any lock is released") by reading the current holder's pid
-off :meth:`LockManager.status` and passing it back to
-:meth:`LockManager.release` — legitimate because this is the daemon's own
-privileged bookkeeping, not a client-supplied pid a caller could use to
-steal someone else's lock. The record is then marked ``disconnected``.
+postcondition "any lock is released") by reading the current holder's
+:class:`~mbtools.registry.locks.HolderRef` off :meth:`LockManager.status`
+and passing it back to :meth:`LockManager.release` — legitimate because
+this is the daemon's own privileged bookkeeping, not a client-supplied
+identity a caller could use to steal someone else's lock. Every local
+caller only ever holds local (PID-tied) locks in this ticket's scope, so
+this is unchanged in effect from the pre-ticket-002 pid-based release;
+it is now holder-generalized only because :meth:`LockManager.release`'s
+signature is. The record is then marked ``disconnected``.
 Flash-pending tracking is left untouched across a detach — the very next
 scan that sees the uid reattach clears it (see above); the ticket's
 "detach-vs-flash disambiguation" is, concretely, that an ordinary detach
@@ -51,6 +55,24 @@ it is.
 :meth:`LockManager.status` is checked; a locked uid is skipped for this
 cycle and retried on a later one once it is unlocked — the probe would
 otherwise fight over the very port a lock exists to protect.
+
+**Event hook (ticket 005)**: :class:`Daemon` accepts an optional
+``event_callback`` (mirroring :class:`~mbtools.registry.locks.LockManager`'s
+own ``flash_release_callback`` convention — constructor-injected, defaults
+to ``None``, a no-op when unset so every existing caller/test is
+unaffected) fired with ``("attach" | "detach" | "identity", record)`` on
+every attach, detach, and completed probe (identity-change) — including
+the flash-reprobe-timeout give-up path, since that is also a completed
+probe (``apply_probe_result(uid, None)``) from a peer's point of view.
+This is where ``registry.peering`` (ticket 005) attaches its
+PUB-socket publish call for ticket 009's assembly to wire up; this class
+itself never imports or knows about ``peering``/ZeroMQ. Every callback
+fires only *after* the triggering ``store``/``locks`` writes are
+committed and, for the attach/detach batch in :meth:`run_once`, only
+after :attr:`_lock` is released — the same "no I/O under the shared
+lock" reasoning the module docstring's "Concurrency" note already applies
+to probing itself, extended to cover a callback that will end up doing a
+network send.
 
 **Concurrency (ticket 009's assembly)**: this class's own thread (the
 poll loop calling :meth:`run_once`) and the API's per-connection threads
@@ -83,7 +105,12 @@ from typing import Any, Callable
 from mbtools.common import PortInfo
 from mbtools.registry import identity
 from mbtools.registry.locks import LockManager
-from mbtools.registry.store import STATE_DISCONNECTED, Store, format_vid_pid
+from mbtools.registry.store import (
+    STATE_DISCONNECTED,
+    DeviceRecord,
+    Store,
+    format_vid_pid,
+)
 from mbtools.registry.usbwatch import PortWatcher
 
 __all__ = ["Daemon", "DEFAULT_INTERVAL_S", "DEFAULT_FLASH_REPROBE_TIMEOUT_S"]
@@ -107,10 +134,11 @@ class Daemon:
     real assembly ticket 009's ``mbregistry run`` builds) owns their
     lifecycle. ``locks`` is *not* injected: :class:`Daemon` always
     constructs its own :class:`~mbtools.registry.locks.LockManager` so it
-    can wire its flash-release callback at construction (the only point
-    ``LockManager`` accepts one) — exposed as :attr:`locks` so ticket
-    007/008 (and tests) can acquire/release/inspect locks against the
-    exact instance this daemon watches.
+    can wire its flash-release callback (and, as of ticket 009, a
+    ``lock_display_callback`` — see below) at construction, the only
+    point ``LockManager`` accepts either — exposed as :attr:`locks` so
+    ticket 007/008 (and tests) can acquire/release/inspect locks against
+    the exact instance this daemon watches.
 
     ``serial_factory``/``probe_timeout_s``/``settle_s`` are forwarded
     verbatim to :func:`mbtools.registry.identity.probe` on every probe
@@ -131,6 +159,19 @@ class Daemon:
     docstring's "Concurrency" note. Defaults to a private ``RLock`` of
     this instance's own when omitted, so single-threaded callers (every
     test in this module) are unaffected.
+
+    ``event_callback`` is the optional attach/detach/identity hook
+    described in the module docstring's "Event hook" note. Defaults to
+    ``None`` (no-op) so every pre-ticket-005 caller/test is unaffected.
+
+    ``lock_display_callback`` (ticket 009) is forwarded verbatim into
+    this daemon's own :class:`~mbtools.registry.locks.LockManager`
+    construction — :func:`mbtools.registry.cli.assemble_registry` passes
+    ``registry.peering.PeerDiscovery.publish_lock_event`` here so every
+    lock-acquire/lock-release this daemon's ``LockManager`` sees is also
+    published onto the peering event bus (sprint.md Decision 3's
+    replicated lock-display cache). Defaults to ``None`` (no-op), so
+    every pre-ticket-009 caller/test is unaffected.
     """
 
     def __init__(
@@ -144,6 +185,9 @@ class Daemon:
         flash_reprobe_timeout_s: float = DEFAULT_FLASH_REPROBE_TIMEOUT_S,
         now_fn: Callable[[], float] = time.monotonic,
         lock: threading.RLock | None = None,
+        event_callback: Callable[[str, DeviceRecord], None] | None = None,
+        lock_display_callback: Callable[[str, str | None, str | None], None]
+        | None = None,
     ) -> None:
         self._usbwatch = usbwatch
         self._store = store
@@ -153,6 +197,7 @@ class Daemon:
         self._flash_reprobe_timeout_s = flash_reprobe_timeout_s
         self._now = now_fn
         self._lock = lock if lock is not None else threading.RLock()
+        self._event_callback = event_callback
 
         #: uid -> deadline (per ``now_fn``) by which a flash-triggered
         #: re-probe must see the device re-enumerate, or it gives up.
@@ -163,7 +208,10 @@ class Daemon:
         #: for).
         self._flash_pending: dict[str, float] = {}
 
-        self.locks = LockManager(flash_release_callback=self._on_flash_release)
+        self.locks = LockManager(
+            flash_release_callback=self._on_flash_release,
+            lock_display_callback=lock_display_callback,
+        )
 
     # -- flash-release hook ------------------------------------------------
 
@@ -183,6 +231,21 @@ class Daemon:
             uid,
             deadline,
         )
+
+    # -- event hook ------------------------------------------------------
+
+    def _fire_events(self, event_type: str, records: list[DeviceRecord]) -> None:
+        """Call :attr:`_event_callback` once per ``record`` in ``records``,
+        a no-op if no callback was registered.
+
+        Always called *after* the triggering ``store`` writes are
+        committed and outside :attr:`_lock` — see the module docstring's
+        "Event hook" note.
+        """
+        if self._event_callback is None:
+            return
+        for record in records:
+            self._event_callback(event_type, record)
 
     # -- the pipeline --------------------------------------------------
 
@@ -214,10 +277,17 @@ class Daemon:
         for it doesn't stall the API. Probing (:meth:`_maybe_probe`) is
         deliberately done in a second pass, after that block releases the
         lock, so the port I/O itself never runs with the shared lock
+        held. ``event_callback`` (see the module docstring's "Event hook"
+        note) is fired for this cycle's attach/detach/identity records
+        after that same block releases the lock too — a callback that
+        does a network send must never run while the shared lock is
         held.
         """
         now = self._now()
         current = self._usbwatch.scan()
+        attached: list[DeviceRecord] = []
+        detached: list[DeviceRecord] = []
+        timed_out: list[DeviceRecord] = []
 
         with self._lock:
             previously_attached = {
@@ -228,15 +298,17 @@ class Daemon:
 
             for uid, info in current.items():
                 if uid not in previously_attached:
-                    self._store.upsert_attached(
+                    record = self._store.upsert_attached(
                         uid, info.port, format_vid_pid(info.vid, info.pid)
                     )
+                    attached.append(record)
 
             for uid in previously_attached - current.keys():
-                holder = self.locks.status(uid)
-                if holder is not None:
-                    self.locks.release(uid, holder.pid)
-                self._store.mark_disconnected(uid)
+                status = self.locks.status(uid)
+                if status is not None:
+                    self.locks.release(uid, status.holder)
+                record = self._store.mark_disconnected(uid)
+                detached.append(record)
 
             for uid, deadline in list(self._flash_pending.items()):
                 if uid not in current and now >= deadline:
@@ -245,8 +317,13 @@ class Daemon:
                         "marking no-firmware",
                         uid,
                     )
-                    self._store.apply_probe_result(uid, None)
+                    record = self._store.apply_probe_result(uid, None)
+                    timed_out.append(record)
                     del self._flash_pending[uid]
+
+        self._fire_events("attach", attached)
+        self._fire_events("detach", detached)
+        self._fire_events("identity", timed_out)
 
         for uid, info in current.items():
             self._maybe_probe(uid, info)
@@ -273,7 +350,10 @@ class Daemon:
         before this method held any lock at all (there was no shared lock
         to close it with); this change only stops it from stalling
         unrelated API calls, it does not add a new guarantee against that
-        specific interleaving.
+        specific interleaving. ``event_callback`` (see the module
+        docstring's "Event hook" note) fires with the post-probe record
+        after this second ``with self._lock`` block releases it, for the
+        same "no network I/O under the shared lock" reason.
         """
         with self._lock:
             eligible = self._store.needs_probe(uid) or uid in self._flash_pending
@@ -288,8 +368,10 @@ class Daemon:
         )
 
         with self._lock:
-            self._store.apply_probe_result(uid, result)
+            record = self._store.apply_probe_result(uid, result)
             self._flash_pending.pop(uid, None)
+
+        self._fire_events("identity", [record])
 
     # -- run loop --------------------------------------------------------
 

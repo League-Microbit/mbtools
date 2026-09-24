@@ -81,6 +81,27 @@ deploy/serial from ever importing store/locks/daemon directly."
 own docstring: "Acquire a ``kind``-kind lock"), so the wire-protocol
 string is what a client speaks, not a Python symbol imported from the
 daemon's own internals.
+
+**Local vs. remote transport (ticket 012, SUC-003)**: ``_run_deploy``
+resolves ``<name>`` via the local registry, then branches exactly once on
+``device.get("host")`` -- ``None`` keeps the sprint-002 local flow
+untouched (this function *is* that flow, byte-for-byte); a peer-owned
+device (``host`` set) opens a ``remote_client.RemoteRegistryClient``
+against the owning host's ``endpoint`` (``host:remote_api_port``, ticket
+010's addition to ``find``'s response) and drives every step from there
+on -- relay guard, hex resolution, lock, flash, wait-for-reprobe, report
+-- through :func:`_run_deploy_flow`, the single implementation both
+branches share (sprint.md Decision 8: a client talks directly to the
+owning host's own registry, never proxied through the local one).  The
+*only* thing that differs per branch is which client object is in hand
+(``RegistryClient`` vs. ``RemoteRegistryClient``) and, inside
+:func:`_flash`, which flash call that implies: local ``flash_hex`` +
+this module's own ``mark_flashed`` call, or the remote ``flash`` wire op,
+which already runs the same retry/mass-erase-robust ``flashlogic``
+server-side and increments ``flash_count`` itself (ticket 008) -- so the
+remote branch never calls ``mark_flashed`` (that would double-count it).
+No ``--auth-token`` handling is added here (out of this ticket's scope;
+Decision 6's shared-token auth defaults off fleet-wide).
 """
 
 from __future__ import annotations
@@ -91,7 +112,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from mbtools.common import (
     EXIT_ERROR,
@@ -99,6 +120,7 @@ from mbtools.common import (
     EXIT_NO_DAEMON,
     EXIT_OK,
     EXIT_USAGE,
+    format_locked_message,
 )
 from mbtools.deploy.flash import flash_hex
 from mbtools.deploy.release import GithubReleaseError, resolve_hex
@@ -113,6 +135,7 @@ from mbtools.registry.client import (
 )
 from mbtools.registry.client import SOCKET_ENV_VAR as _SOCKET_ENV_VAR
 from mbtools.registry.client import resolve_socket_path
+from mbtools.registry.remote_client import RemoteRegistryClient
 from mbtools.registry.render import render_json, render_table
 
 __all__ = [
@@ -183,7 +206,7 @@ def _is_relay(role: str | None) -> bool:
 
 
 def _wait_for_reprobe(
-    client: RegistryClient,
+    client: RegistryClient | RemoteRegistryClient,
     uid: str,
     previous_last_probe: float,
     timeout_s: float,
@@ -193,6 +216,12 @@ def _wait_for_reprobe(
     lands (``last_probe`` strictly later than ``previous_last_probe``,
     and ``state == "connected"`` -- module docstring's "Wait-for-reprobe"
     note on why both are checked) or ``timeout_s`` elapses.
+
+    ``client`` is either a local :class:`RegistryClient` or (ticket 012)
+    a :class:`RemoteRegistryClient` already connected to the owning
+    host's ``remote_api`` -- both expose the same ``find(uid)`` shape, so
+    this polling loop is identical either way (ticket 012's own
+    acceptance criterion: reused, not reimplemented).
 
     Always makes at least one ``find()`` attempt, even if ``timeout_s <=
     0``. Returns the device dict on success, ``None`` on timeout -- never
@@ -221,25 +250,71 @@ def _wait_for_reprobe(
         time.sleep(min(poll_interval_s, remaining))
 
 
-def _run_deploy(client: RegistryClient, args: argparse.Namespace) -> int:
-    """The ``deploy`` subcommand's actual body, run against an already-
-    connected ``client`` -- see :func:`cmd_deploy` for the socket-path
-    resolution and :class:`RegistryUnavailable` handling one level up.
+def _flash(
+    client: RegistryClient | RemoteRegistryClient,
+    uid: str,
+    hex_path: str,
+    name: str,
+    log: Callable[[str], None],
+) -> tuple[bool, int | None]:
+    """Run the flash itself -- the one step ticket 012's local/remote
+    branches don't share code for (module docstring's "Local vs. remote
+    transport" note), dispatched on which client class is in hand.
 
-    Follows the ticket's own numbered flow: resolve, relay guard, resolve
-    hex, lock, flash, mark_flashed, unlock, wait-for-reprobe, report.
+    Local (``RegistryClient``): this process runs pyocd directly via
+    ``deploy.flash.flash_hex`` (Design Rationale: local flashing, not the
+    registry's own minimal ``flash`` op), then calls ``mark_flashed`` for
+    ``flash_count`` bookkeeping (non-fatal if an old daemon doesn't
+    support it).
+
+    Remote (``RemoteRegistryClient``): the wire ``flash`` op runs the
+    same ``flashlogic.flash_hex`` server-side, with the same retry/mass-
+    erase robustness, and increments ``flash_count`` itself (ticket 008)
+    -- so ``mark_flashed`` is never called on this branch; doing so would
+    double-count it (this ticket's own acceptance criterion).
+
+    Returns ``(success, exit_code)`` -- normalized across both client
+    shapes (a local ``rc`` int, a remote ``FlashResult``) so the caller's
+    reporting logic (blank-board vs. generic failure) doesn't need to
+    know which transport ran.
     """
-    if args.asset and not args.repo:
-        print("mbdeploy: --asset only makes sense with --repo", file=sys.stderr)
-        return EXIT_USAGE
+    if isinstance(client, RemoteRegistryClient):
+        result = client.flash(uid, hex_path, log_callback=log)
+        return result.success, result.exit_code
 
-    # -- 1. resolve <name> -----------------------------------------------
-    try:
-        device = client.find(args.target)
-    except RegistryClientError as exc:
-        print(f"mbdeploy: {exc.message}", file=sys.stderr)
-        return exc.exit_code
+    rc = flash_hex(uid, hex_path, log=log, board_name=name)
+    if rc == 0:
+        try:
+            client.mark_flashed(uid)
+        except InvalidRequestError as exc:
+            # Deployment-sequencing risk (sprint.md's Migration
+            # Concerns): an old, sprint-001-vintage daemon has no
+            # mark_flashed op. Non-fatal -- the flash itself already
+            # succeeded; only flash_count bookkeeping is lost.
+            print(
+                "mbdeploy: warning: mark_flashed not supported by this "
+                f"registry daemon ({exc.message}) -- flash_count was "
+                "not updated",
+                file=sys.stderr,
+            )
+    return rc == 0, rc
 
+
+def _run_deploy_flow(
+    client: RegistryClient | RemoteRegistryClient,
+    device: dict[str, Any],
+    args: argparse.Namespace,
+) -> int:
+    """Steps 2-8 of the deploy flow -- relay guard, hex resolution, lock,
+    flash, wait-for-reprobe, report -- run against an already-connected,
+    already-resolved ``client``/``device`` pair.
+
+    Shared verbatim between :func:`_run_deploy`'s local and remote
+    branches (ticket 012's own acceptance criterion: "every step after
+    [resolve] is shared code, not duplicated per branch"); only
+    :func:`_flash` (called below) dispatches on which client class it
+    was given.
+    """
     uid = device["uid"]
     name = device.get("device_name") or uid
 
@@ -252,7 +327,7 @@ def _run_deploy(client: RegistryClient, args: argparse.Namespace) -> int:
         )
         return EXIT_ERROR
 
-    # -- 3. resolve the hex file ------------------------------------------
+    # -- 3. resolve the hex file -- always local, either transport --------
     if args.hex:
         hex_path = args.hex
     else:
@@ -273,11 +348,7 @@ def _run_deploy(client: RegistryClient, args: argparse.Namespace) -> int:
         client.lock(uid, _LOCK_KIND_FLASH)
     except DeviceLockedError as exc:
         holder = exc.holder or {}
-        print(
-            f"mbdeploy: {name} is locked for {holder.get('kind')} by pid "
-            f"{holder.get('pid')}",
-            file=sys.stderr,
-        )
+        print(f"mbdeploy: {format_locked_message(name, holder)}", file=sys.stderr)
         return exc.exit_code
     except RegistryClientError as exc:
         print(f"mbdeploy: {exc.message}", file=sys.stderr)
@@ -292,27 +363,13 @@ def _run_deploy(client: RegistryClient, args: argparse.Namespace) -> int:
             blank_board = True
         print(line, file=sys.stderr)
 
-    # -- 5/6/7: flash, mark_flashed, unlock -- unlock always runs, even on
-    # a flash failure or an unexpected mark_flashed error, since it's also
-    # what triggers the daemon's flash-lock-release re-probe hook (Design
-    # Rationale) and must never be skipped just because something
-    # upstream of it went wrong.
+    # -- 5/6/7: flash, unlock -- unlock always runs, even on a flash
+    # failure or an unexpected error, since it's also what triggers the
+    # owning daemon's flash-lock-release re-probe hook (Design Rationale)
+    # and must never be skipped just because something upstream of it
+    # went wrong.
     try:
-        rc = flash_hex(uid, hex_path, log=_log_line, board_name=name)
-        if rc == 0:
-            try:
-                client.mark_flashed(uid)
-            except InvalidRequestError as exc:
-                # Deployment-sequencing risk (sprint.md's Migration
-                # Concerns): an old, sprint-001-vintage daemon has no
-                # mark_flashed op. Non-fatal -- the flash itself already
-                # succeeded; only flash_count bookkeeping is lost.
-                print(
-                    "mbdeploy: warning: mark_flashed not supported by this "
-                    f"registry daemon ({exc.message}) -- flash_count was "
-                    "not updated",
-                    file=sys.stderr,
-                )
+        success, exit_code = _flash(client, uid, hex_path, name, _log_line)
     finally:
         try:
             client.unlock(uid)
@@ -324,7 +381,7 @@ def _run_deploy(client: RegistryClient, args: argparse.Namespace) -> int:
 
     # -- flash failure reporting -- blank-board is distinct, never folded
     # into the generic message (this ticket's own acceptance criterion).
-    if rc != 0:
+    if not success:
         if blank_board:
             print(
                 f"mbdeploy: {name} was mass-erased and never successfully "
@@ -332,8 +389,10 @@ def _run_deploy(client: RegistryClient, args: argparse.Namespace) -> int:
                 "is successfully reflashed.",
                 file=sys.stderr,
             )
+        elif exit_code is None:
+            print("mbdeploy: flash failed", file=sys.stderr)
         else:
-            print(f"mbdeploy: flash failed (exit {rc})", file=sys.stderr)
+            print(f"mbdeploy: flash failed (exit {exit_code})", file=sys.stderr)
         return EXIT_HARDWARE
 
     # -- 8. wait-for-reprobe -----------------------------------------------
@@ -356,6 +415,71 @@ def _run_deploy(client: RegistryClient, args: argparse.Namespace) -> int:
         f"(flash_count={new_device.get('flash_count')})"
     )
     return EXIT_OK
+
+
+def _run_deploy(client: RegistryClient, args: argparse.Namespace) -> int:
+    """The ``deploy`` subcommand's actual body, run against an already-
+    connected local ``client`` -- see :func:`cmd_deploy` for the socket-
+    path resolution and :class:`RegistryUnavailable` handling one level
+    up.
+
+    Resolves ``<name>`` via the local registry, then branches on
+    ``device.get("host")`` (ticket 012, module docstring's "Local vs.
+    remote transport" note): ``None`` keeps today's local flow, driving
+    :func:`_run_deploy_flow` against this same ``client``; a peer-owned
+    device opens a :class:`RemoteRegistryClient` at the owning host's
+    ``endpoint`` and drives the identical flow against *that* instead
+    (Decision 8 -- direct client-to-owning-registry connection, never
+    proxied through this local one).
+    """
+    if args.asset and not args.repo:
+        print("mbdeploy: --asset only makes sense with --repo", file=sys.stderr)
+        return EXIT_USAGE
+
+    # -- 1. resolve <name> via the local registry -------------------------
+    try:
+        device = client.find(args.target)
+    except RegistryClientError as exc:
+        print(f"mbdeploy: {exc.message}", file=sys.stderr)
+        return exc.exit_code
+
+    host = device.get("host")
+    if host is None:
+        return _run_deploy_flow(client, device, args)
+
+    # -- peer-owned device: connect directly to the owning host's own
+    # remote_api (its endpoint learned from `find`'s response, ticket
+    # 010) and drive the same flow against it. A RegistryUnavailable
+    # raised at any point from here on -- connecting, locking, flashing,
+    # unlocking, or waiting for the re-probe -- is this branch's
+    # "owning-host-unreachable mid-flash" error flow (this ticket's own
+    # acceptance criterion): caught here and reported cleanly, never a
+    # stack trace. --------------------------------------------------------
+    name = device.get("device_name") or device["uid"]
+    endpoint = device.get("endpoint") or ""
+    remote_host, sep, port_str = endpoint.rpartition(":")
+    try:
+        remote_port = int(port_str) if sep else -1
+    except ValueError:
+        remote_port = -1
+    if not sep or remote_port < 0:
+        print(
+            f"mbdeploy: {name} is owned by {host} but no usable endpoint is "
+            "known for it -- try again once peering has re-synced.",
+            file=sys.stderr,
+        )
+        return EXIT_ERROR
+
+    try:
+        with RemoteRegistryClient(remote_host, remote_port) as remote_client:
+            return _run_deploy_flow(remote_client, device, args)
+    except RegistryUnavailable as exc:
+        print(f"mbdeploy: {exc}", file=sys.stderr)
+        print(
+            f"mbdeploy: is {host}'s registry daemon reachable?",
+            file=sys.stderr,
+        )
+        return EXIT_NO_DAEMON
 
 
 def cmd_deploy(args: argparse.Namespace) -> int:

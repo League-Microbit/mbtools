@@ -34,7 +34,7 @@ from mbtools.registry.client import (
 )
 from mbtools.registry.flash import FlashOp
 from mbtools.registry.identity import ProbeResult
-from mbtools.registry.locks import KIND_FLASH, LockManager
+from mbtools.registry.locks import KIND_FLASH, HolderRef, LockManager
 from mbtools.registry.store import Store
 from mbtools.serial import connect as connect_mod
 from mbtools.testing.fakes import FakeSerial
@@ -42,6 +42,13 @@ from mbtools.testing.fakes import FakeSerial
 VID, PID = DAPLINK_VID_PID
 VID_PID = "0d28:0204"
 UID = "99000000111122223333444455556666e0528ab"
+
+
+def _local_holder(pid: int) -> HolderRef:
+    """Mirrors api.py's own ``_local_holder`` construction (ticket 002)
+    for tests that acquire directly against ``LockManager``, bypassing
+    the wire protocol."""
+    return HolderRef(origin="local", ref=str(pid), pid=pid)
 PORT = "/dev/ttyACM7"
 
 
@@ -221,7 +228,7 @@ def test_reset_on_macos_closes_and_reopens_not_a_break(server, store, client):
 
 def test_already_locked_fails_fast_and_never_opens_the_port(server, store, locks, client):
     _seed_device(store)
-    locks.acquire(UID, KIND_FLASH, 4242)
+    locks.acquire(UID, KIND_FLASH, _local_holder(4242))
 
     opened = []
 

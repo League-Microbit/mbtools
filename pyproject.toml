@@ -1,9 +1,9 @@
 [project]
 name = "mbtools"
-version = "0.20260923.2"
+version = "0.20260923.3"
 description = "Tools for finding, flashing and talking to BBC micro:bits across a fleet of hosts."
 requires-python = ">=3.10"
-dependencies = ["pyserial>=3.5", "intelhex>=2.3.0", "pyocd>=0.44.1"]
+dependencies = ["pyserial>=3.5", "intelhex>=2.3.0", "pyocd>=0.44.1", "zeroconf>=0.140", "pyzmq>=27.2"]
 
 [project.scripts]
 mbregistry = "mbtools.registry.cli:main"

@@ -22,11 +22,12 @@ from mbtools.registry.flash import (
     FlashResult,
     HexValidationError,
 )
-from mbtools.registry.locks import KIND_FLASH, KIND_SERIAL, LockManager
+from mbtools.registry.locks import KIND_FLASH, KIND_SERIAL, HolderRef, LockManager
 from mbtools.registry.store import Store
 
 UID = "9900" + "0000" + "11112222" + "3333444455556666" + "77778888" + "6e052820"
 PID = 4242
+HOLDER = HolderRef(origin="local", ref=str(PID), pid=PID)
 VID_PID = "0d28:0204"
 
 
@@ -80,7 +81,7 @@ class _SpyRunner:
 
 
 def test_missing_hex_file_raises_before_pyocd_and_does_not_increment(store, locks, tmp_path):
-    locks.acquire(UID, KIND_FLASH, PID)
+    locks.acquire(UID, KIND_FLASH, HOLDER)
     runner = _SpyRunner()
     op = FlashOp(locks=locks, store=store, runner=runner)
 
@@ -92,7 +93,7 @@ def test_missing_hex_file_raises_before_pyocd_and_does_not_increment(store, lock
 
 
 def test_malformed_hex_file_raises_before_pyocd_and_does_not_increment(store, locks, tmp_path):
-    locks.acquire(UID, KIND_FLASH, PID)
+    locks.acquire(UID, KIND_FLASH, HOLDER)
     bad_hex = tmp_path / "bad.hex"
     bad_hex.write_text("this is not a valid intel hex file\n")
     runner = _SpyRunner()
@@ -123,7 +124,7 @@ def test_flash_without_any_lock_is_refused(store, locks, tmp_path):
 
 
 def test_flash_with_wrong_kind_lock_is_refused(store, locks, tmp_path):
-    locks.acquire(UID, KIND_SERIAL, PID)
+    locks.acquire(UID, KIND_SERIAL, HOLDER)
     runner = _SpyRunner()
     op = FlashOp(locks=locks, store=store, runner=runner)
     hex_path = _valid_hex_path(tmp_path)
@@ -141,7 +142,7 @@ def test_flash_with_wrong_kind_lock_is_refused(store, locks, tmp_path):
 
 
 def test_successful_flash_increments_count_and_relays_log_in_order(store, locks, tmp_path):
-    locks.acquire(UID, KIND_FLASH, PID)
+    locks.acquire(UID, KIND_FLASH, HOLDER)
     lines = ["erasing...", "programming...", "verifying..."]
     runner = _SpyRunner(lines=lines, exit_code=0)
     op = FlashOp(locks=locks, store=store, runner=runner)
@@ -161,7 +162,7 @@ def test_successful_flash_increments_count_and_relays_log_in_order(store, locks,
 
 
 def test_flash_hex_never_releases_the_lock(store, locks, tmp_path):
-    locks.acquire(UID, KIND_FLASH, PID)
+    locks.acquire(UID, KIND_FLASH, HOLDER)
     runner = _SpyRunner(exit_code=0)
     op = FlashOp(locks=locks, store=store, runner=runner)
     hex_path = _valid_hex_path(tmp_path)
@@ -179,7 +180,7 @@ def test_flash_hex_never_releases_the_lock(store, locks, tmp_path):
 
 
 def test_nonzero_exit_still_increments_count_and_reports_failure(store, locks, tmp_path):
-    locks.acquire(UID, KIND_FLASH, PID)
+    locks.acquire(UID, KIND_FLASH, HOLDER)
     runner = _SpyRunner(lines=["some error output"], exit_code=1)
     op = FlashOp(locks=locks, store=store, runner=runner)
     hex_path = _valid_hex_path(tmp_path)
@@ -198,7 +199,7 @@ def test_nonzero_exit_still_increments_count_and_reports_failure(store, locks, t
 
 
 def test_runner_raising_still_increments_count_and_reports_failure(store, locks, tmp_path):
-    locks.acquire(UID, KIND_FLASH, PID)
+    locks.acquire(UID, KIND_FLASH, HOLDER)
     runner = _SpyRunner(raises=OSError("probe disconnected mid-flash"))
     op = FlashOp(locks=locks, store=store, runner=runner)
     hex_path = _valid_hex_path(tmp_path)

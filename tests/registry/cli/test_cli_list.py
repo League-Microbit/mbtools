@@ -24,7 +24,7 @@ from mbtools.registry.api import RegistryAPIServer
 from mbtools.registry.cli import main
 from mbtools.registry.flash import FlashOp
 from mbtools.registry.identity import ProbeResult
-from mbtools.registry.locks import KIND_SERIAL, LockManager
+from mbtools.registry.locks import KIND_SERIAL, HolderRef, LockManager
 from mbtools.registry.store import Store
 
 VID_PID = "0d28:0204"
@@ -83,7 +83,7 @@ def store(tmp_path):
 @pytest.fixture
 def locks():
     lm = LockManager()
-    lm.acquire(UID_LOCKED, KIND_SERIAL, 4821)
+    lm.acquire(UID_LOCKED, KIND_SERIAL, HolderRef(origin="local", ref="4821", pid=4821))
     return lm
 
 

@@ -25,8 +25,16 @@ from mbtools.registry.store import (
 def _device(**overrides) -> dict:
     """A minimal device dict in the shape ``registry.client.list()``
     returns (``api._device_dict``'s ``asdict(record)`` plus
-    ``lock_kind``/``lock_pid``) -- every field a real response carries,
-    with test-friendly defaults an individual test overrides.
+    ``lock_kind``/``lock_pid``/``endpoint``/``peer_reachable``) -- every
+    field a real response carries, with test-friendly defaults an
+    individual test overrides.
+
+    ``host``/``remote_lock_kind``/``remote_lock_display``/``endpoint``
+    default to ``None`` and ``peer_reachable`` defaults to ``True`` --
+    sprint 003's (ticket 010) peer-owned-row fields, at the same
+    "unset/local" defaults ``_device_dict`` folds in for a ``host IS
+    NULL`` row, so every pre-sprint-003 test above (that never overrides
+    them) keeps exercising exactly the local-row code path.
     """
     base = {
         "uid": "9900000011112222aaaaaaaa77778888",
@@ -45,6 +53,11 @@ def _device(**overrides) -> dict:
         "last_seen": 0.0,
         "lock_kind": None,
         "lock_pid": None,
+        "host": None,
+        "remote_lock_kind": None,
+        "remote_lock_display": None,
+        "endpoint": None,
+        "peer_reachable": True,
     }
     base.update(overrides)
     return base
@@ -192,3 +205,89 @@ def test_render_json_sort_order_matches_render_table():
     d_a = _device(short_uid="aaaaaaaa", uid="aa")
     payload = render_json([d_b, d_a])
     assert [d["short_uid"] for d in payload["devices"]] == ["aaaaaaaa", "bbbbbbbb"]
+
+
+# ---------------------------------------------------------------------------
+# HOST column, remote lock display, peer-unreachable rendering (ticket 010)
+# ---------------------------------------------------------------------------
+
+
+def test_render_table_header_row_has_host_column():
+    out = render_table([_device()])
+    header = out.splitlines()[0]
+    assert "HOST" in header
+
+
+def test_local_row_host_cell_is_local():
+    d = _device(short_uid="aaaaaaaa", host=None, port="/dev/ttyACM7")
+    out = render_table([d])
+    data_line = out.splitlines()[2]
+    # HOST sits just before PORT (TABLE_HEADERS) -- PORT stays the last
+    # column, so a known PORT value anchors where HOST's cell ends.
+    assert "local  /dev/ttyACM7" in data_line.rstrip()
+
+
+def test_remote_row_reachable_shows_hostname_and_cached_lock_display():
+    d = _device(
+        short_uid="bbbbbbbb",
+        device_name="vevov",
+        state=STATE_CONNECTED,
+        host="loki",
+        peer_reachable=True,
+        remote_lock_kind="serial",
+        remote_lock_display="pid 4821",
+        port="/dev/ttyACM7",
+    )
+    out = render_table([d])
+    data_line = out.splitlines()[2]
+    assert "loki  /dev/ttyACM7" in data_line.rstrip()
+    assert "locked by serial pid 4821" in data_line
+    # A remote row's cached lock display must never fall back to the
+    # local-only lock_kind/lock_pid fields (which are always None for a
+    # peer-owned row -- see api._device_dict).
+    assert "None" not in data_line
+
+
+def test_remote_row_reachable_and_unlocked_is_free():
+    d = _device(
+        short_uid="cccccccc",
+        state=STATE_CONNECTED,
+        host="loki",
+        peer_reachable=True,
+    )
+    out = render_table([d])
+    data_line = out.splitlines()[2]
+    assert "free" in data_line
+    assert "loki" in data_line
+
+
+def test_remote_row_unreachable_renders_peer_unreachable_regardless_of_cache():
+    # Per the ticket's own Testing note: "renders 'peer unreachable'
+    # regardless of its last-known state/lock cache" -- a stale
+    # "connected" state and a stale cached lock must not leak through.
+    d = _device(
+        short_uid="dddddddd",
+        state=STATE_CONNECTED,
+        host="loki",
+        peer_reachable=False,
+        remote_lock_kind="flash",
+        remote_lock_display="pid 42",
+    )
+    out = render_table([d])
+    data_line = out.splitlines()[2]
+    assert "peer unreachable" in data_line
+    assert "flash" not in data_line
+    assert "loki" in data_line  # HOST cell still shows the owning peer
+
+
+def test_remote_row_unreachable_wins_over_disconnected_state():
+    d = _device(
+        short_uid="eeeeeeee",
+        state=STATE_DISCONNECTED,
+        host="loki",
+        peer_reachable=False,
+    )
+    out = render_table([d])
+    data_line = out.splitlines()[2]
+    assert "peer unreachable" in data_line
+    assert "gone" not in data_line
