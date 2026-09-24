@@ -14,6 +14,7 @@ issues:
 - mbregistry-windows-platform-support.md
 - relay-in-data-plane-can-be-misidentified-by-reprobe.md
 - mbtools-fleet-deployment-tooling-and-migration-docs.md
+- peer-sync-overwrites-ownership-of-locally-attached-devices.md
 ---
 <!-- CLASI: Before changing code or making plans, review the SE process in CLAUDE.md -->
 
