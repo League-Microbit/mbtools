@@ -155,6 +155,41 @@ on connect instead of "0 devices". See the ticket's Implementation
 Notes (`clasi/sprints/005-mbregistry-windows-platform-support-and-fleet-migration/tickets/done/011-fix-local-ownership-wins-over-stale-peer-sync.md`)
 for the full root-cause trace, including a second gap (daemon.py's
 `previously_attached` set) found only by this hardware pass.
+**Re-verified, sprint 005 ticket 010's own hardware acceptance pass**:
+still holds after a second `scripts/deploy-host.sh torture` redeploy —
+all three relays still `host=local` on `torture`, `host=torture`
+everywhere else, pool still hands out all three (see
+`docs/acceptance/005-hardware.md`).
+
+**Fixed, sprint 005 ticket 010**: `mbrelay connect`'s interactive
+session (`relay.cli._interactive`) crashed with `AttributeError:
+'NoneType' object has no attribute 'select'` whenever `sys.stdin` had a
+real file descriptor but was not a tty (a redirected file, a pipe, or
+`/dev/null` — exactly what a script or non-interactive SSH command
+gives it). The old condition chose the `select`-based read loop based
+on `stdin_fd is not None`, but `select`/`termios`/`tty` are only
+imported in the separate `is_tty` branch. Fixed by gating on `is_tty`
+instead; see `docs/acceptance/005-hardware.md` Scenario 3 for the full
+trace and the new regression test (`tests/relay/test_cli.py::
+test_interactive_session_survives_non_tty_real_fd_stdin`).
+
+**Known paper-cut, not fixed (ticket 010)**: a bare `mbregistry`/
+`mbserial`/etc. client command on `braeburn` (macOS) without an
+explicit `--socket` flag fails with `registry unavailable at
+/run/mbregistry/api.sock: No such file or directory` — macOS has no
+`/run` directory at all, but `registry.paths.default_socket_path()`
+returns `/run/mbregistry/api.sock` unconditionally on every non-Windows
+platform (existing, not new, behavior — ticket 002's own acceptance
+criteria required it stay unchanged on macOS/Linux).
+`scripts/deploy-host.sh` already works around this operationally
+(`braeburn`'s daemon is launched with an explicit `--socket
+/tmp/mbregistry/api.sock`), but a manual client invocation on
+`braeburn` needs the same `--socket` flag passed by hand. Not fixed
+here: doing so would resolve `docs/design/specification.md`'s own
+still-open question #7 ("whether macOS is a supported daemon
+platform... is unresolved"), out of a hardware-acceptance ticket's
+scope to decide unilaterally. See `docs/acceptance/005-hardware.md`
+Scenario 3.
 
 ## Firmware for tests (GitHub release assets — use `MICROBIT.hex`)
 
