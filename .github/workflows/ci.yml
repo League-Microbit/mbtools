@@ -28,6 +28,13 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # A hung test should fail loudly, not burn the whole job's default
+    # 6h runner allowance. pytest-timeout (pyproject.toml's `[tool.pytest
+    # .ini_options] timeout = 60`) is the first line of defense --  it
+    # turns a hang into a named per-test failure -- this is the backstop
+    # for a hang pytest-timeout itself can't catch (e.g. within a fixture
+    # teardown running outside the timed test body).
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -42,4 +49,4 @@ jobs:
           python-version: "3.13"
 
       - name: Run the test suite
-        run: uv run pytest -q
+        run: uv run pytest -q -v --timeout=60
