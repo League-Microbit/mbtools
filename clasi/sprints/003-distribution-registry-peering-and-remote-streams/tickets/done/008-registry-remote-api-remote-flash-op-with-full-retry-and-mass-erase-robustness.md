@@ -1,9 +1,12 @@
 ---
 id: 008
 title: 'registry.remote_api: remote flash op with full retry and mass-erase robustness'
-status: open
-use-cases: [SUC-003]
-depends-on: ['003', '006']
+status: done
+use-cases:
+- SUC-003
+depends-on:
+- '003'
+- '006'
 github-issue: ''
 issue: mbdeploy-flash-by-name-remote.md
 completes_issue: true
@@ -28,7 +31,7 @@ here the registry both flashes and knows it happened in one op.
 
 ## Acceptance Criteria
 
-- [ ] `{"op": "flash", "uid": "...", "hex_path": "..."}` (hex file bytes
+- [x] `{"op": "flash", "uid": "...", "hex_path": "..."}` (hex file bytes
       are sent by the client beforehand or alongside — implementer's
       choice of exact wire shape, e.g. a prior `{"op": "send_hex", ...}`
       streaming the file, or requiring the client to have already placed
@@ -37,24 +40,36 @@ here the registry both flashes and knows it happened in one op.
       already held by this connection's own `HolderRef` — same
       precondition as `api.py`'s existing `_op_flash`, generalized via
       ticket 002.
-- [ ] Streams `{"type": "log", "line": ...}` lines exactly like the
+
+      Implemented as a two-op sequence: `{"op": "send_hex", "data":
+      "<base64>"}` (capped at `remote_api.MAX_HEX_PAYLOAD_BYTES`, 8 MiB)
+      stages the decoded bytes into a server-side temp file and returns
+      `{"ok": true, "hex_path": "<staged path>"}`; `flash`'s own
+      `hex_path` must be exactly that staged path from *this same
+      connection's* own prior `send_hex` call (refused as
+      `invalid_request` otherwise) — a remote client has no filesystem
+      this process can read directly, so `hex_path` is never an
+      arbitrary path a client names. Documented in
+      `docs/design/registry-api.md`'s new "Remote flash and hex staging"
+      section.
+- [x] Streams `{"type": "log", "line": ...}` lines exactly like the
       existing local `flash` op's framing (`docs/design/registry-api.md`'s
       existing table), followed by one terminal `{"type": "result", ...}`
       line — reusing that exact response shape so a client library
       (ticket 011) can share parsing code with `registry.client`'s own
       streaming-flash handling if the implementer judges that
       worthwhile.
-- [ ] Internally calls `registry.flashlogic.flash_hex` (not
+- [x] Internally calls `registry.flashlogic.flash_hex` (not
       `registry.flash.FlashOp`), getting the same transient-retry/
       mass-erase/blank-board-reporting behavior a local `mbdeploy deploy`
       gets.
-- [ ] On completion (success or failure), releases the `flash`-kind lock
+- [x] On completion (success or failure), releases the `flash`-kind lock
       unconditionally — same "always release, this is what triggers
       re-probe" guarantee `api.py`'s existing `_op_flash` documents — and
       calls `store.increment_flash_count(uid)` directly on success (this
       registry already owns `store`; no client-facing `mark_flashed` op
       exists on this path).
-- [ ] A blank-board outcome (mass erase succeeded, reflash still failed)
+- [x] A blank-board outcome (mass erase succeeded, reflash still failed)
       is reported through the streamed log lines exactly as
       `flashlogic.flash_hex`'s existing message already does — ticket
       012's client-side `mbdeploy` reporting (the same "blank_board"

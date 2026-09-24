@@ -303,9 +303,8 @@ above with the local Unix-socket `api.RegistryAPIServer`
 (`mbtools.registry._api_base.BaseAPIServer`) — everything under
 "Framing"/"Requests"/"Responses" above applies unchanged to this
 transport too, for the five ops it supports, plus `stream` (sprint 003,
-ticket 007 — see "Stream sub-protocol" below). `flash` is **not yet
-supported here** — that is ticket 008; requesting it on this server today
-gets `invalid_request`, same as any unrecognized op.
+ticket 007 — see "Stream sub-protocol" below) and `send_hex`/`flash`
+(sprint 003, ticket 008 — see "Remote flash and hex staging" below).
 
 ### Transport
 
@@ -488,6 +487,69 @@ primitives (`BREAK` and `SET_DTR`/`SET_RTS`), and ticket 013's
 platform needs into its own `--reset`, without this module needing a
 third, composed RPC.
 
+### Remote flash and hex staging (sprint 003, ticket 008)
+
+`flash` on the remote TCP API requires the calling connection to already
+hold a `flash`-kind lock on the device (call `lock` first), same as the
+local Unix socket's own `flash` op — but a remote client has no
+filesystem this server process can read directly, so `hex_path` here is
+never an arbitrary path. It must instead be a path returned by this same
+connection's own prior `send_hex` call:
+
+```jsonc
+// request
+{"op": "send_hex", "data": "<base64-encoded hex file bytes>"}
+// response, success:
+{"ok": true, "hex_path": "/tmp/mbregistry-remote-hex-xxxxxxxx.hex"}
+// or, payload too large or not valid base64:
+{"ok": false, "code": "invalid_request", "error": "..."}
+```
+
+`send_hex` decodes `data` and writes it to a server-side temp file,
+capped at `mbtools.registry.remote_api.MAX_HEX_PAYLOAD_BYTES` (8 MiB) —
+checked cheaply against the base64 *text* length first, then again
+against the actual decoded byte count. The returned `hex_path` is then
+passed to `flash`:
+
+```jsonc
+// request
+{"op": "flash", "uid": "...", "hex_path": "/tmp/mbregistry-remote-hex-xxxxxxxx.hex"}
+// zero or more, streamed exactly like the local `flash` op:
+{"type": "log", "line": "erasing..."}
+{"type": "log", "line": "programming..."}
+// exactly one, terminal:
+{"type": "result", "ok": true, "success": true, "exit_code": 0, "error": null}
+// or, `hex_path` wasn't staged by this connection's own `send_hex` call:
+{"type": "result", "ok": false, "code": "invalid_request", "error": "..."}
+```
+
+A `hex_path` this connection did not itself stage via `send_hex` is
+refused (`invalid_request`) — this is what stops a remote client from
+asking this registry to flash (and report pyocd's interpretation of) an
+arbitrary file already on this host. `send_hex` does not itself require a
+lock; only `flash` does.
+
+**Calls `flashlogic.flash_hex` directly, not `FlashOp`.** Unlike the
+local Unix socket's `flash` op (`registry.flash.FlashOp`, sprint 1's
+deliberately minimal wire-protocol op), the remote `flash` op calls
+`mbtools.registry.flashlogic.flash_hex` — the same function the local
+`mbdeploy deploy` path calls directly — so a remote flash gets the exact
+same transient-retry/mass-erase/blank-board-reporting behavior. A
+blank-board outcome (mass erase succeeded, reflash still failed) reaches
+the client through the ordinary streamed log lines unchanged, since it is
+the same function producing that message.
+
+**No separate `mark_flashed` round-trip on this path.** The remote `flash`
+op releases the device's `flash`-kind lock unconditionally once the
+attempt concludes (success, pyocd failure, or an unexpected exception) —
+same "always release, this is what triggers re-probe" guarantee as the
+local `flash` op — and, on success only, calls
+`store.increment_flash_count(uid)` directly: this registry both flashes
+and knows it happened in one op, unlike local `mbdeploy`'s two-call
+`flash` + `mark_flashed` pattern. The staged hex temp file is deleted
+afterwards regardless of outcome; a file staged but never flashed (the
+connection disconnected first) is deleted when that connection closes.
+
 ## Exit codes
 
 `mbtools.common` defines the stable process exit codes ticket 009's CLI (and
@@ -516,13 +578,16 @@ listed above, for the same one-place reason.
   BaseAPIServer`, a mixin both `api.RegistryAPIServer` (Unix) and
   `remote_api.RemoteAPIServer` (TCP) extend, parametrized on
   `_holder_for_connection`/`_list_visible_devices`/`_device_visible`.
-  `flash` (ticket 008's remote-flash territory) stays out of the shared
-  base — the local Unix socket's own `flash` op is untouched local-only
-  territory (see its own note above), and the remote API doesn't have a
-  `flash` op yet. The `stream` op and its binary frame sub-protocol
-  (ticket 007) live entirely in `remote_api.py` — the Unix socket has no
-  equivalent op (a local `mbserial` opens its port directly, never
-  through this API), so there is nothing to share into the base for it.
+  `flash` stays out of the shared base — the local Unix socket's own
+  `flash` op (`registry.flash.FlashOp`) and the remote TCP API's own
+  `flash` op (`flashlogic.flash_hex`, ticket 008) are deliberately
+  different implementations with different robustness levels (sprint.md
+  Decision 4), each living in its own module. The `stream` op and its
+  binary frame sub-protocol (ticket 007), and `send_hex` (ticket 008),
+  live entirely in `remote_api.py` — the Unix socket has no equivalent of
+  either (a local `mbserial` opens its port directly, and a local `flash`
+  request already has the hex file on the same filesystem), so there is
+  nothing to share into the base for them.
 - **Threading model.** One OS thread per accepted connection, plus one
   sweep thread, serialized by a single `threading.RLock` around every call
   into `store`/`locks`/`flash_op` — **except** the `flash` op's own pyocd

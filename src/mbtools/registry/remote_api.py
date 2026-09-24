@@ -9,11 +9,12 @@ ticket 006's own Description, this is a TCP listener parallel to
 ``api.RegistryAPIServer``'s existing Unix socket, sharing that module's
 per-op dispatch logic (:mod:`mbtools.registry._api_base`) rather than
 duplicating it — the two servers differ only in transport, peer-identity
-extraction, and (tickets 007/008) which extra ops they support. This
-module covers the JSON-op sub-protocol only: the framed binary stream
-sub-protocol (ticket 007) and remote ``flash`` (ticket 008) are separate
-tickets, since they change for different reasons (sprint.md Step 1-2,
-responsibilities 3/4/5) — this class has no ``flash``/``stream`` op yet.
+extraction, and which extra ops they support. This module covers the
+JSON-op sub-protocol, the framed binary stream sub-protocol the
+``stream`` op switches a connection into (ticket 007 — see "The
+``stream`` op and the binary sub-protocol" below), and, as of ticket 008,
+a robustness-preserving remote ``flash`` op plus the ``send_hex`` staging
+op it depends on (see "Remote flash and hex staging" below).
 
 **Session identity, not PID identity** (sprint.md Decision 2, ticket
 002's own module docstring: "a PID means nothing across hosts"): each
@@ -105,20 +106,67 @@ would already be sitting in the JSON reader's own internal decode buffer
 would not be seen by the socket-level reader that follows. A client that
 already waits for each op's response before sending the next thing --
 true of every op this protocol has -- satisfies this for free.
+
+**Remote flash and hex staging (sprint 003, ticket 008)**: a connection
+that already holds a ``flash``-kind lock on ``uid`` (via this same
+connection's own ``lock`` call -- checked via :class:`HolderRef` equality,
+the same "this connection's own holder" precondition
+``api.RegistryAPIServer._op_flash`` checks for the local socket, just not
+tied to a pid) may send ``{"op": "flash", "uid": "...", "hex_path":
+"..."}``. Unlike the local Unix socket's ``flash`` op, a remote client has
+no filesystem this process can read directly, so ``hex_path`` here is not
+an arbitrary path -- it must be a path returned by this same connection's
+own prior ``{"op": "send_hex", "data": "<base64>"}`` call
+(:meth:`RemoteAPIServer._op_send_hex`), which decodes the given base64
+payload (capped at :data:`MAX_HEX_PAYLOAD_BYTES`, checked cheaply against
+the base64 text length before ever decoding, then again against the
+decoded byte count) and writes it to a server-side temp file. A
+``hex_path`` this connection did not itself stage is refused
+(``invalid_request``) -- this is what stops a remote client from asking
+this registry to flash (and report pyocd's interpretation of) an
+arbitrary file already on this host.
+
+``flash`` here calls :func:`mbtools.registry.flashlogic.flash_hex`
+directly -- not the sprint-1 minimal :class:`~mbtools.registry.flash.
+FlashOp` the local socket's own ``flash`` op uses -- so a remote flash
+gets the exact same transient-retry/mass-erase/blank-board-reporting
+behavior a local ``mbdeploy deploy`` gets (the same function, not a
+parallel reimplementation that could drift). Its log lines stream to the
+client exactly like the local socket's own ``flash`` op
+(``{"type": "log", "line": ...}`` followed by one terminal
+``{"type": "result", ...}``), and, like that op, the pyocd invocation
+itself runs with the shared ``store``/``locks`` lock released -- only the
+per-device ``flash``-kind lock, already held and verified before the run
+starts, protects the device for its duration. On completion (success,
+pyocd failure, or an unexpected exception) the lock is released
+unconditionally -- the trigger `daemon`'s flash-triggered re-probe hook
+is watching for -- and, on success only, ``store.increment_flash_count``
+is called directly: this op both flashes and knows it happened in one
+step, so unlike the local socket's two-call ``flash`` + ``mark_flashed``
+pattern, no separate client-facing bookkeeping call is needed here. The
+staged temp file is removed afterwards regardless of outcome, and any
+file a connection staged but never flashed (e.g. it disconnected first)
+is cleaned up when that connection closes.
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
+import contextlib
 import json
 import logging
+import os
 import socket
+import tempfile
 import threading
 from typing import Any, Callable
 from uuid import uuid4
 
 from mbtools.common import CODE_INVALID_REQUEST, CODE_NOT_LOCKED, CODE_UNAUTHORIZED
 from mbtools.registry._api_base import BaseAPIServer, _error
-from mbtools.registry.locks import KIND_SERIAL, HolderRef, LockManager
+from mbtools.registry.flashlogic import flash_hex
+from mbtools.registry.locks import KIND_FLASH, KIND_SERIAL, HolderRef, LockManager
 from mbtools.registry.store import DeviceRecord, Store
 from mbtools.registry.stream_frame import (
     FRAME_BREAK,
@@ -142,6 +190,7 @@ __all__ = [
     "RemoteAPIServer",
     "DEFAULT_REMOTE_PORT",
     "DEFAULT_SWEEP_INTERVAL_S",
+    "MAX_HEX_PAYLOAD_BYTES",
 ]
 
 logger = logging.getLogger(__name__)
@@ -153,6 +202,23 @@ DEFAULT_REMOTE_PORT = 7440
 DEFAULT_SWEEP_INTERVAL_S = 5.0
 
 _ACCEPT_BACKLOG = 8
+
+#: A generous ceiling on one `send_hex` request's *decoded* byte count
+#: (ticket 008 -- "cap payload size sensibly"): this project's boards
+#: (nRF52833, 512 KiB flash) never produce an Intel HEX file within two
+#: orders of magnitude of this, so a real client never comes close; a
+#: malicious or buggy one can't make this process buffer or write an
+#: unbounded amount of data to a temp file on the strength of one JSON
+#: line. Checked against the base64 *text* length first (cheap, no
+#: decode needed) and again against the decoded byte count (authoritative
+#: -- base64 padding/alphabet tricks must not be able to slip a larger
+#: payload past the first check).
+MAX_HEX_PAYLOAD_BYTES = 8 * 1024 * 1024  # 8 MiB
+
+#: The base64-text-length equivalent of MAX_HEX_PAYLOAD_BYTES (base64
+#: expands 3 bytes into 4 characters), used for the cheap pre-decode
+#: rejection above.
+_MAX_HEX_B64_CHARS = 4 * ((MAX_HEX_PAYLOAD_BYTES + 2) // 3)
 
 #: Best-effort TCP keepalive tuning (see _configure_keepalive) -- short
 #: enough that a genuinely dead peer is noticed well within a human
@@ -403,6 +469,13 @@ class RemoteAPIServer(BaseAPIServer):
             self._live_sessions.add(holder.ref)
 
         acquired_uids: set[str] = set()
+        # ticket 008: hex files this connection staged via its own
+        # `send_hex` calls, keyed by the temp-file path handed back to
+        # the client -- see `_op_send_hex`/`_op_flash`. A path is removed
+        # from this set (and its file deleted) the moment a `flash`
+        # request consumes it; anything left over when the connection
+        # ends (staged but never flashed) is cleaned up below.
+        uploaded_hex_paths: set[str] = set()
         rfile = conn.makefile("r", encoding="utf-8", newline="\n")
         wfile = conn.makefile("w", encoding="utf-8", newline="\n")
         try:
@@ -417,7 +490,9 @@ class RemoteAPIServer(BaseAPIServer):
                     if not authenticated:
                         break
                     continue
-                stream_record = self._dispatch_line(line, holder, acquired_uids, wfile)
+                stream_record = self._dispatch_line(
+                    line, holder, acquired_uids, uploaded_hex_paths, wfile
+                )
                 if stream_record is not None:
                     # ticket 007: "stream" was accepted -- the connection
                     # leaves newline-JSON framing for the rest of its
@@ -439,6 +514,12 @@ class RemoteAPIServer(BaseAPIServer):
             with self._lock:
                 for uid in list(acquired_uids):
                     self._locks.release(uid, holder)
+            # ticket 008: any hex file this connection staged but never
+            # consumed via `flash` (e.g. it disconnected in between) --
+            # never leave a temp file behind past this connection's life.
+            for path in uploaded_hex_paths:
+                with contextlib.suppress(OSError):
+                    os.unlink(path)
             with self._sessions_lock:
                 self._live_sessions.discard(holder.ref)
             for f in (rfile, wfile):
@@ -473,7 +554,12 @@ class RemoteAPIServer(BaseAPIServer):
         return True
 
     def _dispatch_line(
-        self, line: str, holder: HolderRef, acquired_uids: set[str], wfile: Any
+        self,
+        line: str,
+        holder: HolderRef,
+        acquired_uids: set[str],
+        uploaded_hex_paths: set[str],
+        wfile: Any,
     ) -> DeviceRecord | None:
         """Dispatch one JSON request line and write its response.
 
@@ -504,14 +590,15 @@ class RemoteAPIServer(BaseAPIServer):
             resp = self._op_unlock(req, holder, acquired_uids)
         elif op == "mark_flashed":
             resp = self._op_mark_flashed(req, holder)
+        elif op == "send_hex":
+            resp = self._op_send_hex(req, uploaded_hex_paths)
+        elif op == "flash":
+            resp = self._op_flash(req, holder, acquired_uids, uploaded_hex_paths, wfile)
         elif op == "stream":
             resp, record = self._op_stream_precheck(req, holder)
             self._write(wfile, resp)
             return record
         else:
-            # "flash" (ticket 008) is not yet supported -- an unknown op
-            # here, same wire error a client gets for any other typo,
-            # per the module docstring's own scope note.
             resp = _error(CODE_INVALID_REQUEST, f"unknown op {op!r}")
         self._write(wfile, resp)
         return None
@@ -560,6 +647,187 @@ class RemoteAPIServer(BaseAPIServer):
                     None,
                 )
             return {"ok": True}, record
+
+    # -- remote flash and hex staging (ticket 008) ------------------------
+
+    def _op_send_hex(
+        self, req: dict[str, Any], uploaded_hex_paths: set[str]
+    ) -> dict[str, Any]:
+        """``send_hex(data)``: stage a base64-encoded hex file's bytes
+        into a server-side temp file, for a subsequent ``flash`` request
+        *on this same connection* to reference via its own ``hex_path``
+        (see :meth:`_op_flash` and the module docstring's "Remote flash
+        and hex staging" note for why ``flash`` doesn't just take an
+        arbitrary filesystem path here).
+
+        ``uploaded_hex_paths`` is this connection's own bookkeeping set,
+        owned by :meth:`_handle_connection` and mirroring
+        ``acquired_uids`` -- a path is added here on success, removed by
+        :meth:`_op_flash` once consumed, and cleaned up on connection
+        close for anything staged but never flashed.
+
+        The payload is capped at :data:`MAX_HEX_PAYLOAD_BYTES`: first
+        cheaply, against the base64 *text* length (no decode needed), and
+        again against the actual decoded byte count (authoritative --
+        never trust the cheap check alone).
+        """
+        data = req.get("data")
+        if not isinstance(data, str) or not data:
+            return _error(CODE_INVALID_REQUEST, "'send_hex' requires 'data' (base64)")
+        if len(data) > _MAX_HEX_B64_CHARS:
+            return _error(
+                CODE_INVALID_REQUEST,
+                f"hex payload exceeds the {MAX_HEX_PAYLOAD_BYTES}-byte limit",
+            )
+        try:
+            raw = base64.b64decode(data, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            return _error(CODE_INVALID_REQUEST, f"'data' is not valid base64: {exc}")
+        if len(raw) > MAX_HEX_PAYLOAD_BYTES:
+            return _error(
+                CODE_INVALID_REQUEST,
+                f"hex payload exceeds the {MAX_HEX_PAYLOAD_BYTES}-byte limit",
+            )
+
+        fd, path = tempfile.mkstemp(prefix="mbregistry-remote-hex-", suffix=".hex")
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(raw)
+        except OSError as exc:
+            with contextlib.suppress(OSError):
+                os.unlink(path)
+            return _error(CODE_INVALID_REQUEST, f"could not stage hex file: {exc}")
+
+        uploaded_hex_paths.add(path)
+        return {"ok": True, "hex_path": path}
+
+    def _op_flash(
+        self,
+        req: dict[str, Any],
+        holder: HolderRef,
+        acquired_uids: set[str],
+        uploaded_hex_paths: set[str],
+        wfile: Any,
+    ) -> dict[str, Any]:
+        """``flash(uid, hex_path)``: requires a ``flash``-kind lock
+        already held by *this connection's own* :class:`HolderRef` --
+        the same "this connection's own holder, not merely some holder"
+        precondition ``api.RegistryAPIServer._op_flash`` checks for the
+        local socket, generalized here via ``HolderRef`` equality (ticket
+        002) instead of a bare pid comparison. ``hex_path`` must be a
+        path this same connection staged via its own prior ``send_hex``
+        call (tracked in ``uploaded_hex_paths``) -- see the module
+        docstring's "Remote flash and hex staging" note.
+
+        Calls :func:`mbtools.registry.flashlogic.flash_hex` directly --
+        not the sprint-1 minimal :class:`~mbtools.registry.flash.FlashOp`
+        -- so this gets the exact same transient-retry/mass-erase/
+        blank-board-reporting behavior a local ``mbdeploy deploy`` gets,
+        streaming its log lines to ``wfile`` exactly like the local
+        socket's own ``flash`` op. Deliberately runs the pyocd invocation
+        itself outside ``self._lock`` (the shared store/locks lock) --
+        only the short bookkeeping before and after (resolving the
+        record and confirming the lock, then releasing it and, on
+        success, incrementing ``flash_count``) happens under it; the
+        already-verified per-device ``flash``-kind lock is what protects
+        the device for the run itself.
+
+        The lock is released unconditionally once the attempt concludes
+        (success, pyocd failure, or an unexpected exception) -- this is
+        what ``daemon``'s flash-triggered re-probe hook is watching for --
+        and ``store.increment_flash_count(uid)`` is called directly on
+        success only: this op both flashes and knows it happened in one
+        step, so no separate client-facing ``mark_flashed`` call is
+        needed on this path. The staged hex temp file is always removed
+        afterwards, regardless of outcome.
+        """
+
+        def _flash_error(code: str, message: str, **extra: Any) -> dict[str, Any]:
+            # Every response to a "flash" request -- whether a
+            # precondition failure before any log line was ever sent, or
+            # the terminal message after streaming -- carries
+            # "type": "result", mirroring api.RegistryAPIServer's own
+            # `_op_flash` so a client's dispatch loop for this one op is
+            # always "type == 'log' -> print it; else -> done".
+            payload = _error(code, message, **extra)
+            payload["type"] = "result"
+            payload["success"] = False
+            payload["exit_code"] = None
+            return payload
+
+        token = req.get("uid")
+        hex_path = req.get("hex_path")
+        if not token or not hex_path:
+            return _flash_error(CODE_INVALID_REQUEST, "'flash' requires 'uid' and 'hex_path'")
+        hex_path = str(hex_path)
+        if hex_path not in uploaded_hex_paths:
+            return _flash_error(
+                CODE_INVALID_REQUEST,
+                "'hex_path' must be a path staged by this connection's own "
+                "'send_hex' call",
+            )
+
+        # Bookkeeping step 1 (short, held under the shared lock): resolve
+        # the record (scoped to this registry's own devices, same as
+        # every other op) and confirm this connection's own flash-kind
+        # lock is held. Nothing here touches pyocd or the hex file.
+        with self._lock:
+            record, err = self._resolve_visible(str(token))
+            if err is not None:
+                return _flash_error(err["code"], err["error"], **{
+                    k: v for k, v in err.items() if k not in ("ok", "code", "error")
+                })
+            assert record is not None
+            uid = record.uid
+            status = self._locks.status(uid)
+            if status is None or status.kind != KIND_FLASH or status.holder != holder:
+                return _flash_error(
+                    CODE_NOT_LOCKED,
+                    f"{uid}: flash requires a flash-kind lock held by this "
+                    "connection (call 'lock' first)",
+                )
+
+        def log(line: str) -> None:
+            self._write(wfile, {"type": "log", "line": line})
+
+        # The run itself: deliberately outside the shared lock (see this
+        # method's own docstring). `uid`'s own flash-kind lock, verified
+        # above and not released until the `finally`/bookkeeping-step-2
+        # below, is what protects the device for this whole streamed
+        # pyocd invocation.
+        board_name = record.device_name or uid
+        try:
+            rc = flash_hex(uid, hex_path, log=log, board_name=board_name)
+            success = rc == 0
+            exit_code: int | None = rc
+            error: str | None = None if success else f"pyocd flash failed (exit {rc})"
+        except Exception as exc:  # pragma: no cover - flash_hex doesn't raise in practice
+            logger.exception("remote_api: flash_hex raised for %s", uid)
+            success = False
+            exit_code = None
+            error = str(exc)
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(hex_path)
+            uploaded_hex_paths.discard(hex_path)
+
+        # Bookkeeping step 2 (short, held under the shared lock): the
+        # attempt concluded -- release the lock (this is what daemon's
+        # flash-triggered re-probe hook is watching for) and, on success
+        # only, record that this uid was flashed.
+        with self._lock:
+            self._locks.release(uid, holder)
+            acquired_uids.discard(uid)
+            if success:
+                self._store.increment_flash_count(uid)
+
+        return {
+            "type": "result",
+            "ok": success,
+            "success": success,
+            "exit_code": exit_code,
+            "error": error,
+        }
 
     # -- stream sub-protocol (ticket 007) ---------------------------------
 

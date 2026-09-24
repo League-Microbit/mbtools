@@ -517,10 +517,28 @@ def test_unknown_op_returns_invalid_request(remote_server):
     srv = remote_server()
     client = _Client(srv.bound_port)
 
-    resp = client.request({"op": "flash", "uid": LOCAL_UID, "hex_path": "/tmp/x.hex"})
+    resp = client.request({"op": "not_a_real_op", "uid": LOCAL_UID})
 
-    # "flash"/"stream" are tickets 007/008's territory -- not yet a known
-    # op on this server.
     assert resp["ok"] is False
     assert resp["code"] == CODE_INVALID_REQUEST
+    client.close()
+
+
+def test_flash_without_a_staged_hex_path_is_invalid_request(remote_server):
+    """`flash`'s own territory (ticket 008) is covered in
+    test_remote_flash.py -- this only re-proves `flash` is no longer an
+    *unknown* op on this server (see the previous test) while also
+    exercising the "hex_path must come from this connection's own
+    send_hex" guard without a real pyocd invocation."""
+    srv = remote_server()
+    client = _Client(srv.bound_port)
+    client.request({"op": "lock", "uid": LOCAL_UID, "kind": KIND_FLASH})
+
+    resp = client.request(
+        {"op": "flash", "uid": LOCAL_UID, "hex_path": "/tmp/not-staged.hex"}
+    )
+
+    assert resp["ok"] is False
+    assert resp["code"] == CODE_INVALID_REQUEST
+    assert resp["type"] == "result"
     client.close()
