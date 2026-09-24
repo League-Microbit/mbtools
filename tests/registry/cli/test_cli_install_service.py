@@ -3,6 +3,18 @@ assertion on the rendered systemd unit's content, plus a check that the
 CLI command itself writes it to ``--output``. Installing into a real
 systemd is out of scope for automated tests (sprint.md's Test Strategy);
 manual verification on a spare board is a follow-up, not exercised here.
+
+Ticket 008 extends this file with the non-root-USB-access udev rule
+(``--udev-output``) install-service now also writes -- see
+``test_udev_rule_*``/``test_install_service_*udev*`` below. Every
+``main(["install-service", ...])`` call in this file (old and new) now
+passes both ``--output`` and ``--udev-output`` pointing at ``tmp_path``:
+without an explicit ``--udev-output``, ``cmd_install_service`` would try
+to write :data:`~mbtools.registry.cli.DEFAULT_UDEV_RULE_PATH`
+(``/etc/udev/rules.d/...``), a real system path that needs root -- the
+same reason every pre-ticket-008 test already overrides ``--output``
+rather than letting it fall through to
+:data:`~mbtools.registry.cli.DEFAULT_UNIT_PATH`.
 """
 
 from __future__ import annotations
@@ -13,7 +25,12 @@ import sys
 import pytest
 
 from mbtools.common import EXIT_OK
-from mbtools.registry.cli import main, render_systemd_unit
+from mbtools.registry.cli import (
+    DEFAULT_UDEV_RULE_PATH,
+    main,
+    render_systemd_unit,
+    render_udev_rule,
+)
 
 
 def test_rendered_unit_is_a_golden_file_for_the_required_directives():
@@ -43,9 +60,18 @@ def test_rendered_unit_accepts_a_custom_exec_start():
 
 def test_unit_is_named_mbregistry_service_distinct_from_mbrelay_service(tmp_path, capsys):
     output = tmp_path / "mbregistry.service"
+    udev_output = tmp_path / "99-mbregistry-cmsis-dap.rules"
 
     with pytest.raises(SystemExit) as excinfo:
-        main(["install-service", "--output", str(output)])
+        main(
+            [
+                "install-service",
+                "--output",
+                str(output),
+                "--udev-output",
+                str(udev_output),
+            ]
+        )
 
     assert excinfo.value.code == EXIT_OK
     assert output.name == "mbregistry.service"
@@ -63,12 +89,22 @@ def test_unit_is_named_mbregistry_service_distinct_from_mbrelay_service(tmp_path
 
 def test_install_service_creates_parent_directories(tmp_path):
     output = tmp_path / "nested" / "dir" / "mbregistry.service"
+    udev_output = tmp_path / "nested" / "udev-dir" / "99-mbregistry-cmsis-dap.rules"
 
     with pytest.raises(SystemExit) as excinfo:
-        main(["install-service", "--output", str(output)])
+        main(
+            [
+                "install-service",
+                "--output",
+                str(output),
+                "--udev-output",
+                str(udev_output),
+            ]
+        )
 
     assert excinfo.value.code == EXIT_OK
     assert output.exists()
+    assert udev_output.exists()
 
 
 def test_module_invocation_shape_that_the_rendered_unit_s_execstart_uses_actually_runs():
@@ -98,3 +134,137 @@ def test_module_invocation_shape_that_the_rendered_unit_s_execstart_uses_actuall
     assert result.returncode == 0
     assert "usage: mbregistry" in result.stdout
     assert "install-service" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# ticket 008 -- non-root USB access udev rule
+# ---------------------------------------------------------------------------
+
+
+def test_rendered_udev_rule_matches_both_tty_and_usb_device_nodes_for_the_daplink_vid_pid():
+    rule_text = render_udev_rule()
+
+    # tty device node (mbserial, pyOCD's serial transport)
+    assert 'SUBSYSTEM=="tty"' in rule_text
+    assert 'SUBSYSTEMS=="usb"' in rule_text
+
+    # raw USB device node (pyOCD's CMSIS-DAP v2 / WinUSB transport)
+    assert 'SUBSYSTEM=="usb"' in rule_text
+
+    # hidraw device node (pyOCD's CMSIS-DAP v1 / HID transport)
+    assert 'KERNEL=="hidraw*"' in rule_text
+
+    # every match rule is scoped to the micro:bit DAPLink VID:PID, not left
+    # open to match any USB device
+    assert rule_text.count('ATTRS{idVendor}=="0d28"') == 3
+    assert rule_text.count('ATTRS{idProduct}=="0204"') == 3
+
+
+def test_rendered_udev_rule_grants_access_via_group_and_uaccess():
+    rule_text = render_udev_rule()
+
+    # GROUP="plugdev"/MODE="0660" (reliable on the SSH-only Nolanet nodes,
+    # no logind seat/session dependency) *and* TAG+="uaccess" (immediate,
+    # no-relogin grant wherever a logind seat session does apply) -- both
+    # mechanisms, on every one of the three match rules; see
+    # render_udev_rule()'s own docstring for why not just one.
+    assert rule_text.count('GROUP="plugdev"') == 3
+    assert rule_text.count('MODE="0660"') == 3
+    assert rule_text.count('TAG+="uaccess"') == 3
+
+
+def test_install_service_writes_the_udev_rule_to_udev_output(tmp_path, capsys):
+    unit_output = tmp_path / "mbregistry.service"
+    udev_output = tmp_path / "99-mbregistry-cmsis-dap.rules"
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            [
+                "install-service",
+                "--output",
+                str(unit_output),
+                "--udev-output",
+                str(udev_output),
+                "--user",
+                "eric",
+            ]
+        )
+
+    assert excinfo.value.code == EXIT_OK
+    assert udev_output.exists()
+    assert udev_output.read_text() == render_udev_rule()
+
+    err = capsys.readouterr().err
+    assert f"mbregistry: wrote {udev_output}" in err
+    # follow-up commands are printed, not run (matching the systemd
+    # follow-up commands' own existing pattern) -- this ticket's own
+    # acceptance criterion.
+    assert "udevadm control --reload-rules" in err
+    assert "udevadm trigger" in err
+    assert "usermod -aG plugdev eric" in err
+
+
+def test_install_service_udev_rule_write_defaults_to_the_module_constant(tmp_path):
+    # DEFAULT_UDEV_RULE_PATH is exercised only for its *value* here (no
+    # write to the real path, which needs root) -- confirms --udev-output
+    # is documented as overriding this specific default, matching how
+    # --output is tested against DEFAULT_UNIT_PATH elsewhere in this file.
+    assert DEFAULT_UDEV_RULE_PATH.name == "99-mbregistry-cmsis-dap.rules"
+    assert str(DEFAULT_UDEV_RULE_PATH).startswith("/etc/udev/rules.d/")
+
+
+def test_install_service_udev_rule_install_is_idempotent_on_rerun(tmp_path):
+    unit_output = tmp_path / "mbregistry.service"
+    udev_output = tmp_path / "99-mbregistry-cmsis-dap.rules"
+    argv = [
+        "install-service",
+        "--output",
+        str(unit_output),
+        "--udev-output",
+        str(udev_output),
+    ]
+
+    with pytest.raises(SystemExit) as first:
+        main(argv)
+    assert first.value.code == EXIT_OK
+    first_text = udev_output.read_text()
+    first_mtime_dir_listing = sorted(p.name for p in tmp_path.iterdir())
+
+    with pytest.raises(SystemExit) as second:
+        main(argv)
+    assert second.value.code == EXIT_OK
+    second_text = udev_output.read_text()
+    second_dir_listing = sorted(p.name for p in tmp_path.iterdir())
+
+    # same content, and no second/duplicate rule file appeared alongside it
+    # (e.g. no "99-mbregistry-cmsis-dap.rules.1" or similar) -- this
+    # ticket's own "idempotent... no duplicate rule file" acceptance
+    # criterion. A bare re-run of install-service never starts, stops, or
+    # restarts mbregistry.service either (cmd_install_service only ever
+    # writes files and prints instructions), so "no service disruption" is
+    # satisfied by construction, not separately exercised here.
+    assert second_text == first_text
+    assert second_dir_listing == first_mtime_dir_listing
+
+
+def test_resolve_operating_user_prefers_explicit_flag_over_env(monkeypatch):
+    from mbtools.registry.cli import _resolve_operating_user
+
+    monkeypatch.setenv("SUDO_USER", "someoneelse")
+    assert _resolve_operating_user("eric") == "eric"
+
+
+def test_resolve_operating_user_prefers_sudo_user_over_user_env(monkeypatch):
+    from mbtools.registry.cli import _resolve_operating_user
+
+    monkeypatch.setenv("SUDO_USER", "eric")
+    monkeypatch.setenv("USER", "root")
+    assert _resolve_operating_user(None) == "eric"
+
+
+def test_resolve_operating_user_falls_back_to_user_env(monkeypatch):
+    from mbtools.registry.cli import _resolve_operating_user
+
+    monkeypatch.delenv("SUDO_USER", raising=False)
+    monkeypatch.setenv("USER", "eric")
+    assert _resolve_operating_user(None) == "eric"

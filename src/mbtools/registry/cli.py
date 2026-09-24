@@ -5,7 +5,8 @@ socket for ``list`` (per spec §3.5, "other programs consult it through a
 service" — this module never reads ``store``/``locks`` directly, even
 though it runs on the same host as the daemon it's talking to), the
 process that constructs and runs the daemon for ``run``, and a
-systemd-unit-file writer for ``install-service``.
+systemd-unit-file and non-root-USB-access-udev-rule writer for
+``install-service`` (ticket 008).
 
 **``mbregistry run`` is also where ticket 009 closes two gaps ticket 008
 left documented, not solved, in ``docs/design/registry-api.md``'s "Known
@@ -54,6 +55,7 @@ invoking user can write, e.g. ``--socket
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import signal
@@ -100,7 +102,9 @@ __all__ = [
     "assemble_relay_pool",
     "assemble_names_api",
     "render_systemd_unit",
+    "render_udev_rule",
     "DEFAULT_UNIT_PATH",
+    "DEFAULT_UDEV_RULE_PATH",
 ]
 
 #: Standard systemd system-unit install location -- ``install-service``'s
@@ -109,6 +113,28 @@ __all__ = [
 #: "installing into a real systemd is not part of this ticket's automated
 #: tests" scoping).
 DEFAULT_UNIT_PATH = Path("/etc/systemd/system/mbregistry.service")
+
+#: Standard ``udev`` rules.d install location -- ``install-service``'s
+#: default target for ticket 008's non-root-USB-access rule, overridable
+#: with ``--udev-output`` (every test uses that override, mirroring
+#: ``DEFAULT_UNIT_PATH``'s own "writing to the real path needs root"
+#: scoping). ``99-`` sorts after every distro-shipped rule so this one's
+#: ``GROUP=``/``MODE=``/``TAG+=`` assignments win if anything else also
+#: matches this VID:PID.
+DEFAULT_UDEV_RULE_PATH = Path("/etc/udev/rules.d/99-mbregistry-cmsis-dap.rules")
+
+#: The micro:bit DAPLink interface's fixed VID:PID (sprint.md SUC-005,
+#: Decision 9; confirmed on the Nolanet nodes -- see CLAUDE.md's hardware
+#: test hosts table and ``docs/acceptance/002-hardware.md``). Shared
+#: between the tty/usb/hidraw match rules in :func:`render_udev_rule` so
+#: they can never drift apart from each other.
+_USB_VENDOR_ID = "0d28"
+_USB_PRODUCT_ID = "0204"
+
+#: The group :func:`render_udev_rule`'s rules grant access via, alongside
+#: ``TAG+="uaccess"`` -- see that function's own docstring for why both
+#: mechanisms are written into the same rule rather than picking just one.
+_UDEV_GROUP = "plugdev"
 
 _DB_ENV_VAR = "MBREGISTRY_DB"
 
@@ -159,6 +185,34 @@ def _resolve_int(flag_value: int | None, env_var: str, default: int) -> int:
     if env_value:
         return int(env_value)
     return default
+
+
+def _resolve_operating_user(flag_value: str | None) -> str:
+    """``--user`` (ticket 008's own escape hatch for :func:`cmd_install_service`)
+    wins if given; else ``$SUDO_USER``; else ``$USER``; else
+    :func:`getpass.getuser`. No env-var-name parameter like the other
+    ``_resolve_*`` helpers here, since this one checks two env vars in a
+    fixed order rather than one.
+
+    ``install-service`` is typically invoked with ``sudo`` (writing
+    ``DEFAULT_UNIT_PATH``/``DEFAULT_UDEV_RULE_PATH`` needs root), so
+    ``getpass.getuser()``/``$USER`` alone would report ``"root"`` --
+    ``$SUDO_USER`` (set by ``sudo`` itself to the *invoking* user) is
+    checked first so the ``usermod -aG plugdev <user>`` line
+    :func:`cmd_install_service` prints names the actual operator, not
+    ``root``, in the common case. Falls through to ``$USER``/
+    :func:`getpass.getuser` for a non-``sudo`` invocation (e.g. a
+    root-shell host, or a test).
+    """
+    if flag_value:
+        return flag_value
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user:
+        return sudo_user
+    user = os.environ.get("USER")
+    if user:
+        return user
+    return getpass.getuser()
 
 
 def _resolve_token(flag_value: str | None, env_var: str) -> str | None:
@@ -763,14 +817,120 @@ def render_systemd_unit(exec_start: str | None = None) -> str:
     return _SYSTEMD_UNIT_TEMPLATE.format(exec_start=exec_start)
 
 
+# ---------------------------------------------------------------------------
+# install-service -- write the non-root-USB-access udev rule (ticket 008)
+# ---------------------------------------------------------------------------
+
+#: Three match rules, one per device node ``mbserial``/pyOCD open for the
+#: micro:bit DAPLink interface (sprint.md SUC-005):
+#:
+#: 1. The CDC-ACM ``tty`` device node -- what ``mbserial`` and pyOCD's own
+#:    serial transport use (matches the legacy
+#:    ``microbit-radio-relay/server/packaging/99-microbit-relay.rules``
+#:    shape: ``SUBSYSTEM=="tty", SUBSYSTEMS=="usb"``).
+#: 2. The raw ``usb`` device node -- what pyOCD's CMSIS-DAP v2 (WinUSB)
+#:    transport opens *directly*, bypassing the tty layer entirely (pyOCD's
+#:    own udev guidance ships a ``SUBSYSTEM=="usb"`` rule for exactly this
+#:    reason -- the tty-only legacy rule above does not cover it).
+#: 3. Any ``hidraw*`` device node -- what pyOCD's CMSIS-DAP v1 (HID)
+#:    transport opens instead, on DAPLink firmware that negotiates HID
+#:    rather than WinUSB (also called out in pyOCD's own udev guidance).
+#:
+#: Covering all three means the same rule works regardless of which
+#: transport a given board's DAPLink firmware happens to negotiate, without
+#: this module needing to know that ahead of time.
+#:
+#: ``GROUP="plugdev"``/``MODE="0660"`` *and* ``TAG+="uaccess"`` are both
+#: written into every rule (not one or the other) -- see
+#: :func:`render_udev_rule`'s own docstring, "Decision: GROUP *and*
+#: TAG+=uaccess, not either alone", for why.
+_UDEV_RULE_TEMPLATE = """\
+# mbregistry -- non-root access to the micro:bit DAPLink interface
+# (VID:PID {vendor_id}:{product_id}). Written by `mbregistry install-service`
+# (ticket 008) -- re-running it overwrites this file with identical
+# content, so re-running install-service is idempotent. See
+# mbtools.registry.cli.render_udev_rule()'s docstring for why each rule
+# below grants access via both the {group} group and uaccess rather than
+# just one of the two.
+
+# CDC-ACM tty device node (mbserial, and pyOCD's DAPLink serial transport)
+SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{{idVendor}}=="{vendor_id}", ATTRS{{idProduct}}=="{product_id}", GROUP="{group}", MODE="0660", TAG+="uaccess"
+
+# Raw USB device node (CMSIS-DAP v2 / WinUSB transport, opened directly by pyOCD)
+SUBSYSTEM=="usb", ATTRS{{idVendor}}=="{vendor_id}", ATTRS{{idProduct}}=="{product_id}", GROUP="{group}", MODE="0660", TAG+="uaccess"
+
+# hidraw device node (CMSIS-DAP v1 / HID transport)
+KERNEL=="hidraw*", ATTRS{{idVendor}}=="{vendor_id}", ATTRS{{idProduct}}=="{product_id}", GROUP="{group}", MODE="0660", TAG+="uaccess"
+"""
+
+
+def render_udev_rule() -> str:
+    """The udev rule text :func:`cmd_install_service` writes to
+    :data:`DEFAULT_UDEV_RULE_PATH` (or ``--udev-output``) to grant the
+    operating (non-root) user access to the micro:bit DAPLink interface
+    (VID:PID ``0d28:0204``) -- sprint.md SUC-005/Decision 9, closing out
+    the issue this ticket completes
+    (``non-root-usb-access-and-pyocd-permission-hang.md``). See
+    :data:`_UDEV_RULE_TEMPLATE`'s own comment for what each of the three
+    match rules (tty/usb/hidraw) covers and why all three are needed.
+
+    **Decision: grant access via both ``GROUP="plugdev"`` and
+    ``TAG+="uaccess"``, not just one of the two** (the ticket's Description
+    frames this as a choice between the two -- this implementation makes
+    both, deliberately, rather than picking one):
+
+    - ``TAG+="uaccess"`` is systemd-logind's ACL mechanism: it grants the
+      user of the *active session on a seat* access the moment the rule is
+      (re-)applied, with no group-membership or relogin step at all. It's
+      the cleaner fit *when it works* -- but it is scoped to a seat's
+      active session, and the four Nolanet nodes this ticket targets
+      (CLAUDE.md's hardware test hosts table) are reached **only over
+      SSH**, with no local console/graphical seat for logind to track.  An
+      SSH session is not reliably assigned a seat, so relying on
+      ``uaccess`` alone risks silently granting nothing at all on exactly
+      the hosts this ticket exists for.
+    - ``GROUP="plugdev"``/``MODE="0660"`` has no seat/session dependency:
+      any process the operating user starts, in any session (including
+      SSH) opened *after* the group membership below takes effect, gets
+      access -- deterministic and reliable on a headless host. The one
+      cost is that a *newly added* group membership needs a fresh login
+      session to take effect in that session (standard Linux behavior for
+      any group-based grant, not specific to this rule) -- documented in
+      :func:`cmd_install_service`'s own printed follow-up instructions.
+
+    Writing both into the same rule costs nothing (they're independent
+    grant mechanisms; a udev rule can assign both) and means access works
+    immediately wherever ``uaccess`` happens to apply (e.g. a future
+    graphical/console login), while still working reliably on the
+    SSH-only hosts this ticket was written for once the printed
+    ``usermod``/relogin step is done.
+    """
+    return _UDEV_RULE_TEMPLATE.format(
+        vendor_id=_USB_VENDOR_ID, product_id=_USB_PRODUCT_ID, group=_UDEV_GROUP
+    )
+
+
 def cmd_install_service(args: argparse.Namespace) -> int:
     """``mbregistry install-service`` -- write the systemd unit file and
-    print (not run) the ``systemctl`` commands the operator needs.
+    the non-root-USB-access udev rule (ticket 008), then print (not run)
+    the ``systemctl``/``udevadm``/``usermod`` commands the operator needs.
     Printing rather than running them is this ticket's implementer
-    choice (its Description explicitly allows either) -- it keeps this
-    command safe to exercise without root or a real systemd, matching
+    choice (its Description explicitly allows either, matching the
+    pre-existing systemd-unit precedent below) -- it keeps this command
+    safe to exercise without root or a real systemd/udev, matching
     sprint.md's Test Strategy ("installing it into a real systemd is out
     of scope for automated tests").
+
+    Both files are written unconditionally on every call, each to its own
+    fixed default path (:data:`DEFAULT_UNIT_PATH`/
+    :data:`DEFAULT_UDEV_RULE_PATH`, each independently overridable via
+    ``--output``/``--udev-output``) with deterministic content -- so
+    re-running this command on a host that already has both installed
+    simply rewrites each file with the same bytes (this ticket's own
+    "idempotent... no duplicate rule file, no service disruption"
+    acceptance criterion): neither write depends on, or touches, whether
+    ``mbregistry.service`` is currently running, and this function never
+    itself starts, stops, or restarts it.
     """
     unit_path = Path(args.output) if args.output else DEFAULT_UNIT_PATH
     unit_text = render_systemd_unit()
@@ -783,9 +943,38 @@ def cmd_install_service(args: argparse.Namespace) -> int:
         return EXIT_ERROR
 
     print(f"mbregistry: wrote {unit_path}", file=sys.stderr)
+
+    udev_path = Path(args.udev_output) if args.udev_output else DEFAULT_UDEV_RULE_PATH
+    udev_text = render_udev_rule()
+
+    try:
+        udev_path.parent.mkdir(parents=True, exist_ok=True)
+        udev_path.write_text(udev_text)
+    except OSError as exc:
+        print(f"mbregistry: could not write {udev_path}: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    print(f"mbregistry: wrote {udev_path}", file=sys.stderr)
+
+    operating_user = _resolve_operating_user(args.user)
+
     print("Run as root to enable and start the service:", file=sys.stderr)
     print("  systemctl daemon-reload", file=sys.stderr)
     print("  systemctl enable --now mbregistry.service", file=sys.stderr)
+    print(
+        "Run as root to activate the udev rule for an already-attached "
+        "device (a fresh plug-in picks it up automatically):",
+        file=sys.stderr,
+    )
+    print("  udevadm control --reload-rules", file=sys.stderr)
+    print("  udevadm trigger", file=sys.stderr)
+    print(
+        f"Run as root to grant {operating_user!r} non-root USB access "
+        "(new login session -- e.g. a new SSH connection -- needed for "
+        "this to take effect):",
+        file=sys.stderr,
+    )
+    print(f"  usermod -aG {_UDEV_GROUP} {operating_user}", file=sys.stderr)
     return EXIT_OK
 
 
@@ -877,11 +1066,26 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.set_defaults(func=cmd_run)
 
     install_p = sub.add_parser(
-        "install-service", help="write the mbregistry systemd unit"
+        "install-service",
+        help="write the mbregistry systemd unit and non-root-USB-access udev rule",
     )
     install_p.add_argument(
         "--output",
         help=f"where to write the unit file (default {DEFAULT_UNIT_PATH})",
+    )
+    install_p.add_argument(
+        "--udev-output",
+        help=(
+            "where to write the udev rule (default "
+            f"{DEFAULT_UDEV_RULE_PATH})"
+        ),
+    )
+    install_p.add_argument(
+        "--user",
+        help=(
+            "operating user named in the printed usermod command "
+            "(default $SUDO_USER, then $USER, then the current user)"
+        ),
     )
     install_p.set_defaults(func=cmd_install_service)
 
