@@ -1,7 +1,7 @@
 ---
 id: '004'
 title: mbrelay, robot-console compatibility, and fleet migration
-status: executing
+status: done
 branch: sprint/004-mbrelay-robot-console-compatibility-and-fleet-migration
 use-cases: []
 issues:
