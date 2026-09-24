@@ -6,6 +6,7 @@ branch: sprint/005-mbregistry-windows-platform-support-and-fleet-migration
 use-cases: []
 issues:
 - mbregistry-windows-platform-support.md
+- relay-in-data-plane-can-be-misidentified-by-reprobe.md
 ---
 <!-- CLASI: Before changing code or making plans, review the SE process in CLAUDE.md -->
 

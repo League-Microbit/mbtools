@@ -395,3 +395,46 @@ def test_resolve_socket_path_default_when_neither_given(monkeypatch):
 
     monkeypatch.delenv(SOCKET_ENV_VAR, raising=False)
     assert resolve_socket_path(None) == Path("/run/mbregistry/api.sock")
+
+
+# ---------------------------------------------------------------------------
+# names_get / names_set / names_clear / names_list (sprint 004, ticket 005)
+# ---------------------------------------------------------------------------
+
+
+def test_names_get_returns_none_for_an_unregistered_name(server):
+    with RegistryClient(server.socket_path) as client:
+        assert client.names_get("tovez") is None
+
+
+def test_names_set_then_get_round_trips(server):
+    with RegistryClient(server.socket_path) as client:
+        set_entry = client.names_set("tovez", 20, 30)
+        assert set_entry["channel"] == 20
+        assert set_entry["group"] == 30
+        assert set_entry["source"] == "registry"
+
+        got = client.names_get("tovez")
+        assert got == set_entry
+
+
+def test_names_clear_drops_the_row(server):
+    with RegistryClient(server.socket_path) as client:
+        client.names_set("tovez", 20, 30)
+        client.names_clear("tovez")
+        assert client.names_get("tovez") is None
+
+
+def test_names_list_includes_every_row(server):
+    with RegistryClient(server.socket_path) as client:
+        client.names_set("tovez", 20, 30)
+        client.names_set("vevov", 40, 50)
+        entries = client.names_list()
+
+    assert {e["name"] for e in entries} == {"tovez", "vevov"}
+
+
+def test_names_set_of_a_malformed_name_raises_invalid_request(server):
+    with RegistryClient(server.socket_path) as client:
+        with pytest.raises(InvalidRequestError):
+            client.names_set("not-a-name", 20, 30)

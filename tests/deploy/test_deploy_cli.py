@@ -90,13 +90,16 @@ class _FakeFlashHex:
         self.log_lines = list(log_lines)
         self.calls: list[dict] = []
 
-    def __call__(self, uid, hex_path, target_mcu=None, log=None, board_name=None):
+    def __call__(
+        self, uid, hex_path, target_mcu=None, log=None, board_name=None, port=None
+    ):
         self.calls.append(
             {
                 "uid": uid,
                 "hex_path": hex_path,
                 "target_mcu": target_mcu,
                 "board_name": board_name,
+                "port": port,
             }
         )
         for line in self.log_lines:

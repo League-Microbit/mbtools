@@ -200,7 +200,8 @@ def socket_dir():
 def make_server(socket_dir, store, locks):
     servers = []
 
-    def _make(*, runner=None, peer_pid_fn=None, is_pid_alive_fn=None, sweep_interval_s=100.0):
+    def _make(*, runner=None, peer_pid_fn=None, is_pid_alive_fn=None, sweep_interval_s=100.0,
+              name_set_callback=None, name_clear_callback=None):
         flash_op = FlashOp(locks=locks, store=store, runner=runner if runner is not None else _SpyRunner())
         srv = RegistryAPIServer(
             socket_path=f"{socket_dir}/api.sock",
@@ -210,6 +211,8 @@ def make_server(socket_dir, store, locks):
             peer_pid_fn=peer_pid_fn,
             is_pid_alive_fn=is_pid_alive_fn,
             sweep_interval_s=sweep_interval_s,
+            name_set_callback=name_set_callback,
+            name_clear_callback=name_clear_callback,
         )
         srv.start()
         servers.append(srv)
@@ -825,3 +828,142 @@ def test_default_peer_pid_raises_on_unsupported_platform(monkeypatch):
             default_peer_pid(dummy)
     finally:
         dummy.close()
+
+
+# ---------------------------------------------------------------------------
+# name-registry ops (sprint 004, ticket 005) -- names_get/set/clear/list
+# ---------------------------------------------------------------------------
+
+
+def test_names_get_returns_none_for_an_unregistered_name(make_server):
+    srv = make_server()
+    client = _Client(srv.socket_path)
+
+    resp = client.request({"op": "names_get", "name": "tovez"})
+
+    assert resp == {"ok": True, "entry": None}
+    client.close()
+
+
+def test_names_set_then_get_round_trips_through_the_store(make_server, store):
+    srv = make_server()
+    client = _Client(srv.socket_path)
+
+    resp = client.request({"op": "names_set", "name": "tovez", "channel": 20, "group": 30})
+    assert resp["ok"] is True
+    assert resp["entry"]["name"] == "tovez"
+    assert resp["entry"]["channel"] == 20
+    assert resp["entry"]["group"] == 30
+    assert resp["entry"]["source"] == "registry"
+
+    resp = client.request({"op": "names_get", "name": "tovez"})
+    assert resp["ok"] is True
+    assert resp["entry"]["channel"] == 20
+    assert resp["entry"]["group"] == 30
+
+    # The write really landed in the Store, not just this connection's
+    # own view of it.
+    row = store.get_name("tovez")
+    assert row is not None
+    assert (row.channel, row.group) == (20, 30)
+    client.close()
+
+
+def test_names_clear_drops_the_row(make_server):
+    srv = make_server()
+    client = _Client(srv.socket_path)
+    client.request({"op": "names_set", "name": "tovez", "channel": 20, "group": 30})
+
+    resp = client.request({"op": "names_clear", "name": "tovez"})
+    assert resp == {"ok": True}
+
+    resp = client.request({"op": "names_get", "name": "tovez"})
+    assert resp == {"ok": True, "entry": None}
+    client.close()
+
+
+def test_names_clear_of_an_unregistered_name_is_not_an_error(make_server):
+    srv = make_server()
+    client = _Client(srv.socket_path)
+
+    resp = client.request({"op": "names_clear", "name": "tovez"})
+
+    assert resp == {"ok": True}
+    client.close()
+
+
+def test_names_list_includes_every_row(make_server):
+    srv = make_server()
+    client = _Client(srv.socket_path)
+    client.request({"op": "names_set", "name": "tovez", "channel": 20, "group": 30})
+    client.request({"op": "names_set", "name": "vevov", "channel": 40, "group": 50})
+
+    resp = client.request({"op": "names_list"})
+
+    assert resp["ok"] is True
+    names = {e["name"] for e in resp["entries"]}
+    assert names == {"tovez", "vevov"}
+    client.close()
+
+
+def test_names_set_rejects_a_malformed_name(make_server):
+    srv = make_server()
+    client = _Client(srv.socket_path)
+
+    resp = client.request({"op": "names_set", "name": "not-a-name", "channel": 20, "group": 30})
+
+    assert resp["ok"] is False
+    assert resp["code"] == CODE_INVALID_REQUEST
+    client.close()
+
+
+def test_names_get_requires_name(make_server):
+    srv = make_server()
+    client = _Client(srv.socket_path)
+
+    resp = client.request({"op": "names_get"})
+
+    assert resp["ok"] is False
+    assert resp["code"] == CODE_INVALID_REQUEST
+    client.close()
+
+
+def test_names_set_fires_the_name_set_callback_after_the_write_commits(make_server, store):
+    calls = []
+    srv = make_server(name_set_callback=calls.append)
+    client = _Client(srv.socket_path)
+
+    client.request({"op": "names_set", "name": "tovez", "channel": 20, "group": 30})
+
+    assert len(calls) == 1
+    assert calls[0].name == "tovez"
+    assert (calls[0].channel, calls[0].group) == (20, 30)
+    # The callback fires with the row already committed, not before.
+    assert store.get_name("tovez") is not None
+    client.close()
+
+
+def test_names_clear_fires_the_name_clear_callback(make_server):
+    calls = []
+    srv = make_server(name_clear_callback=calls.append)
+    client = _Client(srv.socket_path)
+    client.request({"op": "names_set", "name": "tovez", "channel": 20, "group": 30})
+
+    client.request({"op": "names_clear", "name": "tovez"})
+
+    assert calls == ["tovez"]
+    client.close()
+
+
+def test_names_callbacks_default_to_none_and_are_never_required(make_server):
+    """A server built without name_set_callback/name_clear_callback (every
+    pre-ticket-005 construction) still serves names_set/names_clear --
+    the callback is fire-if-present, never a precondition."""
+    srv = make_server()
+    client = _Client(srv.socket_path)
+
+    resp = client.request({"op": "names_set", "name": "tovez", "channel": 20, "group": 30})
+    assert resp["ok"] is True
+    resp = client.request({"op": "names_clear", "name": "tovez"})
+    assert resp["ok"] is True
+    client.close()

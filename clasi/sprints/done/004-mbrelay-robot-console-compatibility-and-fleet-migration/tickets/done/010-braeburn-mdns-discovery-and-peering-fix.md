@@ -1,8 +1,9 @@
 ---
 id: '010'
 title: braeburn mDNS discovery and peering fix
-status: open
-use-cases: [SUC-006]
+status: done
+use-cases:
+- SUC-006
 depends-on: []
 github-issue: ''
 issue: macos-registry-mdns-discovery-and-outbound-peering-fail-on-braeburn.md
@@ -63,21 +64,39 @@ existing workaround note (if any) is confirmed still accurate.
 
 ## Acceptance Criteria
 
-- [ ] Each of the three candidate causes is checked and the finding
+- [x] Each of the three candidate causes is checked and the finding
       (confirmed cause, ruled out, or inconclusive) is recorded in
-      `docs/acceptance/004-hardware.md`.
+      `docs/acceptance/004-hardware.md`. (Candidate 1 ruled out, candidate
+      2 ruled out, candidate 3 confirmed as a real, independent defect and
+      fixed; a fourth, better-evidenced failure mode -- mDNS responsiveness
+      degrading over uptime, not a static condition -- was found and
+      documented as open.)
 - [ ] If a cause is confirmed and fixed: `mbregistry list` on a Linux
       node shows `braeburn`'s devices with no `--peer` flag, verified on
-      real hardware in ticket 011.
-- [ ] If not resolved: the `--peer braeburn:7440` workaround is
+      real hardware in ticket 011. (Not checked here: no single candidate
+      was confirmed as *the* root cause of the original symptom -- see the
+      "New finding" in `docs/acceptance/004-hardware.md`. That doc does
+      record a real-hardware snapshot of this working, unprompted, right
+      after a fresh restart -- supporting evidence, not a resolution
+      claim; ticket 011 should re-check after several hours of uptime.)
+- [x] If not resolved: the `--peer braeburn:7440` workaround is
       re-confirmed working on real hardware, and the residual issue is
-      explicitly flagged (not silently dropped) for follow-up.
-- [ ] No regression to Linux-to-Linux peering (already-working
+      explicitly flagged (not silently dropped) for follow-up. (See
+      `docs/acceptance/004-hardware.md`'s "Residual issue for follow-up"
+      section; the workaround's own code path is unchanged by this
+      ticket's fix.)
+- [x] No regression to Linux-to-Linux peering (already-working
       mDNS/ZMQ peering between the four Nolanet nodes is unaffected).
-- [ ] Any new diagnostic logging added is useful on its own even if the
+      (`tests/registry/peering/` -- 62 tests, run repeatedly, all passing;
+      full suite `uv run pytest -q` -- 775 passed, 2 skipped; `loki`'s own
+      live `mbregistry.service` continued showing `meili`/`magni`/`hodr`
+      correctly throughout this session's real-hardware testing.)
+- [x] Any new diagnostic logging added is useful on its own even if the
       root cause isn't found this sprint (e.g. clearly logs which
       interface/address was bound, or whether a permission prompt was
-      detected).
+      detected). (`PeerDiscovery.start()`'s new advertise-address/port
+      `INFO` log, and the new self-check thread's `WARNING` on a stale
+      mDNS responder -- see `src/mbtools/registry/peering.py`.)
 
 ## Testing
 

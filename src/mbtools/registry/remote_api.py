@@ -166,7 +166,7 @@ from uuid import uuid4
 from mbtools.common import CODE_INVALID_REQUEST, CODE_NOT_LOCKED, CODE_UNAUTHORIZED
 from mbtools.registry._api_base import BaseAPIServer, _error
 from mbtools.registry.flashlogic import flash_hex
-from mbtools.registry.locks import KIND_FLASH, KIND_SERIAL, HolderRef, LockManager
+from mbtools.registry.locks import KIND_FLASH, KIND_RELAY, KIND_SERIAL, HolderRef, LockManager
 from mbtools.registry.store import DeviceRecord, Store
 from mbtools.registry.stream_frame import (
     FRAME_BREAK,
@@ -608,14 +608,35 @@ class RemoteAPIServer(BaseAPIServer):
     ) -> tuple[dict[str, Any], DeviceRecord | None]:
         """``stream(uid)`` (ticket 007): the JSON-op half only -- resolve
         ``uid``, confirm *this connection's own* ``HolderRef`` already
-        holds a ``serial``-kind lock on it (the same "this connection's
-        own holder, not merely some holder" check
+        holds a ``serial``- or ``relay``-kind lock on it (the same "this
+        connection's own holder, not merely some holder" check
         ``api.RegistryAPIServer._op_flash`` makes for its own
         ``flash``-kind precondition), and confirm the device has a known
         port to open. Returns ``(resp, record)`` -- ``record`` is
         ``None`` on any failure, or the resolved
         :class:`~mbtools.registry.store.DeviceRecord` on success, for
         :meth:`_handle_connection` to hand to :meth:`_handle_stream`.
+
+        ``relay``-kind was added by ticket 011's real-hardware pass: this
+        precheck originally only accepted ``KIND_SERIAL`` (ticket 007,
+        written for ``mbserial``'s own remote passthrough), and sprint
+        004's ``relay.channel.RemoteRelayChannel`` (ticket 004) was built
+        to call this same ``stream`` op after locking the device
+        ``relay``-kind -- but every test on both sides used a fake peer
+        (``tests/relay/test_cli.py``'s ``FakeRemoteRegistryClient`` never
+        exercises this real precheck), so the mismatch only surfaced as
+        an uncaught ``RegistryClientError`` ("stream requires a
+        serial-kind lock...") the first time ``mbrelay connect
+        <robot>@<host>`` was run against a real, different-host relay.
+        The raw byte-stream op itself (:meth:`_handle_stream`) has no
+        serial-specific behavior -- BREAK/DTR/RTS frames are meaningful
+        for a relay channel too (``RemoteRelayChannel`` uses exactly the
+        same ``RemoteStream.send_break()``/``set_dtr()``/``set_rts()``
+        primitives ``mbserial`` does, architecture Decision 4) -- so
+        widening the accepted kind set is the correct fix, not a
+        workaround; ``flash``/``debug``-kind locks are deliberately still
+        excluded, since neither of those has any legitimate reason to
+        open a raw byte stream.
 
         Held under ``self._lock`` for exactly this bookkeeping, same as
         every other op above -- opening the port itself happens later,
@@ -632,12 +653,16 @@ class RemoteAPIServer(BaseAPIServer):
                 return err, None
             assert record is not None
             status = self._locks.status(record.uid)
-            if status is None or status.kind != KIND_SERIAL or status.holder != holder:
+            if (
+                status is None
+                or status.kind not in (KIND_SERIAL, KIND_RELAY)
+                or status.holder != holder
+            ):
                 return (
                     _error(
                         CODE_NOT_LOCKED,
-                        f"{record.uid}: stream requires a serial-kind lock held "
-                        "by this connection (call 'lock' first)",
+                        f"{record.uid}: stream requires a serial- or relay-kind "
+                        "lock held by this connection (call 'lock' first)",
                     ),
                     None,
                 )
@@ -740,6 +765,13 @@ class RemoteAPIServer(BaseAPIServer):
         step, so no separate client-facing ``mark_flashed`` call is
         needed on this path. The staged hex temp file is always removed
         afterwards, regardless of outcome.
+
+        ``record.port`` (already resolved above, under the lock) is
+        passed through as ``flash_hex``'s own ``port`` -- ticket 009's
+        permission pre-check runs here, server-side, against the actual
+        device this daemon owns, exactly like the local socket's flash
+        path runs it against the client's own already-resolved
+        ``device["port"]`` (``deploy.cli._flash``).
         """
 
         def _flash_error(code: str, message: str, **extra: Any) -> dict[str, Any]:
@@ -797,7 +829,9 @@ class RemoteAPIServer(BaseAPIServer):
         # pyocd invocation.
         board_name = record.device_name or uid
         try:
-            rc = flash_hex(uid, hex_path, log=log, board_name=board_name)
+            rc = flash_hex(
+                uid, hex_path, log=log, board_name=board_name, port=record.port
+            )
             success = rc == 0
             exit_code: int | None = rc
             error: str | None = None if success else f"pyocd flash failed (exit {rc})"

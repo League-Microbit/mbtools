@@ -29,6 +29,8 @@ from mbtools.registry import peering as peering_mod
 from mbtools.registry.locks import KIND_FLASH
 from mbtools.registry.peering import PeerDiscovery
 from mbtools.registry.store import (
+    SOURCE_DERIVED,
+    SOURCE_REGISTRY,
     STATE_ATTACHED_UNPROBED,
     STATE_CONNECTED,
     STATE_CONNECTED_NO_FIRMWARE,
@@ -38,6 +40,13 @@ from mbtools.registry.store import (
 
 UID = "9900" + "0000" + "11112222" + "3333444455556666" + "77778888" + "6e052820"
 UID2 = "9900" + "0000" + "11112222" + "aaaabbbbccccdddd" + "77778888" + "6e052820"
+
+# Two well-formed names (CVCVC over zvgpt/uoiea, see
+# mbtools.relay.naming/tests/registry/store/test_store_name_registry.py's
+# own picks) whose derived (channel, group) pairs are distinct from each
+# other -- used by the name-registry replication tests below.
+NAME_A = "zuzuz"
+NAME_B = "tatat"
 
 
 @pytest.fixture
@@ -283,6 +292,90 @@ def test_snapshot_payload_round_trips_through_apply(store):
 
 
 # ---------------------------------------------------------------------------
+# ticket 002 (sprint 004): name_registry replication -- pure application
+# logic, no socket at all (mirrors the device-row tests above).
+# ---------------------------------------------------------------------------
+
+
+def test_apply_event_name_set_creates_entry(store):
+    peering_mod._apply_event(
+        store, "alpha", {"type": "name_set", "name": NAME_A, "channel": 20, "group": 100}
+    )
+
+    entry = store.get_name(NAME_A)
+    assert entry is not None
+    assert entry.channel == 20
+    assert entry.group == 100
+    # Applying always lands as SOURCE_REGISTRY on the receiving side,
+    # regardless of the origin row's own source -- see peering.py's
+    # module docstring "Name registry replication" note.
+    assert entry.source == SOURCE_REGISTRY
+
+
+def test_apply_event_name_set_overwrites_existing_entry(store):
+    store.set(NAME_A, 20, 100)
+
+    peering_mod._apply_event(
+        store, "alpha", {"type": "name_set", "name": NAME_A, "channel": 30, "group": 200}
+    )
+
+    entry = store.get_name(NAME_A)
+    assert (entry.channel, entry.group) == (30, 200)
+
+
+def test_apply_event_name_clear_removes_entry(store):
+    store.set(NAME_A, 20, 100)
+
+    peering_mod._apply_event(store, "alpha", {"type": "name_clear", "name": NAME_A})
+
+    assert store.get_name(NAME_A) is None
+
+
+def test_apply_event_name_clear_of_absent_entry_is_a_no_op(store):
+    peering_mod._apply_event(store, "alpha", {"type": "name_clear", "name": NAME_A})
+
+    assert store.get_name(NAME_A) is None
+
+
+def test_apply_event_name_set_malformed_is_dropped_not_raised(store):
+    # Missing "channel"/"group" -- logged and dropped, never raised, same
+    # "a single malformed event must not crash the receive loop" policy
+    # _apply_event already applies to device events (see
+    # test_apply_event_for_unknown_uid_is_dropped_not_raised above).
+    peering_mod._apply_event(store, "alpha", {"type": "name_set", "name": NAME_A})
+    peering_mod._apply_event(store, "alpha", {"type": "name_clear"})
+
+    assert store.get_name(NAME_A) is None
+
+
+def test_apply_snapshot_name_applies_entry(store):
+    peering_mod._apply_snapshot_name(
+        store, {"name": NAME_A, "channel": 20, "group": 100, "source": SOURCE_DERIVED, "updated": 1.0}
+    )
+
+    entry = store.get_name(NAME_A)
+    assert entry is not None
+    assert (entry.channel, entry.group) == (20, 100)
+
+
+def test_snapshot_name_payload_round_trips_through_apply(store):
+    store.set(NAME_A, 20, 100)
+    store.resolve(NAME_B)  # source=derived
+
+    payload = peering_mod._snapshot_name_payload(store)
+    assert {row["name"] for row in payload} == {NAME_A, NAME_B}
+
+    other_store = Store(store.db_path.parent / "other_names.db")
+    for row in payload:
+        peering_mod._apply_snapshot_name(other_store, row)
+
+    assert (other_store.get_name(NAME_A).channel, other_store.get_name(NAME_A).group) == (20, 100)
+    original_b = store.get_name(NAME_B)
+    replicated_b = other_store.get_name(NAME_B)
+    assert (replicated_b.channel, replicated_b.group) == (original_b.channel, original_b.group)
+
+
+# ---------------------------------------------------------------------------
 # real loopback sockets -- snapshot-then-stream convergence
 # ---------------------------------------------------------------------------
 
@@ -470,6 +563,129 @@ def test_peer_vanish_marks_unreachable_and_reconnect_marks_reachable_again(store
 
 
 # ---------------------------------------------------------------------------
+# ticket 002 (sprint 004): name_registry replication -- real loopback
+# sockets, mirroring this module's existing device-row integration tests
+# above (snapshot-then-stream convergence, peer vanish).
+# ---------------------------------------------------------------------------
+
+
+def test_name_registry_set_and_clear_propagate_over_event_bus(store, tmp_path):
+    """Acceptance: a ``name_registry`` ``set`` on host A publishes onto
+    the PUB bus and is visible in host B's ``Store`` within one
+    event-bus tick, with no polling on B's side -- and a ``clear``
+    likewise propagates.
+    """
+    store_b = Store(tmp_path / "beta_names_setclear.db")
+
+    peering_a = _make_peering(store, host="alpha", pub_port=17682, snapshot_port=17683)
+    peering_b = _make_peering(store_b, host="beta", pub_port=17692, snapshot_port=17693)
+
+    try:
+        peering_a.start()
+        peering_b.start()
+        store_b.record_peer_seen("alpha", f"127.0.0.1:{_remote_port(17682)}")
+        peering_b.connect_peer("alpha", "127.0.0.1", 17682, 17683)
+        assert _wait_until(lambda: store_b.get_peer("alpha").reachable is True)
+
+        entry = store.set(NAME_A, 20, 100)
+        peering_a.publish_name_set(entry)
+
+        assert _wait_until(lambda: store_b.get_name(NAME_A) is not None)
+        replicated = store_b.get_name(NAME_A)
+        assert (replicated.channel, replicated.group) == (20, 100)
+
+        store.clear(NAME_A)
+        peering_a.publish_name_clear(NAME_A)
+
+        assert _wait_until(lambda: store_b.get_name(NAME_A) is None)
+    finally:
+        peering_a.stop()
+        peering_b.stop()
+        store.close()
+        store_b.close()
+
+
+def test_name_registry_snapshot_catches_up_late_joining_peer(store, tmp_path):
+    """Acceptance: a peer joining after entries already exist receives the
+    current ``name_registry`` rows via the existing snapshot exchange --
+    no separate name-registry-specific snapshot call.
+    """
+    store.set(NAME_A, 20, 100)
+    store.resolve(NAME_B)
+
+    store_b = Store(tmp_path / "beta_names_snapshot.db")
+    peering_a = _make_peering(store, host="alpha", pub_port=17702, snapshot_port=17703)
+    peering_b = _make_peering(store_b, host="beta", pub_port=17712, snapshot_port=17713)
+
+    try:
+        peering_a.start()
+        peering_b.start()
+        store_b.record_peer_seen("alpha", f"127.0.0.1:{_remote_port(17702)}")
+        peering_b.connect_peer("alpha", "127.0.0.1", 17702, 17703)
+
+        assert _wait_until(lambda: store_b.get_name(NAME_A) is not None)
+        assert _wait_until(lambda: store_b.get_name(NAME_B) is not None)
+        assert (store_b.get_name(NAME_A).channel, store_b.get_name(NAME_A).group) == (20, 100)
+        original_b = store.get_name(NAME_B)
+        replicated_b = store_b.get_name(NAME_B)
+        assert (replicated_b.channel, replicated_b.group) == (original_b.channel, original_b.group)
+    finally:
+        peering_a.stop()
+        peering_b.stop()
+        store.close()
+        store_b.close()
+
+
+def test_name_registry_survives_peer_link_drop(store, tmp_path):
+    """Acceptance: a peer-link drop degrades name-registry replication the
+    same way it already degrades device-state replication (sets
+    ``peer.reachable = false``; existing rows are not deleted or
+    reverted).
+    """
+    store.set(NAME_A, 20, 100)
+    store_b = Store(tmp_path / "beta_names_vanish.db")
+
+    peering_a = _make_peering(store, host="alpha", pub_port=17722, snapshot_port=17723)
+    peering_b = _make_peering(store_b, host="beta", pub_port=17732, snapshot_port=17733)
+    try:
+        peering_a.start()
+        peering_b.start()
+        store_b.record_peer_seen("alpha", f"127.0.0.1:{_remote_port(17722)}")
+        peering_b.connect_peer("alpha", "127.0.0.1", 17722, 17723)
+
+        assert _wait_until(lambda: store_b.get_name(NAME_A) is not None)
+
+        peering_a.stop()
+        assert _wait_until(lambda: store_b.get_peer("alpha").reachable is False, timeout=10.0)
+
+        # The replicated name row must survive the vanish untouched --
+        # only peer.reachable flips, per Decision 5.
+        replicated = store_b.get_name(NAME_A)
+        assert replicated is not None
+        assert (replicated.channel, replicated.group) == (20, 100)
+    finally:
+        peering_b.stop()
+        store.close()
+        store_b.close()
+
+
+def test_two_peers_independently_deriving_same_unseen_name_converge(store, tmp_path):
+    """Acceptance: two peers independently deriving the same unseen name
+    (e.g. two simultaneous ``resolve()`` calls before either has heard
+    from the other) converge on the same value with no conflict/error
+    surfaced. No live peering link is even needed for this to hold --
+    ``naming.name_to_radio`` is a pure deterministic function of
+    ``name``, per sprint.md Decision 2/this ticket's own Approach.
+    """
+    store_b = Store(tmp_path / "beta_names_derive.db")
+
+    entry_a = store.resolve(NAME_A)
+    entry_b = store_b.resolve(NAME_A)
+
+    assert (entry_a.channel, entry_a.group) == (entry_b.channel, entry_b.group)
+
+
+# ---------------------------------------------------------------------------
 # ticket 009: connect_peer(remote_port=...) records the peer before
 # connecting -- the fix for the pitfall ticket 005 left open (calling
 # connect_peer alone, with no preceding record_peer_seen, connects and
@@ -553,6 +769,126 @@ def test_connect_peer_without_remote_port_reproduces_ticket_005_behavior(store, 
         peering_a.stop()
         peering_b.stop()
         store.close()
+        store_b.close()
+
+
+# ---------------------------------------------------------------------------
+# ticket 010: connect_peer/_PeerLink.start() never block their caller
+# (Decision 10's candidate 3 -- found while investigating braeburn's
+# mDNS/peering asymmetry, docs/acceptance/004-hardware.md). connect_peer
+# is, for the real mDNS path, invoked synchronously from python-zeroconf's
+# own ServiceBrowser callback-dispatch thread -- it must never stall that
+# thread for the snapshot REQ/REP round trip's full timeout.
+# ---------------------------------------------------------------------------
+
+
+def test_connect_peer_returns_immediately_against_unreachable_peer(store, tmp_path):
+    """The regression this fix targets: before ticket 010, connect_peer()
+    called _PeerLink.start() inline, which did the (blocking) snapshot
+    REQ/REP round trip before returning -- up to the full
+    ``_DEFAULT_SNAPSHOT_TIMEOUT_MS`` (5s) for a peer with nothing
+    listening on its snapshot port, exactly this test's setup. connect_peer
+    must now return in well under that -- the snapshot fetch and its
+    eventual timeout happen on _PeerLink's own thread instead.
+    """
+    peering_b = _make_peering(store, host="beta", pub_port=17652, snapshot_port=17653)
+
+    try:
+        peering_b.start()
+
+        started = time.monotonic()
+        # 17654/17655: real, bound-but-unused loopback ports -- nothing
+        # answers the SUB connect or the snapshot REQ, so the snapshot
+        # fetch this triggers is guaranteed to run the full
+        # snapshot_timeout_ms before giving up.
+        peering_b.connect_peer("ghost", "127.0.0.1", 17654, 17655)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 1.0, (
+            f"connect_peer() blocked its caller for {elapsed:.2f}s -- "
+            "the snapshot fetch must run on its own thread, not inline"
+        )
+    finally:
+        peering_b.stop()
+        store.close()
+
+
+def test_peer_link_stop_joins_in_flight_snapshot_thread(store, tmp_path):
+    """PeerDiscovery.stop() (via each _PeerLink.stop()) must still wait
+    for an in-flight snapshot fetch's own thread before returning --
+    ticket 010's async dispatch must not turn into "fire and forget":
+    every thread this module starts is still stoppable and joined, same
+    as every other background thread here.
+    """
+    peering_b = _make_peering(store, host="beta", pub_port=17662, snapshot_port=17663)
+
+    try:
+        peering_b.start()
+        peering_b.connect_peer("ghost", "127.0.0.1", 17664, 17665)
+
+        with peering_b._peer_links_lock:
+            link = peering_b._peer_links["ghost"]
+        assert link._snapshot_thread is not None
+
+        peering_b.stop()
+
+        assert link._snapshot_thread is None
+        # stop() joined it rather than abandoning it mid-fetch.
+        assert not (link._recv_thread and link._recv_thread.is_alive())
+    finally:
+        store.close()
+
+
+def test_snapshot_success_after_link_dropped_does_not_resurrect_reachable(store, tmp_path):
+    """The actual race ticket 010's async-dispatch fix (above) opened, and
+    the fix for it: moving the snapshot fetch off the caller's thread
+    means it and the SUB socket's own disconnect detection are now two
+    independent signals about the same link, with no ordering guarantee
+    between them. Found empirically (not guessed) while investigating
+    braeburn: a real timing-based repro of the original bug showed a
+    peer that dropped its link within the snapshot fetch's own window
+    ended up permanently stuck ``reachable=True`` even though
+    ``EVENT_DISCONNECTED`` had already fired correctly -- a late,
+    genuinely-successful snapshot reply overwrote it back. Reproduced
+    here deterministically (``_link_dropped`` set by hand, not by racing
+    real threads) rather than depending on that timing to land in CI.
+    """
+    peering_a = _make_peering(store, host="alpha", pub_port=17672, snapshot_port=17673)
+    store_b = Store(tmp_path / "beta.db")
+
+    peering_b = _make_peering(store_b, host="beta", pub_port=17682, snapshot_port=17683)
+    reachable_calls: list[str] = []
+
+    try:
+        peering_a.start()
+        peering_b.start()
+        store_b.record_peer_seen("alpha", "127.0.0.1:18672")
+
+        link = peering_mod._PeerLink(
+            host="alpha",
+            store=store_b,
+            zmq_module=peering_mod._real_zmq,
+            context=peering_b._zmq_ctx,
+            pub_address="tcp://127.0.0.1:17672",
+            snapshot_address="tcp://127.0.0.1:17673",
+            on_unreachable=None,
+            on_reachable=lambda host: reachable_calls.append(host),
+        )
+        # This is the race's own ordering, forced rather than awaited:
+        # the link is declared dropped *before* its (still in-flight, in
+        # the real race) snapshot fetch resolves -- alpha is genuinely up
+        # here, so _fetch_snapshot() below succeeds on the wire exactly
+        # like the late-arriving reply in the real race did.
+        link._link_dropped.set()
+        link._fetch_snapshot()
+
+        assert reachable_calls == [], (
+            "on_reachable fired for a link already observed dropped -- "
+            "the exact resurrection bug this guard exists to prevent"
+        )
+    finally:
+        peering_a.stop()
+        peering_b.stop()
         store_b.close()
 
 

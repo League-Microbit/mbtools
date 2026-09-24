@@ -57,7 +57,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict
-from typing import Any
+from typing import Any, Callable
 
 from mbtools.common import (
     CODE_AMBIGUOUS_NAME,
@@ -74,9 +74,26 @@ from mbtools.registry.locks import (
     LockManager,
     LockStatus,
 )
-from mbtools.registry.store import AmbiguousNameError, DeviceRecord, Store
+from mbtools.registry.store import AmbiguousNameError, DeviceRecord, Entry, Store
 
 __all__ = ["BaseAPIServer"]
+
+
+def _entry_dict(entry: Entry) -> dict[str, Any]:
+    """Wire-shape one ``name_registry`` :class:`~mbtools.registry.store.Entry`
+    for a ``names_get``/``names_set``/``names_list`` response -- every
+    dataclass field, ``conflict``/``channel_conflict`` as plain lists
+    (JSON has no tuple type).
+    """
+    return {
+        "name": entry.name,
+        "channel": entry.channel,
+        "group": entry.group,
+        "source": entry.source,
+        "updated": entry.updated,
+        "conflict": list(entry.conflict),
+        "channel_conflict": list(entry.channel_conflict),
+    }
 
 
 def _error(code: str, message: str, **extra: Any) -> dict[str, Any]:
@@ -125,6 +142,18 @@ class BaseAPIServer:
     _locks: LockManager
     # A threading.RLock, typed loosely here (this mixin never annotates
     # it directly — every op below just does ``with self._lock:``).
+
+    #: Fired (outside ``self._lock``, after a successful write) by
+    #: ``_op_names_set``/``_op_names_clear`` -- sprint 004 ticket 005's
+    #: replication wiring. ``None`` by default (every pre-ticket-005
+    #: subclass, and any subclass that never opts in, is unaffected); a
+    #: concrete subclass that wants ``name_registry`` writes replicated
+    #: sets these per-instance in its own ``__init__`` (see
+    #: ``api.RegistryAPIServer``'s own docstring for why this mirrors
+    #: ``Daemon``/``LockManager`` owning their own callbacks rather than
+    #: ``Store`` owning one itself).
+    _name_set_callback: "Callable[[Entry], None] | None" = None
+    _name_clear_callback: "Callable[[str], None] | None" = None
 
     # -- hooks a concrete subclass provides -------------------------------
 
@@ -300,3 +329,90 @@ class BaseAPIServer:
                 )
             self._store.increment_flash_count(uid)
             return {"ok": True}
+
+    # -- name-registry ops (sprint 004, ticket 005) -----------------------
+    #
+    # ``name_registry`` rows are not device rows -- no uid, no lock, no
+    # per-connection visibility scope (every peer converges on the same
+    # fleet-wide table, ticket 002/SUC-004) -- so these four skip
+    # ``_resolve_visible`` entirely, unlike every op above. Not wired into
+    # ``remote_api.RemoteAPIServer``'s dispatch by this ticket: the one
+    # caller that exists so far (``mbrelay``'s CLI, ticket 005) always
+    # resolves a name against its own *local* registry connection -- the
+    # replicated copy ticket 002 already keeps converged -- never a peer's
+    # ``remote_api``, so there is no caller yet to justify that surface.
+    # A future ticket adding one extends ``BaseAPIServer`` (these four
+    # methods) into ``remote_api.py``'s own dispatch, not a re-port.
+
+    def _op_names_get(self, req: dict[str, Any]) -> dict[str, Any]:
+        """``names_get(name)``: the non-creating lookup
+        (:meth:`~mbtools.registry.store.Store.get_name`) -- ``entry`` is
+        ``null`` (not an error) when ``name`` has no row yet, so a caller
+        that wants "is this name registered at all" (``mbrelay connect``'s
+        own distinct-error requirement, SUC-001) can tell that apart from
+        a real protocol failure.
+        """
+        name = req.get("name")
+        if not name:
+            return _error(CODE_INVALID_REQUEST, "'names_get' requires 'name'")
+        with self._lock:
+            try:
+                entry = self._store.get_name(str(name))
+            except ValueError as exc:
+                return _error(CODE_INVALID_REQUEST, str(exc))
+            return {"ok": True, "entry": _entry_dict(entry) if entry is not None else None}
+
+    def _op_names_set(self, req: dict[str, Any]) -> dict[str, Any]:
+        """``names_set(name, channel, group)``: explicit assignment
+        (:meth:`~mbtools.registry.store.Store.set`), then -- once the
+        local write has committed -- :attr:`_name_set_callback`, if this
+        server was given one, publishes it for replication (ticket 002's
+        ``PeerDiscovery.publish_name_set``, wired by ``registry.cli``'s
+        assembly). Fired outside ``self._lock`` (mirrors ``_op_flash``'s
+        own "the shared lock only guards the short bookkeeping" note) --
+        a ZMQ publish is not sqlite bookkeeping and must not hold up
+        every other connection's ``list``/``lock``/... while it runs.
+        """
+        name = req.get("name")
+        channel = req.get("channel")
+        group = req.get("group")
+        if not name or channel is None or group is None:
+            return _error(
+                CODE_INVALID_REQUEST, "'names_set' requires 'name', 'channel', 'group'"
+            )
+        with self._lock:
+            try:
+                entry = self._store.set(str(name), int(channel), int(group))
+            except (ValueError, TypeError) as exc:
+                return _error(CODE_INVALID_REQUEST, str(exc))
+        if self._name_set_callback is not None:
+            self._name_set_callback(entry)
+        return {"ok": True, "entry": _entry_dict(entry)}
+
+    def _op_names_clear(self, req: dict[str, Any]) -> dict[str, Any]:
+        """``names_clear(name)``: drop the row
+        (:meth:`~mbtools.registry.store.Store.clear`), then publish the
+        clear for replication the same way :meth:`_op_names_set` does --
+        see that method's own docstring.
+        """
+        name = req.get("name")
+        if not name:
+            return _error(CODE_INVALID_REQUEST, "'names_clear' requires 'name'")
+        with self._lock:
+            try:
+                self._store.clear(str(name))
+            except ValueError as exc:
+                return _error(CODE_INVALID_REQUEST, str(exc))
+        if self._name_clear_callback is not None:
+            self._name_clear_callback(str(name))
+        return {"ok": True}
+
+    def _op_names_list(self, req: dict[str, Any]) -> dict[str, Any]:
+        """``names_list()``: every row
+        (:meth:`~mbtools.registry.store.Store.listing`), each annotated
+        with its own ``conflict``/``channel_conflict`` names -- for
+        ``mbrelay names list``'s operator-facing view.
+        """
+        with self._lock:
+            entries = self._store.listing()
+        return {"ok": True, "entries": [_entry_dict(e) for e in entries]}

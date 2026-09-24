@@ -248,38 +248,83 @@ service.
 
 Rebuilt as a client that does **only** the relay protocol. It never
 finds, enumerates, probes or lists devices itself — that is entirely the
-registry's job.
+registry's job (`relay.cli`'s own list()-through-the-registry-client
+resolution, never a raw serial/socket scan).
 
 ### 6.1 Picking a relay
-- `mbrelay connect [robot[@host]]` chooses a free relay (by name, or any
-  free one) through the registry and locks it — asking the registry which
-  attached micro:bits are relays (role contains `RELAY` or `BRIDGE`).
+- `mbrelay connect <robot>[@<host>]` names a **robot** (a name-registry
+  name), not a relay device directly. It resolves a free relay (by
+  scanning the local registry's own `list` op for a device whose `role`
+  contains `RELAY`/`BRIDGE` and is unlocked — a local one preferred when
+  `@host` isn't given), optionally scoped to `@host`, and locks it
+  (kind `relay`).
+- `mbrelay names get/set/clear/list <name> [channel] [group]` operates on
+  the name registry directly (through the registry daemon's own
+  `names_get`/`names_set`/`names_clear`/`names_list` ops — the CLI never
+  opens `devices.db` itself), for operator use without going through
+  robot-console's HTTP compatibility endpoint (§6.6).
 
 ### 6.2 Reset and normalize
-On acquire and on release: BREAK/reset, `HELLO`, `!VER?`, then RAW250 /
-frag off / echo off / P7 / ch0 grp10, verified with `?`, then `!DEFAULTS`
-on release. Port this from
-`microbit-radio-relay/server/src/mbrelay/relay.py`.
+On acquire: `HELLO`, `!VER?`, then RAW250 / frag off / echo off / P7 /
+ch0 grp10, verified with `?` — `relay.protocol.RelayControl`'s
+`hello`/`firmware_version`/`normalize`, called directly (not its
+`reset_and_normalize` convenience wrapper, which unconditionally closes
+the channel again — fine for a locally-attached relay, but would drop a
+remote relay's registry lock along with the connection it closes; see
+`relay.cli`'s own module docstring). On release: `!DEFAULTS`
+(`clear_stored_config`) only — the *next* acquire's `normalize()` already
+forces the board back to defaults unconditionally, so release doesn't
+need to repeat that work.
 
 ### 6.3 Tuning to a robot
-`!CG` from the name registry, `!GO`, then an optional `PING`.
+`!CG` from the name registry (a **non-creating** lookup — an
+unregistered robot name is reported as a distinct error, not silently
+derived, unlike robot-console's own `/names` endpoint), `!GO`, then an
+optional `PING` (skip with `--no-probe`).
 
 ### 6.4 Scripting and terminal
-`--send` / `--expect` scripting and the interactive terminal, as in
-today's `mbrelay connect`.
+`--send LINE` (repeatable) / `--expect REGEX` scripting, or — with
+neither given — a raw-mode interactive terminal (`--escape`, default
+Ctrl-`]`), as in today's `mbrelay connect`.
 
 ### 6.5 Name registry
-Robot name → (channel, group) mapping, with conflict reporting. Needs a
-home under the one-daemon rule — probably a table in the registry
-database, replicated to peers. See
+Robot name → (channel, group) mapping, with conflict reporting, in the
+registry's `name_registry` table (`registry.store`, sprint 004 ticket
+001), replicated to peers over the existing ZMQ event bus (ticket 002).
+`mbrelay`'s own writes (`names set`/`names clear`, and `connect`'s own
+lookup) go through the registry daemon's local API — new
+`names_get`/`names_set`/`names_clear`/`names_list` ops on
+`registry._api_base.BaseAPIServer`/`registry.api.RegistryAPIServer` — so
+the daemon (which already owns both the `Store` and the `PeerDiscovery`
+publisher) is what fires `publish_name_set`/`publish_name_clear` right
+after its own write, the same "the component that owns the write fires
+the callback" shape `LockManager`/`Daemon` already use for lock/attach
+events. See
 [Open decisions §6](#6-where-does-the-relay-pool-live-and-what-about-robot-console).
 
 ### 6.6 robot-console compatibility
 robot-console relies on the `_mbrelay._tcp` pool port with
-reset-by-reconnect, TXT `registry=`, and `GET /names/<name>`. Decide
-between a compatibility endpoint hosted by the registry, migrating
-robot-console, or a transition period. See the full contract in
-[robot-console compatibility contract](#8-robot-console-compatibility-contract)
+reset-by-reconnect, TXT `registry=`, and `GET /names/<name>`. Resolved
+(sprint 004 Decision 1, see
+[Open decisions §6](#6-where-does-the-relay-pool-live-and-what-about-robot-console-resolved-sprint-004)):
+hosted inside `mbregistry` as `registry.console_compat.relay_pool.
+RelayPool` (the pool port, ticket 006) and `registry.console_compat.
+names_api.NamesAPI` (ticket 007) — `GET/PUT/DELETE /names/<name>` on
+`RelayPool.DEFAULT_NAMES_API_PORT` (`7445`, the same port `RelayPool`
+advertises in its TXT `registry=` key). `GET` is robot-console's own
+call (write-on-read: derives and persists a `source: "derived"` entry
+on first ask, per `mbrelayRegistry.ts`'s own documented expectation);
+`PUT`/`DELETE` exist for parity with legacy `mbrelay`'s own HTTP
+contract, for admin/tooling use — `mbrelay names set`/`names clear`
+themselves go through the registry daemon's local Unix-socket API
+instead (§6.5), not this HTTP listener. Every write (a `PUT`, a
+`DELETE`, or a `GET`'s own derive-on-miss) replicates via
+`PeerDiscovery.publish_name_set`/`publish_name_clear`, the same two
+callables ticket 005's local-socket ops already use. Neither listener
+checks `--auth-token` — robot-console has no mechanism to send one,
+matching legacy `mbrelay`'s own no-auth posture for this exact surface
+(sprint.md's Migration Concerns). See the full contract in
+[robot-console compatibility contract](#7-robot-console-compatibility-contract)
 below — breaking it silently mistunes moved robots.
 
 ### 6.7 Port from
@@ -458,17 +503,31 @@ leave the data plane. The registry's stream protocol needs an
 out-of-band control channel: a framed protocol, WebSocket control
 messages, or RFC 2217 (which pyserial supports). No mechanism is chosen.
 
-### 6. Where does the relay pool live, and what about robot-console?
-With one daemon, "give me any free relay" becomes a client-side query
-plus a lock. robot-console, however, expects an `_mbrelay._tcp` pool
-port and `/names` HTTP (see
-[cross-cutting §7](#7-robot-console-compatibility-contract)).
-- Options on the table: the registry hosts a compatibility endpoint;
-  robot-console migrates to the registry API; or a transition period
-  runs both. None is chosen.
-- The name registry (robot → channel/group) also needs a home. "A table
-  in the registry database, replicated to peers, is the natural fit" —
-  stated as a fit, not a decision.
+### 6. Where does the relay pool live, and what about robot-console? (resolved, sprint 004)
+Decided: the registry hosts a compatibility endpoint, inside `mbregistry`
+itself (sprint 004 sprint.md Decision 1) — not a robot-console migration,
+and not a transition period running both `mbrelay` and `mbregistry` side
+by side (that would reintroduce the exact port-collision problem this
+project exists to fix). Implemented as `registry.console_compat.
+relay_pool.RelayPool` (ticket 006): the `_mbrelay._tcp` pool-port TCP
+listener, wired into `mbregistry run`'s assembly alongside `daemon`/
+`api`/`remote_api`/`peering`, sharing their one `threading.RLock`. It
+serves only this host's own local relays (Decision 5 — no cross-host
+relay proxying), on `RelayPool.DEFAULT_POOL_PORT` (`7444`, distinct from
+legacy `mbrelay`'s `8760` — Decision 6), and advertises
+`RelayPool.DEFAULT_NAMES_API_PORT` (`7445`) in its TXT `registry=` key
+for `registry.console_compat.names_api.NamesAPI` (ticket 007), the
+`GET/PUT/DELETE /names/<name>` HTTP listener that serves that same
+port, also wired into `mbregistry run`'s assembly and sharing the same
+`threading.RLock`. See
+[cross-cutting §7](#7-robot-console-compatibility-contract) for the
+contract this satisfies, and `registry.console_compat.relay_pool`'s/
+`registry.console_compat.names_api`'s own module docstrings for the
+full per-connection/per-request sequence of each.
+- The name registry (robot → channel/group) also has a home: a
+  `name_registry` table in the registry database (`registry.store`,
+  sprint 004 ticket 001), replicated to peers over the existing ZMQ
+  event bus (ticket 002) — see §6.5 above.
 
 ### 7. Platforms
 Linux and Windows are required for the daemon. macOS is where the tools

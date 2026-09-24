@@ -33,16 +33,22 @@ the nRF52833 constant lives there.
 
 from __future__ import annotations
 
-import subprocess
 import sys
 from typing import Callable
 
 import intelhex
 
-from mbtools.registry.flash import DEFAULT_MCU
+from mbtools.registry.flash import (
+    DEFAULT_MCU,
+    DEFAULT_NO_PROGRESS_TIMEOUT_S,
+    check_device_permission,
+    looks_permission_denied,
+    run_streamed_with_watchdog,
+)
 
 __all__ = [
     "DEFAULT_MCU",
+    "DEFAULT_NO_PROGRESS_TIMEOUT_S",
     "flash_hex",
 ]
 
@@ -152,38 +158,34 @@ def _looks_locked(output: str) -> bool:
 
 
 def _run_streamed(
-    cmd: list[str], log: Callable[[str], None] | None
+    cmd: list[str],
+    log: Callable[[str], None] | None,
+    no_progress_timeout: float = DEFAULT_NO_PROGRESS_TIMEOUT_S,
 ) -> tuple[int, str]:
     """Run ``cmd``, relaying its combined stdout/stderr through ``_log``
     line by line as it arrives, and return ``(exit_code, output_text)``.
 
-    Uses ``subprocess.Popen`` rather than a single blocking
-    ``subprocess.run()`` specifically so pyocd's own progress output
-    (erase/program/verify lines) reaches the caller-supplied ``log``
-    throughout the run, not only once at exit -- this is what let
-    mbdeploy's own remote streaming stay within its client-side read
-    timeout during a real multi-second flash.
+    A thin, ``log``-may-be-``None``-safe wrapper over
+    :func:`mbtools.registry.flash.run_streamed_with_watchdog` (ticket 009)
+    -- that function requires a real callable (mirroring
+    :data:`~mbtools.registry.flash.Runner`'s own contract), so this
+    wrapper is what still lets every existing ``flash_hex`` caller here
+    pass ``log=None`` and get the original stderr fallback via
+    :func:`_log`, unchanged. The watchdog itself (no-progress kill, early
+    permission-denied exit) is defined once in ``flash.py`` and not
+    duplicated here -- see that module's own "Ticket 009" comment.
 
     ``output_text`` accumulates the exact same lines already relayed to
-    ``log`` (newline-joined), as a side buffer for signature matching
-    (:func:`_looks_transient`/:func:`_looks_locked`) -- it does not
-    change what is streamed or when, and it is not batching or deferring
-    anything: every line still reaches ``log`` the instant it arrives.
-
-    ``stderr=subprocess.STDOUT`` merges pyocd's stderr into the same
-    stream, since pyocd's progress output is not reliably confined to
-    one of the two and both matter equally to ``log``'s caller.
+    ``log``/stderr (newline-joined), as a side buffer for signature
+    matching (:func:`_looks_transient`/:func:`_looks_locked`/
+    :func:`~mbtools.registry.flash.looks_permission_denied`) -- it does
+    not change what is streamed or when, and it is not batching or
+    deferring anything: every line still reaches ``log`` the instant it
+    arrives.
     """
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    return run_streamed_with_watchdog(
+        cmd, lambda line: _log(log, line), no_progress_timeout
     )
-    assert proc.stdout is not None  # guaranteed by stdout=PIPE above
-    lines: list[str] = []
-    for line in proc.stdout:
-        stripped = line.rstrip("\n")
-        lines.append(stripped)
-        _log(log, stripped)
-    return proc.wait(), "\n".join(lines)
 
 
 def flash_hex(
@@ -192,6 +194,8 @@ def flash_hex(
     target_mcu: str = DEFAULT_MCU,
     log: Callable[[str], None] | None = None,
     board_name: str | None = None,
+    port: str | None = None,
+    no_progress_timeout: float = DEFAULT_NO_PROGRESS_TIMEOUT_S,
 ) -> int:
     """Flash ``hex_path`` to the board behind ``uid``, with mass-erase recovery.
 
@@ -215,11 +219,30 @@ def flash_hex(
     ``pyocd`` subprocess is constructed or run -- so an operator-side file
     problem never reaches the board at all.
 
+    Also before any ``pyocd`` subprocess: if ``port`` is given, its USB
+    permission is checked (ticket 009,
+    :func:`~mbtools.registry.flash.check_device_permission`) and a
+    denial fails immediately with a clear, actionable message -- the
+    primary defense against the bug this ticket closes (without USB
+    permission, pyOCD retries opening the probe indefinitely and never
+    times out on its own). ``port`` is optional and skipped (``None``)
+    when unknown -- callers that don't have it yet still get the
+    fallback protection below. A first flash whose output names a
+    permission/access problem (caught as it streams, by
+    :func:`_run_streamed`'s own early-exit) is likewise never retried --
+    see the transient-retry paragraph below for why that matters.
+
     A first flash failure whose output looks transient (a probe timeout,
     a communication/transfer fault, or a ``DAPAccess`` error --
     :func:`_looks_transient`) is retried exactly once, logged visibly,
     before anything else is decided -- most flaky-USB failures simply
     succeed the second time with no change to the board's state at all.
+    A failure whose output instead looks like a permission/access
+    problem (:func:`~mbtools.registry.flash.looks_permission_denied`) is
+    checked *first*, ahead of the transient check, and returns
+    immediately without ever reaching this retry -- a permission problem
+    is a host-configuration fact, not a flaky-USB blip, and retrying it
+    would just repeat (or, worse, re-hang on) the same failure.
 
     A failure that persists past that (or that never looked transient in
     the first place) is mass-erased and retried only if its output looks
@@ -243,6 +266,14 @@ def flash_hex(
         _log(log, f"Error: {hex_error}")
         return 1
 
+    # Ticket 009's primary fix: a proactive permission check, before any
+    # pyocd subprocess is constructed or run -- see this function's own
+    # docstring's "Also before any pyocd subprocess" paragraph.
+    perm_error = check_device_permission(port)
+    if perm_error is not None:
+        _log(log, f"Error: {perm_error}")
+        return 1
+
     # --- flash (with mass-erase recovery for locked parts) ---
     flash_cmd = [
         *_PYOCD, "flash",
@@ -250,14 +281,25 @@ def flash_hex(
         "--uid", uid,
         hex_path,
     ]
-    rc, output = _run_streamed(flash_cmd, log)
+    rc, output = _run_streamed(flash_cmd, log, no_progress_timeout)
+    if rc != 0 and looks_permission_denied(output):
+        # Ticket 009's fallback: the pre-check above missed it (unknown
+        # `port`, or a race), but pyocd's own output named the problem as
+        # it streamed -- `_run_streamed` already killed the subprocess
+        # and logged the specific message the instant that line arrived
+        # (see flash.run_streamed_with_watchdog's own docstring), rather
+        # than waiting out `no_progress_timeout`. Return here, without
+        # ever reaching the transient-retry or mass-erase logic below --
+        # see this function's own docstring for why a permission problem
+        # must never be retried.
+        return rc
     if rc != 0 and _looks_transient(output):
         _log(
             log,
             "flash failed with a transient-looking probe/communication "
             "error — retrying once before any mass-erase decision.",
         )
-        rc, output = _run_streamed(flash_cmd, log)
+        rc, output = _run_streamed(flash_cmd, log, no_progress_timeout)
 
     if rc != 0 and _looks_locked(output):
         # A locked/protected nRF (APPROTECT set, or a protected SoftDevice
@@ -276,11 +318,11 @@ def flash_hex(
             "--uid", uid,
             "--mass",
         ]
-        erase_rc, _erase_output = _run_streamed(erase_cmd, log)
+        erase_rc, _erase_output = _run_streamed(erase_cmd, log, no_progress_timeout)
         if erase_rc != 0:
             _log(log, f"Error: mass erase failed (exit {erase_rc}).")
             return erase_rc
-        rc, output = _run_streamed(flash_cmd, log)
+        rc, output = _run_streamed(flash_cmd, log, no_progress_timeout)
         if rc != 0:
             name = board_name or uid
             _log(
@@ -308,5 +350,5 @@ def flash_hex(
         "-t", target_mcu,
         "--uid", uid,
     ]
-    reset_rc, _reset_output = _run_streamed(reset_cmd, log)
+    reset_rc, _reset_output = _run_streamed(reset_cmd, log, no_progress_timeout)
     return reset_rc
