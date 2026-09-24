@@ -248,30 +248,58 @@ service.
 
 Rebuilt as a client that does **only** the relay protocol. It never
 finds, enumerates, probes or lists devices itself — that is entirely the
-registry's job.
+registry's job (`relay.cli`'s own list()-through-the-registry-client
+resolution, never a raw serial/socket scan).
 
 ### 6.1 Picking a relay
-- `mbrelay connect [robot[@host]]` chooses a free relay (by name, or any
-  free one) through the registry and locks it — asking the registry which
-  attached micro:bits are relays (role contains `RELAY` or `BRIDGE`).
+- `mbrelay connect <robot>[@<host>]` names a **robot** (a name-registry
+  name), not a relay device directly. It resolves a free relay (by
+  scanning the local registry's own `list` op for a device whose `role`
+  contains `RELAY`/`BRIDGE` and is unlocked — a local one preferred when
+  `@host` isn't given), optionally scoped to `@host`, and locks it
+  (kind `relay`).
+- `mbrelay names get/set/clear/list <name> [channel] [group]` operates on
+  the name registry directly (through the registry daemon's own
+  `names_get`/`names_set`/`names_clear`/`names_list` ops — the CLI never
+  opens `devices.db` itself), for operator use without going through
+  robot-console's HTTP compatibility endpoint (§6.6).
 
 ### 6.2 Reset and normalize
-On acquire and on release: BREAK/reset, `HELLO`, `!VER?`, then RAW250 /
-frag off / echo off / P7 / ch0 grp10, verified with `?`, then `!DEFAULTS`
-on release. Port this from
-`microbit-radio-relay/server/src/mbrelay/relay.py`.
+On acquire: `HELLO`, `!VER?`, then RAW250 / frag off / echo off / P7 /
+ch0 grp10, verified with `?` — `relay.protocol.RelayControl`'s
+`hello`/`firmware_version`/`normalize`, called directly (not its
+`reset_and_normalize` convenience wrapper, which unconditionally closes
+the channel again — fine for a locally-attached relay, but would drop a
+remote relay's registry lock along with the connection it closes; see
+`relay.cli`'s own module docstring). On release: `!DEFAULTS`
+(`clear_stored_config`) only — the *next* acquire's `normalize()` already
+forces the board back to defaults unconditionally, so release doesn't
+need to repeat that work.
 
 ### 6.3 Tuning to a robot
-`!CG` from the name registry, `!GO`, then an optional `PING`.
+`!CG` from the name registry (a **non-creating** lookup — an
+unregistered robot name is reported as a distinct error, not silently
+derived, unlike robot-console's own `/names` endpoint), `!GO`, then an
+optional `PING` (skip with `--no-probe`).
 
 ### 6.4 Scripting and terminal
-`--send` / `--expect` scripting and the interactive terminal, as in
-today's `mbrelay connect`.
+`--send LINE` (repeatable) / `--expect REGEX` scripting, or — with
+neither given — a raw-mode interactive terminal (`--escape`, default
+Ctrl-`]`), as in today's `mbrelay connect`.
 
 ### 6.5 Name registry
-Robot name → (channel, group) mapping, with conflict reporting. Needs a
-home under the one-daemon rule — probably a table in the registry
-database, replicated to peers. See
+Robot name → (channel, group) mapping, with conflict reporting, in the
+registry's `name_registry` table (`registry.store`, sprint 004 ticket
+001), replicated to peers over the existing ZMQ event bus (ticket 002).
+`mbrelay`'s own writes (`names set`/`names clear`, and `connect`'s own
+lookup) go through the registry daemon's local API — new
+`names_get`/`names_set`/`names_clear`/`names_list` ops on
+`registry._api_base.BaseAPIServer`/`registry.api.RegistryAPIServer` — so
+the daemon (which already owns both the `Store` and the `PeerDiscovery`
+publisher) is what fires `publish_name_set`/`publish_name_clear` right
+after its own write, the same "the component that owns the write fires
+the callback" shape `LockManager`/`Daemon` already use for lock/attach
+events. See
 [Open decisions §6](#6-where-does-the-relay-pool-live-and-what-about-robot-console).
 
 ### 6.6 robot-console compatibility

@@ -326,6 +326,52 @@ class RegistryClient:
         resp = self._request({"op": "unlock", "uid": uid})
         return bool(resp.get("released", False))
 
+    # -- name-registry ops (sprint 004, ticket 005) -----------------------
+    #
+    # Not device ops -- no uid, no lock -- see ``registry._api_base``'s
+    # own "name-registry ops" section docstring for why they skip this
+    # class's usual find/lock shape entirely.
+
+    def names_get(self, name: str) -> dict[str, Any] | None:
+        """The name registry's row for ``name``, or ``None`` if it has
+        none yet -- the non-creating lookup (``names_get`` op,
+        :meth:`~mbtools.registry.store.Store.get_name`). Unlike
+        ``find``, an absent row is not an error: a caller wanting "is
+        this name registered at all" (``mbrelay connect``'s own
+        distinct-error requirement) tells that apart from a real
+        protocol failure by checking for ``None`` here, not by catching
+        an exception.
+        """
+        resp = self._request({"op": "names_get", "name": name})
+        entry = resp.get("entry")
+        return dict(entry) if entry is not None else None
+
+    def names_set(self, name: str, channel: int, group: int) -> dict[str, Any]:
+        """Explicitly assign ``name`` to ``(channel, group)`` (``names_set``
+        op, :meth:`~mbtools.registry.store.Store.set`) -- overwrites any
+        existing row, derived or previously registered. Returns the new
+        row.
+        """
+        resp = self._request(
+            {"op": "names_set", "name": name, "channel": channel, "group": group}
+        )
+        return dict(resp["entry"])
+
+    def names_clear(self, name: str) -> None:
+        """Drop ``name``'s row, if any (``names_clear`` op,
+        :meth:`~mbtools.registry.store.Store.clear`). Not an error if
+        ``name`` has no row.
+        """
+        self._request({"op": "names_clear", "name": name})
+
+    def names_list(self) -> list[dict[str, Any]]:
+        """Every ``name_registry`` row, each annotated with its own
+        ``conflict``/``channel_conflict`` names (``names_list`` op,
+        :meth:`~mbtools.registry.store.Store.listing`).
+        """
+        resp = self._request({"op": "names_list"})
+        return list(resp.get("entries", []))
+
     def mark_flashed(self, uid: str) -> None:
         """Record that ``uid`` was just flashed, per the ``mark_flashed``
         op (ticket 003) -- bookkeeping only, for a flash that ran

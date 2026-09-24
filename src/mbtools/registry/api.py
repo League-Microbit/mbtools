@@ -15,7 +15,10 @@ down here since it becomes sprint 002's de facto contract; see also
 ``docs/design/registry-api.md``): newline-delimited JSON over the Unix
 socket, one connection per client session. Each request line is a JSON
 object with an ``"op"`` field (``list``/``get``/``find``/``lock``/
-``unlock``/``flash``/``mark_flashed``); each non-streaming op writes exactly one JSON
+``unlock``/``flash``/``mark_flashed``/``names_get``/``names_set``/
+``names_clear``/``names_list`` -- the last four, sprint 004 ticket 005,
+are ``BaseAPIServer``'s name-registry ops, not scoped to a device at all);
+each non-streaming op writes exactly one JSON
 response line. ``flash`` is the one streaming op: zero or more
 ``{"type": "log", "line": ...}`` lines (relayed from
 :meth:`~mbtools.registry.flash.FlashOp.flash_hex`'s log callback as they
@@ -109,7 +112,7 @@ from mbtools.common import CODE_INVALID_REQUEST, CODE_NOT_FOUND, CODE_NOT_LOCKED
 from mbtools.registry._api_base import BaseAPIServer, _error
 from mbtools.registry.flash import FlashOp, HexValidationError
 from mbtools.registry.locks import KIND_FLASH, HolderRef, LockManager
-from mbtools.registry.store import Store
+from mbtools.registry.store import Entry, Store
 
 __all__ = [
     "RegistryAPIServer",
@@ -278,6 +281,8 @@ class RegistryAPIServer(BaseAPIServer):
         is_pid_alive_fn: Callable[[int], bool] | None = None,
         sweep_interval_s: float = DEFAULT_SWEEP_INTERVAL_S,
         lock: threading.RLock | None = None,
+        name_set_callback: Callable[[Entry], None] | None = None,
+        name_clear_callback: Callable[[str], None] | None = None,
     ) -> None:
         self.socket_path = Path(socket_path)
         self._store = store
@@ -288,6 +293,14 @@ class RegistryAPIServer(BaseAPIServer):
             is_pid_alive_fn if is_pid_alive_fn is not None else default_is_pid_alive
         )
         self._sweep_interval_s = sweep_interval_s
+        # sprint 004, ticket 005: fired by BaseAPIServer's
+        # _op_names_set/_op_names_clear (see that module's own docstring)
+        # -- registry.cli's assembly wires these to
+        # PeerDiscovery.publish_name_set/publish_name_clear; None (the
+        # default) leaves a bare RegistryAPIServer, and every pre-ticket-005
+        # test that constructs one directly, unaffected.
+        self._name_set_callback = name_set_callback
+        self._name_clear_callback = name_clear_callback
 
         self._lock = lock if lock is not None else threading.RLock()
         self._stop_event = threading.Event()
@@ -534,6 +547,14 @@ class RegistryAPIServer(BaseAPIServer):
             resp = self._op_flash(req, pid, acquired_uids, wfile)
         elif op == "mark_flashed":
             resp = self._op_mark_flashed(req, holder)
+        elif op == "names_get":
+            resp = self._op_names_get(req)
+        elif op == "names_set":
+            resp = self._op_names_set(req)
+        elif op == "names_clear":
+            resp = self._op_names_clear(req)
+        elif op == "names_list":
+            resp = self._op_names_list(req)
         else:
             resp = _error(CODE_INVALID_REQUEST, f"unknown op {op!r}")
         self._write(wfile, resp)

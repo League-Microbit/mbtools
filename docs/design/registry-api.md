@@ -8,11 +8,15 @@ plane" below) — the two share one dispatch implementation
 (`mbtools.registry._api_base.BaseAPIServer`) — plus, TCP-only, a `stream`
 op (sprint 003, ticket 007) that switches the connection into a separate
 binary framed sub-protocol (`mbtools.registry.stream_frame`) for serial
-data and out-of-band control. Written down here — not only in code — per
+data and out-of-band control, and, local-socket-only as of sprint 004
+ticket 005, four name-registry ops (`names_get`/`names_set`/
+`names_clear`/`names_list` — see "Name-registry ops" below) that are not
+device ops at all. Written down here — not only in code — per
 sprint.md's Open Question #1: this becomes a de facto contract sprint
-002's client tools (`mbdeploy`, `mbserial`) must speak. Except where
-noted, everything below describes the local Unix socket; "Remote TCP
-control plane" covers only where the TCP transport differs.
+002's client tools (`mbdeploy`, `mbserial`, and sprint 004's `mbrelay`)
+must speak. Except where noted, everything below describes the local
+Unix socket; "Remote TCP control plane" covers only where the TCP
+transport differs.
 
 ## Transport
 
@@ -45,9 +49,17 @@ Every request is a JSON object with an `"op"` field:
 | `unlock` | `uid` | release this connection's own lock on the device (a no-op, not an error, if this connection doesn't hold it) |
 | `flash` | `uid`, `hex_path` | flash `hex_path` to the device — requires a `flash`-kind lock already held by this same connection (call `lock` first) |
 | `mark_flashed` | `uid` | bookkeeping only: record that `uid` was flashed *outside* this op (sprint 002's `mbdeploy`, which flashes locally by running pyocd directly rather than through `flash`) — same `flash`-kind-lock-held-by-this-connection precondition as `flash`, no pyocd invocation |
+| `names_get` | `name` | sprint 004, ticket 005: the name registry's row for `name`, or `entry: null` (not an error) if it has none yet — the non-creating lookup |
+| `names_set` | `name`, `channel`, `group` | explicit assignment, `source: "registry"` — overwrites any existing row |
+| `names_clear` | `name` | drop `name`'s row, if any (not an error if it has none) |
+| `names_list` | — | every `name_registry` row, each annotated with its own `conflict`/`channel_conflict` names |
 
-`uid` accepts any of uid / short_uid / device_name for every op that takes
-one, since all of them resolve through `store.find`.
+`uid` accepts any of uid / short_uid / device_name for every device op
+that takes one, since all of them resolve through `store.find`. The four
+`names_*` ops are not device ops — they take a `name` (a micro:bit name,
+`mbtools.relay.naming.validate`'d), not a `uid`, and are not scoped by
+`lock`/visibility at all (`name_registry` rows are fleet-wide, converged
+across every peer — see "Name-registry ops" below).
 
 ## Responses
 
@@ -211,6 +223,63 @@ pyocd and — because it does not touch the lock at all — never releases it,
 so it triggers no re-probe of its own; the existing lock-release hook
 (`LockManager`'s `flash_release_callback`, fired on any `flash`-kind release
 regardless of what ran before it) is what does that, unaffected by this op.
+
+### Name-registry ops (sprint 004, ticket 005): `names_get` / `names_set` / `names_clear` / `names_list`
+
+```jsonc
+// names_get request
+{"op": "names_get", "name": "tovez"}
+// response -- registered:
+{"ok": true, "entry": {"name": "tovez", "channel": 20, "group": 30,
+                        "source": "registry", "updated": 1700000000.0,
+                        "conflict": [], "channel_conflict": []}}
+// response -- not registered (not an error):
+{"ok": true, "entry": null}
+
+// names_set request
+{"op": "names_set", "name": "tovez", "channel": 20, "group": 30}
+// response: {"ok": true, "entry": {...}}
+
+// names_clear request
+{"op": "names_clear", "name": "tovez"}
+// response: {"ok": true}  -- even if `name` had no row
+
+// names_list request
+{"op": "names_list"}
+// response: {"ok": true, "entries": [{...}, ...]}
+```
+
+Not device ops — no `uid`, no lock, no `_resolve_visible` scope. They
+wrap `mbtools.registry.store.Store`'s own `get_name`/`set`/`clear`/
+`listing` (sprint 004 ticket 001) directly, unscoped, since every
+peered registry converges on the same `name_registry` table (ticket 002)
+and there is nothing per-device to restrict a caller's view of.
+`names_get` is the **non-creating** lookup (unlike `Store.resolve`,
+which derives-and-persists on miss, the semantic `console_compat.
+names_api`'s `GET /names/<name>` — sprint 004 ticket 007 — needs for
+robot-console's own "write-on-read" expectation): a name with no row
+answers `"entry": null`, not an error, so a caller that specifically
+wants to tell "unregistered" apart from a protocol failure (`mbrelay
+connect`'s own SUC-001 error flow) can do so without catching an
+exception. `names_set`/`names_clear` each fire an optional callback
+(`RegistryAPIServer`'s `name_set_callback`/`name_clear_callback`
+constructor parameters, `None` by default) immediately after their own
+write commits, outside the shared store/locks lock — `registry.cli`'s
+`assemble_registry` wires these to `PeerDiscovery.publish_name_set`/
+`publish_name_clear` (ticket 002), the same "the component that owns
+the write fires the callback" shape `Daemon`'s `event_callback`/
+`LockManager`'s `lock_display_callback` already use, rather than `Store`
+owning a callback of its own. A malformed `name` (`mbtools.relay.
+naming.validate` failure) is `invalid_request` on every op that takes
+one.
+
+**Local Unix socket only, not yet on the remote TCP control plane**: the
+one caller that exists so far (`mbrelay`'s CLI) always resolves a name
+against its own *local* registry connection — replication already keeps
+every peer's copy converged, so there is no reason for it to ask a
+peer's `remote_api` the same question instead. A future ticket adding a
+remote caller would wire the same four `BaseAPIServer` methods into
+`remote_api.RemoteAPIServer`'s own dispatch, not re-port them.
 
 ## Locking and connection lifetime
 

@@ -249,6 +249,8 @@ def assemble_daemon_and_api(
     lock: threading.RLock | None = None,
     event_callback: Any = None,
     lock_display_callback: Any = None,
+    name_set_callback: Any = None,
+    name_clear_callback: Any = None,
 ) -> tuple[Daemon, RegistryAPIServer]:
     """Build one :class:`Daemon` and one :class:`RegistryAPIServer` that
     share a single ``threading.RLock`` -- ticket 009's fix for the
@@ -287,6 +289,17 @@ def assemble_daemon_and_api(
     ``registry.peering.PeerDiscovery.publish_daemon_event``/
     ``publish_lock_event`` here. Both default to ``None`` (no-op),
     unaffected for every pre-ticket-009 caller/test.
+
+    ``name_set_callback``/``name_clear_callback`` (sprint 004, ticket
+    005) are forwarded verbatim to :class:`RegistryAPIServer` (which
+    fires them itself, from ``BaseAPIServer._op_names_set``/
+    ``_op_names_clear`` -- see that module's own docstring for why
+    ``Store`` doesn't own this hook itself, the same "Daemon/LockManager,
+    not Store, own the callback" reasoning as ``event_callback``/
+    ``lock_display_callback`` above); :func:`assemble_registry` passes
+    ``PeerDiscovery.publish_name_set``/``publish_name_clear`` here. Both
+    default to ``None`` (no-op), unaffected for every pre-ticket-005
+    caller/test.
     """
     shared_lock = lock if lock is not None else threading.RLock()
     daemon = Daemon(
@@ -307,6 +320,8 @@ def assemble_daemon_and_api(
         flash_op=flash_op,
         peer_pid_fn=peer_pid_fn,
         lock=shared_lock,
+        name_set_callback=name_set_callback,
+        name_clear_callback=name_clear_callback,
     )
     return daemon, api
 
@@ -412,6 +427,8 @@ def assemble_registry(
         lock=shared_lock,
         event_callback=peer_discovery.publish_daemon_event,
         lock_display_callback=peer_discovery.publish_lock_event,
+        name_set_callback=peer_discovery.publish_name_set,
+        name_clear_callback=peer_discovery.publish_name_clear,
     )
     remote_api = RemoteAPIServer(
         host=remote_host,

@@ -405,3 +405,55 @@ def test_two_pipelines_connected_via_peer_flag_equivalent_converge(tmp_path, soc
         api_b.stop()
         store_a.close()
         store_b.close()
+
+
+def test_assemble_registry_name_set_callback_reaches_peering(tmp_path, socket_dir):
+    """Same proof as ``test_assemble_registry_lock_display_callback_
+    reaches_peering`` above, for sprint 004 ticket 005's
+    ``name_set_callback``/``name_clear_callback`` wiring: a
+    ``names_set`` op through ``api``'s own dispatch (``BaseAPIServer.
+    _op_names_set``) publishes onto ``peering``'s event bus -- proves
+    ``assemble_registry`` actually wires ``PeerDiscovery.publish_name_set``
+    into ``RegistryAPIServer``, not just accepts and drops it. Ticket
+    002 left this callback unwired to any call site; this ticket's own
+    ``registry.cli`` assembly (module docstring's "name-registry
+    replication wiring" note) is where it lands.
+    """
+    import zmq
+
+    from mbtools.registry.store import Store as _Store
+
+    store = _Store(tmp_path / "devices.db")
+    usbwatch = FakeUSBSource([[]])
+
+    daemon, api, remote_api, peering = assemble_registry(
+        store=store,
+        usbwatch=usbwatch,
+        socket_path=f"{socket_dir}/api.sock",
+        remote_port=0,
+        peer_pub_port=17714,
+        peer_snapshot_port=17715,
+        zeroconf=_FakeZeroconfNamespace(),
+    )
+
+    ctx = zmq.Context()
+    sub = ctx.socket(zmq.SUB)
+    sub.setsockopt(zmq.SUBSCRIBE, b"")
+    sub.setsockopt(zmq.RCVTIMEO, 3000)
+
+    try:
+        peering.start()
+        sub.connect("tcp://127.0.0.1:17714")
+        time.sleep(0.2)  # let the SUB subscription propagate
+
+        resp = api._op_names_set({"name": "tovez", "channel": 20, "group": 30})
+        assert resp["ok"] is True
+
+        message = sub.recv()
+        assert b"name_set" in message
+        assert b"tovez" in message
+    finally:
+        sub.close(linger=0)
+        ctx.term()
+        peering.stop()
+        store.close()

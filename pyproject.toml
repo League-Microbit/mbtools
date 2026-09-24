@@ -9,7 +9,7 @@ dependencies = ["pyserial>=3.5", "intelhex>=2.3.0", "pyocd>=0.44.1", "zeroconf>=
 mbregistry = "mbtools.registry.cli:main"
 mbdeploy = "mbtools.deploy.cli:main"
 mbserial = "mbtools.serial.cli:main"
-mbrelay = "mbtools.relay:main"
+mbrelay = "mbtools.relay.cli:main"
 
 [dependency-groups]
 dev = ["pytest>=8"]
