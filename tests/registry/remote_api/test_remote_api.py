@@ -30,6 +30,7 @@ from mbtools.common import (
     CODE_UNAUTHORIZED,
 )
 from mbtools.registry.api import RegistryAPIServer
+from mbtools.registry.eventbus import EventBus
 from mbtools.registry.flash import FlashOp
 from mbtools.registry.identity import ProbeResult
 from mbtools.registry.locks import KIND_FLASH, KIND_SERIAL, HolderRef, LockManager
@@ -135,7 +136,13 @@ def locks():
 def remote_server(store, locks):
     servers: list[RemoteAPIServer] = []
 
-    def _make(*, auth_token=None, sweep_interval_s=100.0, lock: threading.RLock | None = None):
+    def _make(
+        *,
+        auth_token=None,
+        sweep_interval_s=100.0,
+        lock: threading.RLock | None = None,
+        eventbus=None,
+    ):
         srv = RemoteAPIServer(
             host="127.0.0.1",
             port=0,
@@ -144,6 +151,7 @@ def remote_server(store, locks):
             auth_token=auth_token,
             sweep_interval_s=sweep_interval_s,
             lock=lock,
+            eventbus=eventbus,
         )
         srv.start()
         servers.append(srv)
@@ -543,3 +551,115 @@ def test_flash_without_a_staged_hex_path_is_invalid_request(remote_server):
     assert resp["code"] == CODE_INVALID_REQUEST
     assert resp["type"] == "result"
     client.close()
+
+
+# ---------------------------------------------------------------------------
+# watch (sprint 008, ticket 001) -- mirrors tests/registry/api/test_api.py's
+# own watch tests, over the remote TCP transport instead of the local
+# Unix socket, dispatched through the same shared
+# _api_base.BaseAPIServer._op_watch/_handle_watch.
+# ---------------------------------------------------------------------------
+
+
+def test_watch_acks_then_streams_published_events_in_order(remote_server):
+    bus = EventBus()
+    srv = remote_server(eventbus=bus)
+    client = _Client(srv.bound_port)
+
+    ack = client.request({"op": "watch"})
+    assert ack == {"ok": True}
+
+    event1 = {"type": "attach", "uid": LOCAL_UID, "port": "/dev/ttyACM0", "vid_pid": VID_PID}
+    event2 = {"type": "lock_state", "uid": LOCAL_UID, "kind": "serial", "display": "pid 1"}
+    bus.publish(event1)
+    bus.publish(event2)
+
+    assert client.recv() == event1
+    assert client.recv() == event2
+    client.close()
+
+
+def test_watch_fans_out_to_every_connected_watcher(remote_server):
+    bus = EventBus()
+    srv = remote_server(eventbus=bus)
+    watcher_a = _Client(srv.bound_port)
+    watcher_b = _Client(srv.bound_port)
+    assert watcher_a.request({"op": "watch"}) == {"ok": True}
+    assert watcher_b.request({"op": "watch"}) == {"ok": True}
+
+    event = {"type": "detach", "uid": LOCAL_UID}
+    bus.publish(event)
+
+    assert watcher_a.recv() == event
+    assert watcher_b.recv() == event
+    watcher_a.close()
+    watcher_b.close()
+
+
+def test_watch_sees_no_snapshot_only_events_published_after_subscribing(remote_server):
+    bus = EventBus()
+    srv = remote_server(eventbus=bus)
+    bus.publish({"type": "attach", "uid": "before-watch"})
+
+    client = _Client(srv.bound_port)
+    assert client.request({"op": "watch"}) == {"ok": True}
+
+    after = {"type": "attach", "uid": "after-watch"}
+    bus.publish(after)
+
+    assert client.recv() == after
+    client.close()
+
+
+def test_watch_client_disconnect_cleanly_unsubscribes(remote_server):
+    """No leaked queue, no exception on the next publish() -- mirrors
+    test_api.py's own equivalent test; see that test's docstring for why
+    a publish (not the bare close) is what surfaces cleanup here.
+
+    Unlike a Unix-domain socket, a first write to a TCP socket whose peer
+    already closed can succeed silently (it lands in the local send
+    buffer before the RST arrives) -- so this keeps publishing (each
+    call must not raise) until the second or later write actually
+    surfaces the broken connection and the handler thread unsubscribes.
+    """
+    bus = EventBus()
+    srv = remote_server(eventbus=bus)
+    client = _Client(srv.bound_port)
+    assert client.request({"op": "watch"}) == {"ok": True}
+
+    client.close()
+
+    def _no_subscribers_left():
+        with bus._lock:
+            if len(bus._subscribers) == 0:
+                return True
+        bus.publish({"type": "attach", "uid": "after-close"})  # must not raise
+        return False
+
+    _wait_until(_no_subscribers_left)
+
+
+def test_watch_requires_auth_token_when_configured(remote_server, locks):
+    """`watch` gets no auth exemption -- the same first-line token
+    handshake every other op requires still applies."""
+    srv = remote_server(auth_token="s3cret")
+    client = _Client(srv.bound_port)
+
+    resp = client.request({"op": "watch"})
+
+    assert resp["ok"] is False
+    assert resp["code"] == CODE_UNAUTHORIZED
+    client.close()
+
+
+def test_watch_does_not_block_other_clients_from_being_served(remote_server):
+    srv = remote_server()
+    watcher = _Client(srv.bound_port)
+    assert watcher.request({"op": "watch"}) == {"ok": True}
+
+    other = _Client(srv.bound_port)
+    resp = other.request({"op": "list"})
+    assert resp["ok"] is True
+
+    watcher.close()
+    other.close()

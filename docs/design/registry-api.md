@@ -58,6 +58,7 @@ Every request is a JSON object with an `"op"` field:
 | `names_set` | `name`, `channel`, `group` | explicit assignment, `source: "registry"` — overwrites any existing row |
 | `names_clear` | `name` | drop `name`'s row, if any (not an error if it has none) |
 | `names_list` | — | every `name_registry` row, each annotated with its own `conflict`/`channel_conflict` names |
+| `watch` | — | sprint 008, ticket 001: no precondition — after `{"ok": true}`, the connection receives one JSON line per subsequent event (change-only, no snapshot) until it closes; see "`watch`" below |
 
 `uid` accepts any of uid / short_uid / device_name for every device op
 that takes one, since all of them resolve through `store.find`. The four
@@ -261,6 +262,77 @@ pyocd and — because it does not touch the lock at all — never releases it,
 so it triggers no re-probe of its own; the existing lock-release hook
 (`LockManager`'s `flash_release_callback`, fired on any `flash`-kind release
 regardless of what ran before it) is what does that, unaffected by this op.
+
+### `watch` (sprint 008, ticket 001)
+
+```jsonc
+// request
+{"op": "watch"}
+// response: one immediate ack, then one JSON line per subsequent event,
+// for as long as the connection stays open -- no "final" line, ever.
+{"ok": true}
+{"type": "attach", "host": "...", "uid": "...", "port": "...", "vid_pid": "..."}
+{"type": "lock_state", "host": "...", "uid": "...", "kind": "serial", "display": "..."}
+{"type": "detach", "host": "...", "uid": "..."}
+// ...
+```
+
+Any connection may `watch` — there is no precondition (unlike
+`lock`/`unlock`, every connection may watch, regardless of what else it
+holds). Once `{"ok": true}` is sent, the connection leaves ordinary
+request/response dispatch for the rest of its life: it never reads
+another request line, and every subsequent write is one JSON line per
+event, until the connection closes (from either end). This is the same
+shared mechanism (`_api_base.BaseAPIServer._op_watch`/`_handle_watch`) on
+both the local Unix socket (`api.py`) and the remote TCP port
+(`remote_api.py`, see "Remote TCP control plane" below) — a Node client
+(robot-console) gets change notifications on either transport without
+linking `pyzmq` or knowing this registry's PUB port.
+
+**Change-only, no snapshot on connect** (stakeholder decision): a
+`watch` client sees only events published *after* it subscribes, never a
+replay of current state — `list` is this protocol's own point-in-time
+snapshot call; a client that wants both calls `list` first, then
+`watch`, per `docs/design/robot-console-integration.md` §3.1's own
+two-step sequence. This mirrors the existing ZeroMQ PUB bus, which is
+also change-only (a new peer gets a snapshot separately, via the
+REQ/REP snapshot exchange, not via the PUB stream).
+
+**Event vocabulary** — exactly the event types the ZeroMQ PUB bus already
+emits, plus two new ones this ticket adds:
+
+| `"type"` | Fields | Source |
+|---|---|---|
+| `attach` | `uid`, `port`, `vid_pid` | `Daemon`'s own attach detection |
+| `detach` | `uid` | `Daemon`'s own detach detection |
+| `identity` | `uid`, `state`, `role`, `common_name`, `device_name`, `serial_payload`, `raw_announcement` | `Daemon`'s own probe/identify step |
+| `lock_state` | `uid`, `kind`, `display` (`kind`/`display` both `null` on release) | `LockManager.acquire`/`release`/`sweep` |
+| `name_set` | `name`, `channel`, `group`, `source`, `updated` | `Store.set`/`Store.resolve` (via `names_set`) |
+| `name_clear` | `name` | `Store.clear` (via `names_clear`) |
+| `peer_up` | `host` (the peer that became reachable) | `registry.peering`'s own reachability tracking (new this ticket) |
+| `peer_down` | `host` (the peer that became unreachable) | `registry.peering`'s own reachability tracking (new this ticket) |
+
+Every event also carries a `"host"` field — the name of the registry
+instance that produced it (this instance's own short hostname, or
+`--instance` override), the same field the ZeroMQ PUB bus's own messages
+already carry — except `peer_up`/`peer_down`, whose `"host"` names the
+*peer* whose reachability changed, not this instance.
+
+**Works identically under `--no-peering`**: `watch` is sourced from the
+daemon's own event hooks (`Daemon.event_callback`,
+`LockManager.lock_display_callback`,
+`_api_base.BaseAPIServer._name_set_callback`/`_name_clear_callback`) via
+an always-constructed `registry.eventbus.EventBus`, never from a ZeroMQ
+subscription — so a `watch` client on a `--no-peering`-spawned instance
+still sees `attach`/`detach`/`identity`/`lock_state`/`name_set`/
+`name_clear` exactly as it would with peering on. The one thing it never
+sees is `peer_up`/`peer_down` — an unpeered instance has no peers to
+report on. When peering *is* on, the event bus is additive, not a
+replacement for the existing ZeroMQ PUB publish: a peer keeps receiving
+everything except `peer_up`/`peer_down` over its own PUB subscription
+exactly as before this ticket — `peer_up`/`peer_down` are a purely local
+notification (this host's own view of one peer's reachability) and are
+never re-published onward over PUB to a third host.
 
 ### Name-registry ops (sprint 004, ticket 005): `names_get` / `names_set` / `names_clear` / `names_list`
 
@@ -636,6 +708,17 @@ ignored (and never acted on) until authentication succeeds on a
 *subsequent* line. When `auth_token` is unset (the default), this
 handshake is skipped entirely and a connection's first line is
 dispatched as a normal op, exactly like the local Unix socket.
+
+### `watch` (sprint 008, ticket 001)
+
+`{"op": "watch"}` works identically here to the local Unix socket's own
+`watch` op described above — same request/ack shape, same event
+vocabulary, same "leaves ordinary request/response dispatch for the rest
+of the connection's life" handoff, dispatched through the same shared
+`_api_base.BaseAPIServer._op_watch`/`_handle_watch` both servers use. No
+auth exemption: when `--auth-token` is configured, the same first-line
+token handshake described above still applies before `watch` (or any
+other op) is dispatched.
 
 ### Stream sub-protocol (sprint 003, ticket 007; widened sprint 004, ticket 011)
 

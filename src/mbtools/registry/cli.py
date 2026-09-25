@@ -82,11 +82,19 @@ from mbtools.registry.console_compat.relay_pool import (
 )
 from mbtools.registry.claims import build_claim_fn
 from mbtools.registry.daemon import DEFAULT_INTERVAL_S, Daemon
+from mbtools.registry.eventbus import EventBus
 from mbtools.registry.flash import FlashOp
 from mbtools.registry.peering import (
     DEFAULT_PUB_PORT,
     DEFAULT_SNAPSHOT_PORT,
+    EVENT_LOCK_STATE,
+    EVENT_NAME_CLEAR,
+    EVENT_NAME_SET,
     PeerDiscovery,
+    daemon_event_payload,
+    lock_event_payload,
+    name_clear_payload,
+    name_set_payload,
 )
 from mbtools.registry.remote_api import DEFAULT_REMOTE_PORT, RemoteAPIServer
 from mbtools.registry.paths import LINUX_SYSTEM_UNIT_PATH, LINUX_UDEV_RULE_PATH
@@ -392,6 +400,7 @@ def assemble_daemon_and_api(
     claim_fn: Any = None,
     chip_identity_session_factory: Any = None,
     pipe_name: str | None = None,
+    eventbus: EventBus | None = None,
 ) -> tuple[Daemon, RegistryAPIServer | WindowsPipeAPIServer]:
     """Build one :class:`Daemon` and one local-API server that share a
     single ``threading.RLock`` -- ticket 009's fix for the cross-module
@@ -486,6 +495,17 @@ def assemble_daemon_and_api(
     production caller that does. Every pre-ticket-004 caller/test that
     omits it is unaffected: :class:`WindowsPipeAPIServer` is still built
     with ``pipe_name=str(socket_path)``, byte for byte as before.
+
+    ``eventbus`` (sprint 008 ticket 001) is forwarded to
+    :class:`RegistryAPIServer`'s own ``eventbus`` parameter -- the
+    ``watch`` op's event source (not wired into
+    :class:`WindowsPipeAPIServer`, this ticket's own scope: the local
+    Unix socket and the remote TCP port, per sprint.md's Architecture).
+    Left ``None`` here (this function's own default), :class:`RegistryAPIServer`
+    builds a private instance of its own, unaffected for every
+    pre-ticket-008-001 caller/test that omits it. :func:`assemble_registry`
+    always passes the one ``EventBus`` it constructs for the whole
+    daemon pipeline.
     """
     shared_lock = lock if lock is not None else threading.RLock()
     daemon = Daemon(
@@ -520,6 +540,7 @@ def assemble_daemon_and_api(
             flash_op=flash_op,
             peer_pid_fn=peer_pid_fn,
             lock=shared_lock,
+            eventbus=eventbus,
             name_set_callback=name_set_callback,
             name_clear_callback=name_clear_callback,
         )
@@ -548,6 +569,7 @@ def assemble_registry(
     stream_serial_factory: Any = None,
     lock: threading.RLock | None = None,
     claim_fn: Any = None,
+    chip_identity_session_factory: Any = None,
     pipe_name: str | None = None,
     no_peering: bool = False,
 ) -> tuple[
@@ -625,6 +647,18 @@ def assemble_registry(
     other/earlier caller/test that omits it gets :class:`Daemon`'s own
     no-op default, unaffected.
 
+    ``chip_identity_session_factory`` (sprint 007, ticket 003) is
+    forwarded verbatim to :func:`assemble_daemon_and_api` -- see that
+    function's own docstring note. Left ``None`` here (this function's
+    own default, real pyOCD), unaffected for every pre-ticket-008-001
+    caller/test that omits it; a test driving ``daemon.run_once()``
+    through this function's own ``daemon`` (rather than
+    ``daemon.locks``/callback closures directly) should pass
+    ``mbtools.testing.fakes.unavailable_chip_identity_session_factory``
+    (or a scripted one) here, same as any other ``Daemon``-level test --
+    see that module's own docstring for why a bare ``None`` reaches real
+    ``pyocd``.
+
     ``pipe_name`` (sprint 007, ticket 004) is forwarded verbatim to
     :func:`assemble_daemon_and_api` -- see that function's own
     ``pipe_name`` docstring note. Left ``None`` here (this function's
@@ -660,8 +694,43 @@ def assemble_registry(
     uses: ``peering.stop()``, then ``remote_api.stop()``, then
     ``api.stop()``, then ``store.close()`` last, since nothing may still
     be touching ``store`` by the time it closes.
+
+    **Sprint 008 ticket 001: the event bus, and the always-on fan-out
+    closures.** One :class:`~mbtools.registry.eventbus.EventBus` is
+    constructed here unconditionally -- including under ``no_peering``,
+    since a ``watch`` client on an unpeered instance still needs
+    ``attach``/``detach``/``lock_state``/``name_set``/``name_clear``
+    (sprint.md's SUC-001) -- and handed to ``api``/``remote_api`` (their
+    own ``eventbus`` parameter, so ``_api_base.BaseAPIServer._op_watch``/
+    ``_handle_watch`` have a real bus to subscribe against on either
+    transport) and to ``peer_discovery`` (so its own ``peer_up``/
+    ``peer_down`` publish, sourced from ``_on_peer_reachable``/
+    ``_on_peer_unreachable``, reaches the same bus -- see
+    ``registry.peering``'s own module docstring).
+
+    Per sprint.md's Decision 3, the fan-out itself -- "publish to the bus
+    *and*, only when peering is on, also call the matching
+    ``PeerDiscovery.publish_*``" -- lives in the four small closures just
+    below, not as new multi-subscriber support inside
+    ``Daemon``/``LockManager``/``_api_base`` (which keeps each of those
+    three modules at exactly the single injected callback they already
+    had). Each closure builds the identical wire-shaped event dict
+    ``peer_discovery.publish_*`` would send over PUB, via the pure
+    payload-builder functions ``registry.peering`` exports for exactly
+    this reason (``daemon_event_payload``/``lock_event_payload``/
+    ``name_set_payload``/``name_clear_payload``) -- so a ``watch``
+    subscriber sees the same event shape whether or not this host is
+    peering with anyone, and the two publishing paths (this bus, and
+    ``peer_discovery``'s own PUB send) can never drift apart on field
+    names. ``host_name`` mirrors ``PeerDiscovery.__init__``'s own
+    ``host if host is not None else _short_hostname()`` precedence
+    exactly, so the ``"host"`` field on a bus event matches what a real
+    ``PeerDiscovery`` would have advertised even when ``no_peering`` is
+    set and no ``PeerDiscovery`` exists to ask.
     """
     shared_lock = lock if lock is not None else threading.RLock()
+    eventbus = EventBus()
+    host_name = peering_host if peering_host is not None else _short_hostname()
 
     # Sprint 007, ticket 005: --no-peering skips this construction
     # entirely -- see this function's own no_peering docstring note.
@@ -678,7 +747,41 @@ def assemble_registry(
             lock=shared_lock,
             zeroconf=zeroconf,
             zmq=zmq,
+            eventbus=eventbus,
         )
+
+    def _event_callback(event_type: str, record: Any) -> None:
+        payload = daemon_event_payload(event_type, record)
+        if payload is not None:
+            eventbus.publish({"type": event_type, "host": host_name, **payload})
+        if peer_discovery is not None:
+            peer_discovery.publish_daemon_event(event_type, record)
+
+    def _lock_display_callback(uid: str, kind: str | None, display: str | None) -> None:
+        eventbus.publish(
+            {
+                "type": EVENT_LOCK_STATE,
+                "host": host_name,
+                **lock_event_payload(uid, kind, display),
+            }
+        )
+        if peer_discovery is not None:
+            peer_discovery.publish_lock_event(uid, kind, display)
+
+    def _name_set_callback(entry: Any) -> None:
+        eventbus.publish(
+            {"type": EVENT_NAME_SET, "host": host_name, **name_set_payload(entry)}
+        )
+        if peer_discovery is not None:
+            peer_discovery.publish_name_set(entry)
+
+    def _name_clear_callback(name: str) -> None:
+        eventbus.publish(
+            {"type": EVENT_NAME_CLEAR, "host": host_name, **name_clear_payload(name)}
+        )
+        if peer_discovery is not None:
+            peer_discovery.publish_name_clear(name)
+
     daemon, api = assemble_daemon_and_api(
         store=store,
         usbwatch=usbwatch,
@@ -689,20 +792,14 @@ def assemble_registry(
         peer_pid_fn=peer_pid_fn,
         flash_runner=flash_runner,
         lock=shared_lock,
-        event_callback=(
-            peer_discovery.publish_daemon_event if peer_discovery is not None else None
-        ),
-        lock_display_callback=(
-            peer_discovery.publish_lock_event if peer_discovery is not None else None
-        ),
-        name_set_callback=(
-            peer_discovery.publish_name_set if peer_discovery is not None else None
-        ),
-        name_clear_callback=(
-            peer_discovery.publish_name_clear if peer_discovery is not None else None
-        ),
+        event_callback=_event_callback,
+        lock_display_callback=_lock_display_callback,
+        name_set_callback=_name_set_callback,
+        name_clear_callback=_name_clear_callback,
         claim_fn=claim_fn,
+        chip_identity_session_factory=chip_identity_session_factory,
         pipe_name=pipe_name,
+        eventbus=eventbus,
     )
     remote_api = RemoteAPIServer(
         host=remote_host,
@@ -712,6 +809,7 @@ def assemble_registry(
         auth_token=auth_token,
         lock=shared_lock,
         serial_factory=stream_serial_factory,
+        eventbus=eventbus,
     )
     return daemon, api, remote_api, peer_discovery
 

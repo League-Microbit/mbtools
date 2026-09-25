@@ -32,6 +32,7 @@ from mbtools.common import (
     CODE_NOT_LOCKED,
 )
 from mbtools.registry.api import RegistryAPIServer, default_peer_pid
+from mbtools.registry.eventbus import EventBus
 from mbtools.registry.flash import FlashOp
 from mbtools.registry.identity import ProbeResult
 from mbtools.registry.locks import KIND_FLASH, KIND_SERIAL, HolderRef, LockManager
@@ -201,7 +202,7 @@ def make_server(socket_dir, store, locks):
     servers = []
 
     def _make(*, runner=None, peer_pid_fn=None, is_pid_alive_fn=None, sweep_interval_s=100.0,
-              name_set_callback=None, name_clear_callback=None):
+              name_set_callback=None, name_clear_callback=None, eventbus=None):
         flash_op = FlashOp(locks=locks, store=store, runner=runner if runner is not None else _SpyRunner())
         srv = RegistryAPIServer(
             socket_path=f"{socket_dir}/api.sock",
@@ -213,6 +214,7 @@ def make_server(socket_dir, store, locks):
             sweep_interval_s=sweep_interval_s,
             name_set_callback=name_set_callback,
             name_clear_callback=name_clear_callback,
+            eventbus=eventbus,
         )
         srv.start()
         servers.append(srv)
@@ -794,6 +796,107 @@ def test_unknown_op_returns_invalid_request(make_server):
     assert resp["ok"] is False
     assert resp["code"] == CODE_INVALID_REQUEST
     client.close()
+
+
+# ---------------------------------------------------------------------------
+# watch (sprint 008, ticket 001)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.requires_af_unix
+def test_watch_acks_then_streams_published_events_in_order(make_server):
+    bus = EventBus()
+    srv = make_server(eventbus=bus)
+    client = _Client(srv.socket_path)
+
+    ack = client.request({"op": "watch"})
+    assert ack == {"ok": True}
+
+    event1 = {"type": "attach", "uid": UID, "port": "/dev/ttyACM0", "vid_pid": VID_PID}
+    event2 = {"type": "lock_state", "uid": UID, "kind": "serial", "display": "pid 1"}
+    bus.publish(event1)
+    bus.publish(event2)
+
+    assert client.recv() == event1
+    assert client.recv() == event2
+    client.close()
+
+
+@pytest.mark.requires_af_unix
+def test_watch_fans_out_to_every_connected_watcher(make_server):
+    bus = EventBus()
+    srv = make_server(eventbus=bus)
+    watcher_a = _Client(srv.socket_path)
+    watcher_b = _Client(srv.socket_path)
+    assert watcher_a.request({"op": "watch"}) == {"ok": True}
+    assert watcher_b.request({"op": "watch"}) == {"ok": True}
+
+    event = {"type": "detach", "uid": UID}
+    bus.publish(event)
+
+    assert watcher_a.recv() == event
+    assert watcher_b.recv() == event
+    watcher_a.close()
+    watcher_b.close()
+
+
+@pytest.mark.requires_af_unix
+def test_watch_sees_no_snapshot_only_events_published_after_subscribing(make_server):
+    bus = EventBus()
+    srv = make_server(eventbus=bus)
+    # Published before any watch client connects -- must never be delivered.
+    bus.publish({"type": "attach", "uid": "before-watch"})
+
+    client = _Client(srv.socket_path)
+    assert client.request({"op": "watch"}) == {"ok": True}
+
+    after = {"type": "attach", "uid": "after-watch"}
+    bus.publish(after)
+
+    assert client.recv() == after
+    client.close()
+
+
+@pytest.mark.requires_af_unix
+def test_watch_client_disconnect_cleanly_unsubscribes(make_server):
+    """No leaked queue, no exception on the next publish() -- this
+    ticket's own acceptance criterion. The connection's own write is
+    what notices a disconnect (this handler thread is otherwise parked
+    on the subscriber queue, exactly like a real ``watch`` client with
+    nothing new to report) -- publishing after close is what surfaces
+    that, and must neither raise for the publisher nor leave the queue
+    subscribed afterwards.
+    """
+    bus = EventBus()
+    srv = make_server(eventbus=bus)
+    client = _Client(srv.socket_path)
+    assert client.request({"op": "watch"}) == {"ok": True}
+
+    client.close()
+    bus.publish({"type": "attach", "uid": "after-close"})  # must not raise
+
+    def _no_subscribers_left():
+        with bus._lock:
+            return len(bus._subscribers) == 0
+
+    _wait_until(_no_subscribers_left)
+
+
+@pytest.mark.requires_af_unix
+def test_watch_does_not_block_other_clients_from_being_served(make_server):
+    """A watch connection parks its own handler thread forever (by
+    design) -- an ordinary client on a separate connection must still be
+    served normally."""
+    srv = make_server()
+    watcher = _Client(srv.socket_path)
+    assert watcher.request({"op": "watch"}) == {"ok": True}
+
+    other = _Client(srv.socket_path)
+    resp = other.request({"op": "list"})
+    assert resp["ok"] is True
+
+    watcher.close()
+    other.close()
 
 
 # ---------------------------------------------------------------------------

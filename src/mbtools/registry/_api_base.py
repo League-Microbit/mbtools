@@ -66,6 +66,7 @@ from mbtools.common import (
     CODE_NOT_FOUND,
     CODE_NOT_LOCKED,
 )
+from mbtools.registry.eventbus import EventBus
 from mbtools.registry.locks import (
     KIND_FLASH,
     LOCK_KINDS,
@@ -154,6 +155,18 @@ class BaseAPIServer:
     #: ``Store`` owning one itself).
     _name_set_callback: "Callable[[Entry], None] | None" = None
     _name_clear_callback: "Callable[[str], None] | None" = None
+
+    #: Sprint 008 ticket 001: the always-present event fan-out ``watch``
+    #: subscribes to (see :meth:`_op_watch`/:meth:`_handle_watch`). Every
+    #: concrete subclass constructs one (``api.RegistryAPIServer``/
+    #: ``remote_api.RemoteAPIServer``'s own ``eventbus`` constructor
+    #: parameter, defaulting to a private instance of its own when
+    #: omitted, mirroring this mixin's existing ``lock``-parameter
+    #: convention) -- no default here, since unlike
+    #: ``_name_set_callback``/``_name_clear_callback`` (optional
+    #: replication hooks that are fine to leave unwired), ``watch`` has
+    #: nothing to dispatch into without a real bus.
+    _eventbus: EventBus
 
     # -- hooks a concrete subclass provides -------------------------------
 
@@ -269,6 +282,48 @@ class BaseAPIServer:
                 return err
             assert record is not None
             return {"ok": True, "device": self._device_dict(record)}
+
+    def _op_watch(self) -> dict[str, Any]:
+        """``watch()`` (sprint 008 ticket 001): the request/ack half only
+        -- no precondition to check (unlike ``lock``/``unlock``, every
+        connection may watch), so this always succeeds. A concrete
+        subclass's dispatch writes this response, then hands the
+        connection to :meth:`_handle_watch` instead of returning to read
+        further request lines, exactly the way ``remote_api
+        .RemoteAPIServer``'s ``stream`` op already switches a connection
+        out of ordinary request/response dispatch (see that module's own
+        "Protocol synchronization note").
+        """
+        return {"ok": True}
+
+    def _handle_watch(self, wfile: Any) -> None:
+        """``watch``'s data half: subscribe to :attr:`_eventbus` and
+        write every event it produces to ``wfile``, one JSON line each,
+        until the connection breaks or is closed from the other end.
+
+        Change-only, per the stakeholder decision recorded in
+        sprint.md's Open Questions -- no snapshot is sent on subscribe,
+        only events published *after* this call subscribes (``list`` is
+        this protocol's own point-in-time snapshot call; a client that
+        wants both calls ``list`` first, then ``watch``, per
+        ``docs/design/robot-console-integration.md`` §3.1's own two-step
+        sequence).
+
+        Always unsubscribes in a ``finally``, whether this method exits
+        because writing to ``wfile`` failed (the client disconnected) or
+        because of some other I/O error -- an ``EventBus`` subscriber
+        that a broken connection never explicitly removes is exactly the
+        "leaked queue" this ticket's acceptance criteria rule out.
+        """
+        q = self._eventbus.subscribe()
+        try:
+            while True:
+                event = q.get()
+                self._write(wfile, event)
+        except (OSError, ConnectionError):
+            pass
+        finally:
+            self._eventbus.unsubscribe(q)
 
     def _op_lock(
         self, req: dict[str, Any], holder: HolderRef, acquired_uids: set[str]

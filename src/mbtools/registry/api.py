@@ -16,10 +16,14 @@ down here since it becomes sprint 002's de facto contract; see also
 socket, one connection per client session. Each request line is a JSON
 object with an ``"op"`` field (``list``/``get``/``find``/``lock``/
 ``unlock``/``flash``/``mark_flashed``/``names_get``/``names_set``/
-``names_clear``/``names_list`` -- the last four, sprint 004 ticket 005,
-are ``BaseAPIServer``'s name-registry ops, not scoped to a device at all);
-each non-streaming op writes exactly one JSON
-response line. ``flash`` is the one streaming op: zero or more
+``names_clear``/``names_list``/``watch`` -- the middle four, sprint 004
+ticket 005, are ``BaseAPIServer``'s name-registry ops, not scoped to a
+device at all; ``watch``, sprint 008 ticket 001, is the other one this
+class doesn't own the mechanics of -- see ``_api_base.BaseAPIServer
+._op_watch``/``_handle_watch``); each non-streaming op writes exactly one
+JSON response line, except ``watch`` (an ``ok`` acknowledgement followed
+by one JSON line per subsequent event, for as long as the connection
+stays open -- never a "final" line). ``flash`` is the one streaming op: zero or more
 ``{"type": "log", "line": ...}`` lines (relayed from
 :meth:`~mbtools.registry.flash.FlashOp.flash_hex`'s log callback as they
 arrive, not buffered) followed by exactly one
@@ -110,6 +114,7 @@ from typing import Any, Callable
 
 from mbtools.common import CODE_INVALID_REQUEST, CODE_NOT_FOUND, CODE_NOT_LOCKED
 from mbtools.registry._api_base import BaseAPIServer, _error
+from mbtools.registry.eventbus import EventBus
 from mbtools.registry.flash import FlashOp, HexValidationError
 from mbtools.registry.locks import KIND_FLASH, HolderRef, LockManager
 from mbtools.registry.paths import default_socket_path
@@ -305,6 +310,7 @@ class RegistryAPIServer(BaseAPIServer):
         lock: threading.RLock | None = None,
         name_set_callback: Callable[[Entry], None] | None = None,
         name_clear_callback: Callable[[str], None] | None = None,
+        eventbus: EventBus | None = None,
     ) -> None:
         self.socket_path = Path(socket_path)
         self._store = store
@@ -323,6 +329,14 @@ class RegistryAPIServer(BaseAPIServer):
         # test that constructs one directly, unaffected.
         self._name_set_callback = name_set_callback
         self._name_clear_callback = name_clear_callback
+        # Sprint 008 ticket 001: the ``watch`` op's event source
+        # (``_api_base.BaseAPIServer._op_watch``/``_handle_watch``) --
+        # ``registry.cli``'s assembly always passes the one ``EventBus``
+        # it constructs for the whole daemon pipeline; a bare
+        # ``RegistryAPIServer`` (every pre-ticket test) gets a private
+        # instance of its own, mirroring ``lock``'s own default-when-
+        # omitted convention just below.
+        self._eventbus = eventbus if eventbus is not None else EventBus()
 
         self._lock = lock if lock is not None else threading.RLock()
         self._stop_event = threading.Event()
@@ -519,7 +533,15 @@ class RegistryAPIServer(BaseAPIServer):
                 line = raw_line.strip()
                 if not line:
                     continue
-                self._dispatch_line(line, pid, holder, acquired_uids, wfile)
+                if self._dispatch_line(line, pid, holder, acquired_uids, wfile):
+                    # Sprint 008 ticket 001: ``watch`` was accepted --
+                    # this connection leaves ordinary request/response
+                    # dispatch for the rest of its life (mirrors
+                    # remote_api.RemoteAPIServer's own "stream" handoff);
+                    # nothing here goes back to reading JSON request
+                    # lines from `rfile` after this.
+                    self._handle_watch(wfile)
+                    break
         except (ConnectionError, OSError):
             pass
         finally:
@@ -546,15 +568,25 @@ class RegistryAPIServer(BaseAPIServer):
         holder: HolderRef,
         acquired_uids: set[str],
         wfile: Any,
-    ) -> None:
+    ) -> bool:
+        """Dispatch one JSON request line and write its response.
+
+        Returns ``True`` only for a successfully-accepted ``watch``
+        (sprint 008 ticket 001) -- the caller (:meth:`_handle_connection`)
+        uses that to know it must stop reading further JSON request
+        lines and hand the connection to :meth:`_handle_watch` instead,
+        mirroring how ``remote_api.RemoteAPIServer._dispatch_line``'s own
+        non-``None`` return signals the same handoff for ``stream``.
+        Every other op returns ``False``.
+        """
         try:
             req = json.loads(line)
         except json.JSONDecodeError:
             self._write(wfile, _error(CODE_INVALID_REQUEST, "malformed JSON request"))
-            return
+            return False
         if not isinstance(req, dict):
             self._write(wfile, _error(CODE_INVALID_REQUEST, "request must be a JSON object"))
-            return
+            return False
 
         op = req.get("op")
         if op == "list":
@@ -577,9 +609,14 @@ class RegistryAPIServer(BaseAPIServer):
             resp = self._op_names_clear(req)
         elif op == "names_list":
             resp = self._op_names_list(req)
+        elif op == "watch":
+            resp = self._op_watch()
+            self._write(wfile, resp)
+            return True
         else:
             resp = _error(CODE_INVALID_REQUEST, f"unknown op {op!r}")
         self._write(wfile, resp)
+        return False
 
     # -- ops --------------------------------------------------------------
     #

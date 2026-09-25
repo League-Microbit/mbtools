@@ -107,6 +107,20 @@ would not be seen by the socket-level reader that follows. A client that
 already waits for each op's response before sending the next thing --
 true of every op this protocol has -- satisfies this for free.
 
+**The ``watch`` op (sprint 008, ticket 001)**: any connection may send
+``{"op": "watch"}`` -- no lock or other precondition required. On
+success (``{"ok": true}``), the connection leaves ordinary
+request/response dispatch for the rest of its life, exactly like
+``stream`` above, and instead receives one JSON line per event published
+on :attr:`RemoteAPIServer._eventbus` (subscribed at that moment; no
+snapshot of already-connected devices is sent -- see
+``_api_base.BaseAPIServer._handle_watch``'s own docstring for the
+change-only rationale) until the connection closes. This is the same
+shared mechanism ``api.RegistryAPIServer``'s local socket uses -- see
+that module's own docstring -- so a Node client (robot-console) gets
+change notifications without linking ``pyzmq`` or knowing this
+registry's PUB port, on either transport.
+
 **Remote flash and hex staging (sprint 003, ticket 008)**: a connection
 that already holds a ``flash``-kind lock on ``uid`` (via this same
 connection's own ``lock`` call -- checked via :class:`HolderRef` equality,
@@ -165,6 +179,7 @@ from uuid import uuid4
 
 from mbtools.common import CODE_INVALID_REQUEST, CODE_NOT_LOCKED, CODE_UNAUTHORIZED
 from mbtools.registry._api_base import BaseAPIServer, _error
+from mbtools.registry.eventbus import EventBus
 from mbtools.registry.flashlogic import flash_hex
 from mbtools.registry.locks import KIND_FLASH, KIND_RELAY, KIND_SERIAL, HolderRef, LockManager
 from mbtools.registry.store import DeviceRecord, Store
@@ -194,6 +209,13 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+
+#: Sprint 008 ticket 001: ``_dispatch_line``'s sentinel return value for a
+#: successfully-accepted ``watch`` -- distinct from ``None`` (every
+#: ordinary op) and from a real ``DeviceRecord`` (a successfully-accepted
+#: ``stream``), so ``_handle_connection`` can tell the three apart and
+#: hand the connection to the right handler.
+_WATCH = object()
 
 #: Production default TCP port (sprint.md Decision 7), all configurable.
 DEFAULT_REMOTE_PORT = 7440
@@ -274,6 +296,7 @@ class RemoteAPIServer(BaseAPIServer):
         stream_baud: int = BAUD_RATE,
         stream_settle_s: float | None = None,
         break_duration_s: float = BREAK_DURATION,
+        eventbus: EventBus | None = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -281,6 +304,11 @@ class RemoteAPIServer(BaseAPIServer):
         self._locks = locks
         self._auth_token = auth_token
         self._sweep_interval_s = sweep_interval_s
+        # Sprint 008 ticket 001: same "watch" event source as
+        # api.RegistryAPIServer's own eventbus parameter -- see that
+        # class's own docstring note for the default-when-omitted
+        # convention this mirrors.
+        self._eventbus = eventbus if eventbus is not None else EventBus()
         self._serial_factory = serial_factory
         self._stream_baud = stream_baud
         self._stream_settle = OPEN_SETTLE if stream_settle_s is None else stream_settle_s
@@ -481,6 +509,7 @@ class RemoteAPIServer(BaseAPIServer):
         try:
             authenticated = self._auth_token is None
             stream_record: DeviceRecord | None = None
+            watch_requested = False
             for raw_line in rfile:
                 line = raw_line.strip()
                 if not line:
@@ -490,17 +519,28 @@ class RemoteAPIServer(BaseAPIServer):
                     if not authenticated:
                         break
                     continue
-                stream_record = self._dispatch_line(
+                result = self._dispatch_line(
                     line, holder, acquired_uids, uploaded_hex_paths, wfile
                 )
-                if stream_record is not None:
+                if result is _WATCH:
+                    # sprint 008 ticket 001: "watch" was accepted -- same
+                    # "leaves ordinary request/response dispatch for the
+                    # rest of this connection's life" handoff "stream"
+                    # already uses, just to a JSON-lines event feed
+                    # instead of the binary frame sub-protocol.
+                    watch_requested = True
+                    break
+                if result is not None:
+                    stream_record = result
                     # ticket 007: "stream" was accepted -- the connection
                     # leaves newline-JSON framing for the rest of its
                     # life (module docstring's own note); nothing here
                     # goes back to reading JSON lines from `rfile` after
                     # this, ever, on any exit path.
                     break
-            if stream_record is not None:
+            if watch_requested:
+                self._handle_watch(wfile)
+            elif stream_record is not None:
                 self._handle_stream(conn, holder, acquired_uids, stream_record)
         except (ConnectionError, OSError):
             pass
@@ -560,15 +600,17 @@ class RemoteAPIServer(BaseAPIServer):
         acquired_uids: set[str],
         uploaded_hex_paths: set[str],
         wfile: Any,
-    ) -> DeviceRecord | None:
+    ) -> DeviceRecord | object | None:
         """Dispatch one JSON request line and write its response.
 
-        Returns ``None`` for every op except a successfully-accepted
-        ``stream`` (ticket 007), which returns the resolved
-        :class:`~mbtools.registry.store.DeviceRecord` to stream -- the
-        caller (:meth:`_handle_connection`) uses a non-``None`` return to
-        know it must stop reading JSON lines and hand the connection to
-        :meth:`_handle_stream` instead.
+        Returns ``None`` for every ordinary op; a successfully-accepted
+        ``stream`` (ticket 007) returns the resolved
+        :class:`~mbtools.registry.store.DeviceRecord` to stream; a
+        successfully-accepted ``watch`` (sprint 008 ticket 001) returns
+        the module-level :data:`_WATCH` sentinel. Either non-``None``
+        return tells the caller (:meth:`_handle_connection`) to stop
+        reading further JSON lines and hand the connection to
+        :meth:`_handle_stream`/:meth:`_handle_watch` respectively.
         """
         try:
             req = json.loads(line)
@@ -598,6 +640,10 @@ class RemoteAPIServer(BaseAPIServer):
             resp, record = self._op_stream_precheck(req, holder)
             self._write(wfile, resp)
             return record
+        elif op == "watch":
+            resp = self._op_watch()
+            self._write(wfile, resp)
+            return _WATCH
         else:
             resp = _error(CODE_INVALID_REQUEST, f"unknown op {op!r}")
         self._write(wfile, resp)
