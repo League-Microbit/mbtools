@@ -191,6 +191,34 @@ platform... is unresolved"), out of a hardware-acceptance ticket's
 scope to decide unilaterally. See `docs/acceptance/005-hardware.md`
 Scenario 3.
 
+**Known real-hardware quirk, not a code bug (ticket 007-007):** `meili`
+and `loki` were both found with a **second, stale `mbtools` install at
+`/opt/mbtools`** (built `0.20260924.4`, one build predating this
+sprint's own `scripts/deploy-host.sh` deploy) whose `/usr/local/bin/
+{mbregistry,mbdeploy,mbserial,mbrelay}` symlinks — not this project's
+own deploy tooling, which never touches `/opt/mbtools` or
+`/usr/local/bin` — take priority on `$PATH` over `~/mbtools-venv`
+(`scripts/deploy-host.sh`'s own install target). The **daemon** is
+unaffected: `mbregistry service install`'s `ExecStart=` always points at
+whichever venv actually ran it, so `mbregistry.service` runs the fresh
+build regardless. But a **bare client command** (`mbregistry list`, no
+explicit interpreter path) silently runs the *stale* `/opt/mbtools`
+build's own client-side code — including its own, pre-ticket-001
+`render_table`, which still prints a free-text `<name>: <error_note>`
+line after the table and renders any didn't-announce/known-blank state
+as plain `free`/role-text instead of `no-answer`/`unknown`. This looked
+exactly like a live rendering bug during this ticket's Scenario B until
+`which mbregistry`/`head -1 $(which mbregistry)` traced it to
+`/opt/mbtools`'s own separate venv — the daemon's `--json` output was
+correct the whole time. Fixed on `meili`/`loki` this session by
+re-`ln -sf`-ing `/usr/local/bin/{mbregistry,mbdeploy,mbserial,mbrelay}`
+to `~/mbtools-venv/bin/...`; not checked/fixed on `hodr`/`magni`/
+`braeburn` (not touched this session) — **run `head -1 $(which
+mbregistry)` on any host before trusting a bare CLI command's output**,
+and re-point the symlinks the same way if it doesn't say
+`~/mbtools-venv`. See `docs/acceptance/006-hardware.md` Scenario B for
+the full trace.
+
 ## Firmware for tests (GitHub release assets — use `MICROBIT.hex`)
 
 | Firmware | Repo | Announces as |
