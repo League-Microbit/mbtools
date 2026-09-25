@@ -1,5 +1,11 @@
 ---
-status: pending
+status: in-progress
+sprint: '007'
+tickets:
+- 007-001
+- 007-003
+- 007-006
+- 007-007
 ---
 
 # Name silent boards over SWD, and show "no announcement" in the STATE column
