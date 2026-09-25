@@ -79,6 +79,7 @@ from mbtools.registry.console_compat.relay_pool import (
     DEFAULT_POOL_PORT,
     RelayPool,
 )
+from mbtools.registry.claims import build_claim_fn
 from mbtools.registry.daemon import DEFAULT_INTERVAL_S, Daemon
 from mbtools.registry.flash import FlashOp
 from mbtools.registry.peering import (
@@ -327,6 +328,7 @@ def assemble_daemon_and_api(
     lock_display_callback: Any = None,
     name_set_callback: Any = None,
     name_clear_callback: Any = None,
+    claim_fn: Any = None,
 ) -> tuple[Daemon, RegistryAPIServer | WindowsPipeAPIServer]:
     """Build one :class:`Daemon` and one local-API server that share a
     single ``threading.RLock`` -- ticket 009's fix for the cross-module
@@ -390,6 +392,17 @@ def assemble_daemon_and_api(
     ``PeerDiscovery.publish_name_set``/``publish_name_clear`` here. Both
     default to ``None`` (no-op), unaffected for every pre-ticket-005
     caller/test.
+
+    ``claim_fn`` (sprint 007, ticket 002) is forwarded verbatim to
+    :class:`Daemon`'s own ``claim_fn`` -- see that class's module
+    docstring's "Cross-instance claim" note. Left ``None`` here (this
+    function's own default), a bare :func:`assemble_daemon_and_api` call
+    gets :class:`Daemon`'s own filesystem-free no-op default -- real,
+    cross-instance claim enforcement is wired only by
+    :func:`_run_registry`, which always passes a real
+    :func:`mbtools.registry.claims.build_claim_fn` result through
+    :func:`assemble_registry` below. Every pre-ticket-002 caller/test that
+    omits it is unaffected.
     """
     shared_lock = lock if lock is not None else threading.RLock()
     daemon = Daemon(
@@ -401,6 +414,7 @@ def assemble_daemon_and_api(
         lock=shared_lock,
         event_callback=event_callback,
         lock_display_callback=lock_display_callback,
+        claim_fn=claim_fn,
     )
     api: RegistryAPIServer | WindowsPipeAPIServer
     if sys.platform == "win32":
@@ -449,6 +463,7 @@ def assemble_registry(
     zmq: Any = None,
     stream_serial_factory: Any = None,
     lock: threading.RLock | None = None,
+    claim_fn: Any = None,
 ) -> tuple[Daemon, RegistryAPIServer | WindowsPipeAPIServer, RemoteAPIServer, PeerDiscovery]:
     """Ticket 009's real assembly: everything :func:`assemble_daemon_and_api`
     already builds, *plus* a :class:`~mbtools.registry.remote_api.RemoteAPIServer`
@@ -515,6 +530,13 @@ def assemble_registry(
     this function's own 4-tuple return would break every existing caller
     that unpacks it).
 
+    ``claim_fn`` (sprint 007, ticket 002) is forwarded verbatim to
+    :func:`assemble_daemon_and_api` -- see that function's own ``claim_fn``
+    docstring note. :func:`_run_registry` always passes a real
+    :func:`mbtools.registry.claims.build_claim_fn` result here; every
+    other/earlier caller/test that omits it gets :class:`Daemon`'s own
+    no-op default, unaffected.
+
     Callers do not start or stop any of the four returned objects --
     that stays their own responsibility, matching
     :func:`assemble_daemon_and_api`'s own convention. Shutdown order
@@ -553,6 +575,7 @@ def assemble_registry(
         lock_display_callback=peer_discovery.publish_lock_event,
         name_set_callback=peer_discovery.publish_name_set,
         name_clear_callback=peer_discovery.publish_name_clear,
+        claim_fn=claim_fn,
     )
     remote_api = RemoteAPIServer(
         host=remote_host,
@@ -759,6 +782,13 @@ def _run_registry(args: argparse.Namespace, stop_event: threading.Event) -> int:
 
     store = Store(db_path)
     shared_lock = threading.RLock()
+    # Sprint 007, ticket 002: always wire the real cross-instance claim
+    # (registry.claims.try_claim, through build_claim_fn's --only-uid/
+    # --exclude-uid filter) for a real `mbregistry run` -- unconditionally,
+    # not only when --only-uid/--exclude-uid are given, since two
+    # instances on one host must never both claim a board whether or not
+    # an operator has partitioned uids explicitly (SUC-005).
+    claim_fn = build_claim_fn(only_uids=args.only_uid, exclude_uids=args.exclude_uid)
     daemon, api, remote_api, peering = assemble_registry(
         store=store,
         usbwatch=PollingPortWatcher(),
@@ -768,6 +798,7 @@ def _run_registry(args: argparse.Namespace, stop_event: threading.Event) -> int:
         peer_snapshot_port=peer_snapshot_port,
         auth_token=auth_token,
         lock=shared_lock,
+        claim_fn=claim_fn,
     )
 
     # Sprint 004 ticket 006: the robot-console-compatibility pool port,
@@ -1147,6 +1178,21 @@ def build_parser() -> argparse.ArgumentParser:
             "(_mbrelay._tcp) -- set this on a host with no local relay "
             "hardware"
         ),
+    )
+    run_p.add_argument(
+        "--only-uid",
+        action="append",
+        metavar="UID",
+        help=(
+            "only ever claim/probe this uid (repeatable); default: no "
+            "restriction -- claim any uid this instance can win"
+        ),
+    )
+    run_p.add_argument(
+        "--exclude-uid",
+        action="append",
+        metavar="UID",
+        help="never claim/probe this uid (repeatable)",
     )
     run_p.set_defaults(func=cmd_run)
 

@@ -15,6 +15,7 @@ from collections import deque
 import pytest
 
 from mbtools.common import DAPLINK_VID_PID, PortInfo
+from mbtools.registry import claims
 from mbtools.registry.daemon import Daemon
 from mbtools.registry.locks import KIND_FLASH, KIND_SERIAL, HolderRef
 from mbtools.registry.store import (
@@ -552,3 +553,195 @@ def test_flash_pending_reprobe_resets_the_board(store, announcement):
 
     assert script.calls == 2
     assert script.fakes[1].break_calls == [BREAK_DURATION]
+
+
+# ---------------------------------------------------------------------------
+# cross-instance claim gating (sprint 007, ticket 002) -- every test above
+# this section relies on Daemon's own bare claim_fn default (a filesystem-
+# free no-op that always grants the claim, per daemon.py's "Cross-instance
+# claim" docstring note), so none of them are affected by this section at
+# all. These tests inject a fake claim_fn instead, matching the ticket's
+# own "tests can fake claim outcomes... when more convenient than tmp_path"
+# testing note -- no real filesystem touched here. See
+# test_daemon_claims_integration.py for the real-claims.try_claim,
+# tmp_path-backed, two-Daemon/Store-pair version of this same guarantee.
+# ---------------------------------------------------------------------------
+
+
+class _FakeClaimHandle:
+    def __init__(self, on_release=None):
+        self._on_release = on_release
+        self.released = False
+
+    def release(self) -> None:
+        self.released = True
+        if self._on_release is not None:
+            self._on_release()
+
+
+def test_denied_claim_never_upserts_the_uid(store):
+    usbwatch = FakeUSBSource([[_port_info()]])  # repeats once exhausted
+    script = _ProbeScript([ANNOUNCEMENT])
+    calls: list[str] = []
+
+    def deny(uid: str):
+        calls.append(uid)
+        return None
+
+    daemon = _make_daemon(usbwatch, store, script, claim_fn=deny)
+
+    daemon.run_once()
+
+    assert store.get(UID) is None
+    assert script.calls == 0
+    assert calls == [UID]
+
+
+def test_denied_claim_is_retried_on_a_later_cycle_with_no_extra_bookkeeping(store):
+    usbwatch = FakeUSBSource([[_port_info()]])  # repeats
+    script = _ProbeScript([ANNOUNCEMENT])
+    calls: list[str] = []
+
+    def deny(uid: str):
+        calls.append(uid)
+        return None
+
+    daemon = _make_daemon(usbwatch, store, script, claim_fn=deny)
+
+    daemon.run_once()
+    daemon.run_once()
+    daemon.run_once()
+
+    assert store.get(UID) is None
+    assert calls == [UID, UID, UID]  # tried again every cycle, unconditionally
+
+
+def test_claim_recovers_once_it_becomes_available_on_a_later_cycle(store):
+    usbwatch = FakeUSBSource([[_port_info()]])  # repeats
+    script = _ProbeScript([ANNOUNCEMENT])
+    outcomes = iter([None, None, _FakeClaimHandle()])
+
+    daemon = _make_daemon(
+        usbwatch, store, script, claim_fn=lambda uid: next(outcomes)
+    )
+
+    daemon.run_once()  # denied
+    daemon.run_once()  # denied
+    assert store.get(UID) is None
+
+    daemon.run_once()  # granted this cycle -- upserted and probed in the same cycle
+
+    assert store.get(UID) is not None
+    assert script.calls == 1
+    assert store.get(UID).state == STATE_CONNECTED
+
+
+def test_granted_claim_is_released_on_detach(store):
+    usbwatch = FakeUSBSource([[_port_info()], []])
+    script = _ProbeScript([ANNOUNCEMENT])
+    handle = _FakeClaimHandle()
+    daemon = _make_daemon(usbwatch, store, script, claim_fn=lambda uid: handle)
+
+    daemon.run_once()  # attach -- claim granted
+    assert handle.released is False
+
+    daemon.run_once()  # detach
+
+    assert handle.released is True
+    assert store.get(UID).state == STATE_DISCONNECTED
+
+
+def test_granted_claim_is_never_released_while_still_attached(store):
+    usbwatch = FakeUSBSource([[_port_info()]])  # repeats -- never detaches
+    script = _ProbeScript([ANNOUNCEMENT])
+    handle = _FakeClaimHandle()
+    daemon = _make_daemon(usbwatch, store, script, claim_fn=lambda uid: handle)
+
+    daemon.run_once()
+    daemon.run_once()
+    daemon.run_once()
+
+    assert handle.released is False
+
+
+def test_claim_fn_is_called_at_most_once_per_attach_not_once_per_cycle(store):
+    usbwatch = FakeUSBSource([[_port_info()]])  # repeats -- stays attached
+    script = _ProbeScript([ANNOUNCEMENT])
+    calls: list[str] = []
+
+    def grant(uid: str):
+        calls.append(uid)
+        return _FakeClaimHandle()
+
+    daemon = _make_daemon(usbwatch, store, script, claim_fn=grant)
+
+    daemon.run_once()
+    daemon.run_once()
+    daemon.run_once()
+
+    assert calls == [UID]  # only re-attempted on a genuinely new attach
+
+
+def test_default_claim_fn_grants_every_uid_with_no_filesystem_access(store):
+    """Daemon's own bare default (no claim_fn given at all) -- the same
+    default every pre-ticket-002 test above this section already relies
+    on implicitly. Made explicit here as its own test."""
+    usbwatch = FakeUSBSource([[_port_info()]])
+    script = _ProbeScript([ANNOUNCEMENT])
+    daemon = _make_daemon(usbwatch, store, script)  # no claim_fn
+
+    daemon.run_once()
+
+    assert store.get(UID) is not None
+    assert store.get(UID).state == STATE_CONNECTED
+
+
+# ---------------------------------------------------------------------------
+# real cross-instance contention against a shared, real (tmp_path-backed)
+# claims directory -- proves Daemon actually wires up
+# mbtools.registry.claims.try_claim correctly when a real claim_fn is
+# injected, not just a fake. Two independent Daemon/Store pairs, one
+# shared claims directory, one shared USB scan result -- exactly the
+# ticket's own "an unclaimed uid is never upsert_attached'd" acceptance
+# criterion, end to end.
+# ---------------------------------------------------------------------------
+
+
+def test_two_daemons_sharing_a_real_claims_dir_only_one_claims_the_uid(tmp_path):
+    claims_dir = tmp_path / "claims"
+    store_a = Store(tmp_path / "a" / "devices.db", now_fn=_store_clock())
+    store_b = Store(tmp_path / "b" / "devices.db", now_fn=_store_clock())
+
+    usbwatch_a = FakeUSBSource([[_port_info()]])  # repeats
+    usbwatch_b = FakeUSBSource([[_port_info()]])  # repeats -- same uid
+
+    daemon_a = Daemon(
+        usbwatch=usbwatch_a,
+        store=store_a,
+        serial_factory=_ProbeScript([ANNOUNCEMENT]),
+        probe_timeout_s=0.05,
+        settle_s=0,
+        claim_fn=lambda uid: claims.try_claim(uid, claims_dir=claims_dir),
+    )
+    daemon_b = Daemon(
+        usbwatch=usbwatch_b,
+        store=store_b,
+        serial_factory=_ProbeScript([ANNOUNCEMENT]),
+        probe_timeout_s=0.05,
+        settle_s=0,
+        claim_fn=lambda uid: claims.try_claim(uid, claims_dir=claims_dir),
+    )
+
+    daemon_a.run_once()
+    daemon_b.run_once()
+
+    a_has_it = store_a.get(UID) is not None
+    b_has_it = store_b.get(UID) is not None
+    assert a_has_it != b_has_it  # exactly one of the two claimed it
+
+    # The loser keeps retrying every cycle and still never gets it while
+    # the winner holds the claim.
+    daemon_a.run_once()
+    daemon_b.run_once()
+    assert (store_a.get(UID) is not None) == a_has_it
+    assert (store_b.get(UID) is not None) == b_has_it

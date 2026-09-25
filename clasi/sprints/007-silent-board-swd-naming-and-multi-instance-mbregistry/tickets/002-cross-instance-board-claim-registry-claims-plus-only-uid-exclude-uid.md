@@ -1,8 +1,9 @@
 ---
 id: '002'
-title: 'Cross-instance board claim (registry.claims) plus --only-uid/--exclude-uid'
-status: open
-use-cases: [SUC-005]
+title: Cross-instance board claim (registry.claims) plus --only-uid/--exclude-uid
+status: done
+use-cases:
+- SUC-005
 depends-on: []
 github-issue: ''
 issue: robot-console-on-mbregistry-multi-instance-and-spawn-support.md
@@ -65,29 +66,29 @@ claim, but decided locally rather than by contention).
 
 ## Acceptance Criteria
 
-- [ ] `registry.claims.try_claim`/release exist, with a real-filesystem
+- [x] `registry.claims.try_claim`/release exist, with a real-filesystem
       `tmp_path` test proving two independent claim attempts on the same
       uid (from two threads/processes) never both succeed.
-- [ ] A crashed/killed holder's claim becomes available to another
+- [x] A crashed/killed holder's claim becomes available to another
       claimant with no manual cleanup (verified by closing the holder's
       fd/process and re-attempting).
-- [ ] Windows path is an explicit, documented no-op that always
+- [x] Windows path is an explicit, documented no-op that always
       succeeds — not silently skipped, not raising `NotImplementedError`.
-- [ ] `registry.paths` gains a claims-directory helper following the
+- [x] `registry.paths` gains a claims-directory helper following the
       existing location-knowledge convention (see `system_db_path`/
       `user_db_path`/sprint 006's service-artifact helpers for the
       pattern to match).
-- [ ] `daemon.run_once` never calls `store.upsert_attached` for a uid
+- [x] `daemon.run_once` never calls `store.upsert_attached` for a uid
       whose claim attempt failed this cycle — a test using two
       `Daemon`/`Store` pairs sharing one fake claims directory proves a
       uid claimed by one `Daemon` never appears in the other's
       `list_devices()`.
-- [ ] A claim that fails this cycle is retried (not permanently given
+- [x] A claim that fails this cycle is retried (not permanently given
       up on) on a later cycle once it becomes available.
-- [ ] `--only-uid`/`--exclude-uid` are wired into the claim-check path
+- [x] `--only-uid`/`--exclude-uid` are wired into the claim-check path
       and covered by CLI tests, following the existing `--remote-port`-
       style flag test pattern.
-- [ ] No test in the automated suite touches a real board or a real
+- [x] No test in the automated suite touches a real board or a real
       probe — every claim test uses `tmp_path` and fake/simulated
       contention, matching the module's own "no real hardware in the
       automated suite" convention already established for
@@ -131,3 +132,113 @@ then wire it into `daemon.py`'s `run_once`, then add the CLI flags.
 
 **Documentation updates**: none in this ticket — ticket 006 covers docs
 for the whole sprint.
+
+## Implementation Notes
+
+- **New module `src/mbtools/registry/claims.py`**: `try_claim(uid, *,
+  claims_dir=None) -> ClaimHandle | None`, `ClaimHandle.release()`
+  (idempotent, also usable as a context manager), a free-function
+  `release(handle)`, `protect_fd(fd) -> bool` (best-effort `TIOCEXCL`,
+  Unix only — see below), `is_claimable(uid, *, only_uids=,
+  exclude_uids=)` (pure predicate), and `build_claim_fn(*, only_uids=,
+  exclude_uids=, claims_dir=)` (builds the `--only-uid`/`--exclude-uid`-
+  filtering closure `registry.cli` wires into `Daemon`). Unix: real
+  non-blocking `flock` on `<claims_dir>/<uid>.lock`. Windows: an explicit
+  no-op — `try_claim` returns a handle with no real fd and always
+  succeeds, checked before any filesystem access.
+- **`registry.paths.claims_dir_path()`**: `<tempfile.gettempdir()>/
+  mbtools/claims` (not `/tmp` literally, so a sandboxed run or a host
+  with `$TMPDIR` set differently still gets a writable location — the
+  same permission *model*, `0o1777` world-writable-sticky, sprint.md's
+  Open Question 4 asked for). Deliberately **one location for every
+  scope** (no `system_`/`user_` split unlike the db/socket helpers) —
+  a claim's entire point is being visible to every `mbregistry` process
+  on the host regardless of privilege level, so a root (`--system`) and
+  a user (`--user`) daemon must contend for the *same* file. This
+  resolves Open Question 4 as stated: one shared, world-writable-sticky
+  directory works for both.
+- **`TIOCEXCL` scoping decision**: `claims.protect_fd(fd)` exists and is
+  unit-tested (against a real `pty` pair) as its own standalone
+  capability, but is **not wired into any actual serial/SWD open call
+  site** by this ticket — no such call site is touched by this ticket's
+  own daemon wiring (only the pre-`upsert_attached` claim check is in
+  scope; the actual port open happens later, in `_maybe_probe` via
+  `identity.probe`, and ticket 003's SWD read opens a second session on
+  the same probe). Flagged explicitly for **ticket 003**: wire
+  `claims.protect_fd` onto the fd once `identity.probe`/the new SWD path
+  actually open the port, for the belt-and-suspenders protection the
+  ticket description calls for.
+- **`Daemon.claim_fn` default is a filesystem-free no-op, not
+  `claims.try_claim`** — a deliberate deviation from `serial_factory`'s
+  own precedent (whose default *does* reach for real hardware). Reasoning
+  in `daemon.py`'s own "Cross-instance claim" docstring note: a missing
+  `serial_factory` fails loudly (no port to open); a bare `Daemon(...)`
+  silently defaulting to real `claims.try_claim` against the real, host-
+  shared claims directory would instead succeed silently, and would have
+  broken every one of the ~23 pre-existing `test_daemon.py` tests'
+  isolation (they reuse the same fixed `UID` across many test functions
+  in one pytest process, several without ever detaching, which would
+  leak a real held `flock` across test functions). Real, cross-instance
+  enforcement is opt-in: `registry.cli._run_registry` always builds and
+  passes a real `claims.build_claim_fn(...)` through `assemble_registry`
+  → `assemble_daemon_and_api` → `Daemon`, unconditionally (not only when
+  `--only-uid`/`--exclude-uid` are given), so production `mbregistry run`
+  always enforces the claim. Every pre-ticket-002 direct `Daemon(...)`
+  construction, and every `assemble_daemon_and_api`/`assemble_registry`
+  call in the existing test suite that omits `claim_fn`, needed zero
+  changes as a result — confirmed by the full pre-existing
+  `tests/registry/daemon/` and `tests/registry/cli/` suites passing
+  unmodified.
+- **Real bug found and fixed while wiring this in**: `run_once`'s final
+  pass used to call `_maybe_probe(uid, info)` for *every* uid in the
+  current USB scan, unconditionally. Once a claim can be denied, that is
+  wrong two ways: (1) `Store.needs_probe` raises `KeyError` for a uid
+  with no store record at all (exactly what a denied, never-before-seen
+  uid has, since it's never upserted) — an uncaught crash of `run_once`;
+  (2) even where it wouldn't crash (a uid mirrored from a peer, `host !=
+  None`), probing it would mean physically opening a port for a board
+  this instance does not hold the claim for — the exact hazard the claim
+  exists to prevent, and the reason sprint.md's Architecture says the
+  claim must land before ticket 003's SWD read shares the same probe.
+  Fixed by tracking `locally_owned_now` (uids that are either already
+  locally-owned and still attached, or newly claimed+upserted this
+  cycle) during the locked attach/detach pass, and probing only that set
+  afterward, instead of every currently-scanned uid. Covered by the new
+  cross-instance integration tests (`test_daemon_claims_integration.py`)
+  and the denied-claim unit tests in `test_daemon.py`, which would have
+  hit the `KeyError` immediately without this fix.
+- **Release policy**: explicit release-on-detach (in the same
+  `store.mark_disconnected` branch), not release-on-process-exit-only —
+  chosen for symmetry with the existing attach/detach bookkeeping; the
+  module docstring documents both as equally valid per the ticket's own
+  "implementer's call".
+- **`--only-uid`/`--exclude-uid`**: repeatable `action="append"` flags
+  (no comma-splitting), following `--peer`'s own convention. An excluded/
+  not-included uid never reaches `try_claim` at all (decided locally,
+  per the ticket's Description) — `build_claim_fn` filters before
+  delegating.
+- **Testing**: `tests/registry/claims/test_claims.py` (27 tests: flock
+  contention including a real killed-subprocess crash-recovery test via
+  `multiprocessing`, two-thread race, release/reclaim, context-manager
+  form, directory creation/permissions, the Windows no-op, `protect_fd`
+  against a real `pty`, `is_claimable`/`build_claim_fn`);
+  `tests/registry/daemon/test_daemon.py` (8 new claim-gating tests, all
+  23 pre-existing tests unmodified and passing);
+  `tests/registry/daemon/test_daemon_claims_integration.py` (2 new tests,
+  real `claims.try_claim` against a shared `tmp_path` directory, two
+  independent `Daemon`/`Store` pairs); `tests/registry/cli/
+  test_cli_claims.py` (5 new tests: flag parsing,
+  `assemble_daemon_and_api`'s `claim_fn` forwarding). Full scoped run:
+  `uv run pytest tests/registry/claims/ tests/registry/daemon/
+  tests/registry/cli/ tests/registry/paths/ -q` → 154 passed.
+- **Not tested directly**: `_run_registry`'s own one-line
+  `build_claim_fn(only_uids=args.only_uid, exclude_uids=args.exclude_uid)`
+  call is not exercised by a dedicated test that runs the real pipeline —
+  matching this codebase's existing convention (no test in
+  `tests/registry/cli/` invokes `_run_registry` directly; it has no seam
+  to inject a fake `zeroconf`, so doing so would mean real mDNS
+  registration in the test suite). Covered instead by: `build_parser`
+  tests proving the flags parse into `args.only_uid`/`args.exclude_uid`
+  correctly, `claims.build_claim_fn`'s own thorough unit tests, and
+  `assemble_daemon_and_api`'s `claim_fn`-forwarding test proving the
+  parameter this call passes through actually gates `Daemon`.
