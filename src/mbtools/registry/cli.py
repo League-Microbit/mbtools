@@ -61,6 +61,7 @@ import signal
 import socket
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -84,6 +85,7 @@ from mbtools.registry.claims import build_claim_fn
 from mbtools.registry.daemon import DEFAULT_INTERVAL_S, Daemon
 from mbtools.registry.eventbus import EventBus
 from mbtools.registry.flash import FlashOp
+from mbtools.registry.locks import format_lock_suffix
 from mbtools.registry.peering import (
     DEFAULT_PUB_PORT,
     DEFAULT_SNAPSHOT_PORT,
@@ -120,6 +122,7 @@ __all__ = [
     "main",
     "build_parser",
     "cmd_list",
+    "cmd_unlock",
     "cmd_run",
     "cmd_install_service",
     "cmd_service_install",
@@ -374,6 +377,53 @@ def cmd_list(args: argparse.Namespace) -> int:
         return EXIT_OK
 
     print(render_table(devices))
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# unlock --force -- local-socket-only, manual, operator override
+# ---------------------------------------------------------------------------
+
+
+def cmd_unlock(args: argparse.Namespace) -> int:
+    """``mbregistry unlock --force UID|NAME`` (sprint 008, ticket 003):
+    resolve ``UID|NAME`` via ``find`` (handled server-side, same as every
+    other device op) and issue ``force_unlock`` -- a manual,
+    operator-only override that drops the device's lock regardless of
+    who holds it and closes the holder's own connection, so the holder
+    observes EOF rather than silently losing exclusivity. Local-socket
+    only: there is no remote-TCP-port equivalent and no automatic
+    pre-emption (sprint.md's Solution/Out of Scope) -- ``--force`` is
+    required on this subcommand precisely because there is no
+    non-forcing ``unlock`` to fall back to by omitting it.
+
+    A device with no active lock is reported as "not locked" (``EXIT_OK``
+    -- not an error), mirroring ``force_unlock``'s own wire-level
+    "no-op, not an error" contract.
+    """
+    socket_path = find_local_api_address(args.socket, _SOCKET_ENV_VAR)
+
+    try:
+        with RegistryClient(socket_path) as client:
+            released = client.force_unlock(args.uid)
+    except RegistryUnavailable as exc:
+        print(f"mbregistry: {exc}", file=sys.stderr)
+        print(
+            "mbregistry: is the daemon running? start it with 'mbregistry run'",
+            file=sys.stderr,
+        )
+        return EXIT_NO_DAEMON
+    except RegistryClientError as exc:
+        print(f"mbregistry: {exc.message}", file=sys.stderr)
+        return exc.exit_code
+
+    if released is None:
+        print(f"mbregistry: {args.uid}: not locked")
+        return EXIT_OK
+
+    holder = released["holder"]
+    suffix = format_lock_suffix(holder.get("label"), holder.get("since"), now=time.time())
+    print(f"mbregistry: {args.uid}: released {released['kind']} lock{suffix}")
     return EXIT_OK
 
 
@@ -1503,6 +1553,25 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"api socket path (default {DEFAULT_SOCKET_PATH}, or ${_SOCKET_ENV_VAR})",
     )
     list_p.set_defaults(func=cmd_list)
+
+    unlock_p = sub.add_parser(
+        "unlock", help="forcibly release a device's lock (local socket only)"
+    )
+    unlock_p.add_argument("uid", help="device uid, short_uid, or device_name")
+    unlock_p.add_argument(
+        "--force",
+        action="store_true",
+        required=True,
+        help=(
+            "drop the lock regardless of who holds it, closing the holder's "
+            "connection -- required; there is no non-forcing 'unlock' subcommand"
+        ),
+    )
+    unlock_p.add_argument(
+        "--socket",
+        help=f"api socket path (default {DEFAULT_SOCKET_PATH}, or ${_SOCKET_ENV_VAR})",
+    )
+    unlock_p.set_defaults(func=cmd_unlock)
 
     run_p = sub.add_parser("run", help="run the registry daemon in the foreground")
     run_p.add_argument(

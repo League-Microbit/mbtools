@@ -27,6 +27,7 @@ and the code disagree, the code wins. Run `<program> --help` or
 |---|---|---|
 | `mbregistry run` | The daemon. One per host. Watches USB, identifies micro:bits, keeps the device database, grants locks, peers with other hosts. | It *is* the daemon. |
 | `mbregistry list` | Client | yes |
+| `mbregistry unlock --force` | Client (local socket only) | yes |
 | `mbdeploy deploy / list / debug` | Client | yes |
 | `mbdeploy build` | Local build helper | no |
 | `mbserial` | Client | yes |
@@ -335,6 +336,28 @@ mbregistry run --socket /tmp/mbregistry-session/api.sock \
 
 `mbdeploy deploy --repo` caches downloaded hex files in
 `~/.cache/mbtools/hex/<owner>/<repo>/<tag>/`.
+
+### `mbregistry unlock --force` (sprint 008)
+
+```text
+mbregistry unlock UID|NAME --force [--socket PATH]
+```
+
+A manual, operator-only override for a stale lock: drops the device's
+lock regardless of who holds it, and closes the holder's own connection
+so it observes EOF rather than silently losing exclusivity. `--force` is
+required — there is no non-forcing `unlock` subcommand to fall back to
+by omitting it. Local Unix socket / named pipe only: there is no
+equivalent on the remote TCP port, and no automatic pre-emption — this
+is always a deliberate action an operator takes. A device with no active
+lock reports `not locked` and exits `0`, not an error.
+
+```text
+$ mbregistry unlock 9d2f... --force
+mbregistry: 9d2f...: released flash lock (alice-laptop, 12m)
+$ mbregistry unlock 9d2f... --force
+mbregistry: 9d2f...: not locked
+```
 
 ### `mbregistry service install` / `uninstall` / `status`
 

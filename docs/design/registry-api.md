@@ -52,6 +52,7 @@ Every request is a JSON object with an `"op"` field:
 | `get` / `find` | `uid` | resolve a device by uid, short_uid, or device_name (`store.find`'s precedence) — `get` and `find` are aliases for the same op |
 | `lock` | `uid`, `kind` | acquire an exclusive lock of `kind` (`serial`/`relay`/`flash`/`debug`) on the device, tied to this connection's peer PID |
 | `unlock` | `uid` | release this connection's own lock on the device (a no-op, not an error, if this connection doesn't hold it) |
+| `force_unlock` | `uid` | sprint 008, ticket 003: **local Unix socket only** (never dispatched on the remote TCP port) — drop the device's lock regardless of who holds it, and close the holder's own connection so its blocked read observes EOF; see "`force_unlock`" below |
 | `flash` | `uid`, `hex_path` | flash `hex_path` to the device — requires a `flash`-kind lock already held by this same connection (call `lock` first) |
 | `mark_flashed` | `uid` | bookkeeping only: record that `uid` was flashed *outside* this op (sprint 002's `mbdeploy`, which flashes locally by running pyocd directly rather than through `flash`) — same `flash`-kind-lock-held-by-this-connection precondition as `flash`, no pyocd invocation |
 | `names_get` | `name` | sprint 004, ticket 005: the name registry's row for `name`, or `entry: null` (not an error) if it has none yet — the non-creating lookup |
@@ -232,6 +233,28 @@ also appear in `list`'s per-device dict and in a `lock_state` `watch` event
 // response
 {"ok": true, "released": true}   // or false if this connection didn't hold it -- still ok:true, not an error
 ```
+
+### `force_unlock` (sprint 008, ticket 003)
+
+**Local Unix socket only** — `mbtools.registry.api.RegistryAPIServer` dispatches this op directly; it is never shared into `_api_base.py` and `remote_api.RemoteAPIServer` never dispatches it (an attempt on the remote TCP port gets the same `{"ok": false, "code": "invalid_request"}` any unrecognized op gets — see "Remote TCP control plane" below). A manual, operator-only override with no automatic pre-emption (sprint.md's Solution/Out of Scope): `mbregistry unlock --force UID|NAME` is its one intended caller.
+
+```jsonc
+// request
+{"op": "force_unlock", "uid": "..."}
+// response, a lock was held (by anyone -- local or remote origin):
+{"ok": true, "released": true, "uid": "<resolved uid>", "kind": "flash",
+ "holder": {"kind": "flash", "pid": 4821, "label": "alice-laptop", "since": 1732400000.0}}
+// response, uid was already unlocked -- not an error:
+{"ok": true, "released": false, "uid": "<resolved uid>"}
+// or:
+{"ok": false, "code": "not_found", "error": "..."}
+// or, missing uid:
+{"ok": false, "code": "invalid_request", "error": "..."}
+```
+
+Drops `uid`'s lock via `LockManager.force_release` — which skips the holder-equality check `unlock`/`release()` enforces, releasing it regardless of who holds it — then, if this server is tracking a connection for that uid (`RegistryAPIServer`'s own per-uid `{uid: connection}` map, populated on a successful `lock` and cleared on release via any path: `unlock`, connection close, the periodic sweep, or this op itself), shuts that connection down from the server side (`socket.shutdown(SHUT_RDWR)`, not a hard close — the holder's own connection-handler thread still runs its normal close/cleanup). The holder's blocked read (an ordinary JSON-lines loop, or a `stream` session's frame reader, ticket 004) then unblocks with an error/EOF and unwinds through its own existing `finally`-block cleanup — a harmless no-op release there, since the lock is already gone. `force_release` funnels through the same shared release mechanics `release`/`sweep` use (flash-release callback, then the lock-display callback), so a forced release fires a `lock_state` `watch` event and updates a peer's replicated display exactly as an ordinary release would.
+
+`"holder"` is the same wire shape `lock`'s own `locked` response carries (including `label`/`since`), so a caller can report what it broke — `mbregistry unlock --force`'s own CLI output does exactly this.
 
 ### `flash`
 
@@ -655,6 +678,12 @@ above with the local Unix-socket `api.RegistryAPIServer`
 transport too, for the five ops it supports, plus `stream` (sprint 003,
 ticket 007 — see "Stream sub-protocol" below) and `send_hex`/`flash`
 (sprint 003, ticket 008 — see "Remote flash and hex staging" below).
+**No `force_unlock`** (sprint 008, ticket 003): that op is local Unix
+socket only — this server has no dispatch entry for it at all, so a
+`{"op": "force_unlock", ...}` request here gets the same
+`{"ok": false, "code": "invalid_request"}` any other unrecognized op
+gets, per sprint.md's Solution/Out of Scope ("no equivalent on the
+remote TCP port").
 
 ### Transport
 
@@ -1079,6 +1108,8 @@ listed above, for the same one-place reason.
   sprint completed items 1 (configurable pool/names ports, advertise what's
   bound), 4 (`--instance`/`--pipe`), 5 (the cross-instance claim,
   `--only-uid`/`--exclude-uid`), and 6 (`--ready-json`/
-  `--exit-with-parent`/`--no-peering`). Items 2 (`watch` op), 3 (lock
-  `label`), 7 (understandable stale-lock breaking), and 8 (`stream` on the
-  local socket) remain open, planned for sprint 008 per that document.
+  `--exit-with-parent`/`--no-peering`). Sprint 008 completed items 2
+  (`watch` op, ticket 001), 3 (lock `label`, ticket 002), and 7
+  (understandable stale-lock breaking — `mbregistry unlock --force`,
+  ticket 003). Item 8 (`stream` on the local socket) remains open,
+  planned for a later ticket of this sprint per that document.

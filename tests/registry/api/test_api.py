@@ -582,6 +582,128 @@ def test_unlock_by_a_different_connection_cannot_steal_release(make_server, lock
 
 
 # ---------------------------------------------------------------------------
+# force_unlock (sprint 008, ticket 003)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.requires_af_unix
+def test_force_unlock_releases_a_lock_held_by_a_different_connection(make_server, locks):
+    srv = make_server(peer_pid_fn=_sequential_peer_pid_fn([PID_A, PID_B]))
+    holder = _Client(srv.socket_path)
+    holder.request({"op": "lock", "uid": UID, "kind": KIND_FLASH})
+
+    admin = _Client(srv.socket_path)
+    resp = admin.request({"op": "force_unlock", "uid": UID})
+
+    assert resp["ok"] is True
+    assert resp["released"] is True
+    assert resp["uid"] == UID
+    assert resp["kind"] == KIND_FLASH
+    assert resp["holder"]["pid"] == PID_A
+    assert locks.status(UID) is None
+    admin.close()
+    holder.close()
+
+
+@pytest.mark.requires_af_unix
+def test_force_unlock_echoes_label_and_since(make_server, locks):
+    """Handoff from ticket 002: the op response echoes the broken lock's
+    label/since (a caller like the CLI can report what it broke)."""
+    srv = make_server(peer_pid_fn=_sequential_peer_pid_fn([PID_A, PID_B]))
+    holder = _Client(srv.socket_path)
+    holder.request({"op": "lock", "uid": UID, "kind": KIND_SERIAL, "label": "alice-laptop"})
+    since = locks.status(UID).since
+
+    admin = _Client(srv.socket_path)
+    resp = admin.request({"op": "force_unlock", "uid": UID})
+
+    assert resp["holder"]["label"] == "alice-laptop"
+    assert resp["holder"]["since"] == since
+    admin.close()
+    holder.close()
+
+
+@pytest.mark.requires_af_unix
+def test_force_unlock_closes_the_holders_connection_so_its_read_observes_eof(make_server):
+    """Acceptance criterion: the holder's own blocked read observes EOF
+    (or a connection error), not a hang."""
+    srv = make_server(peer_pid_fn=_sequential_peer_pid_fn([PID_A, PID_B]))
+    holder = _Client(srv.socket_path)
+    holder.request({"op": "lock", "uid": UID, "kind": KIND_SERIAL})
+
+    admin = _Client(srv.socket_path)
+    resp = admin.request({"op": "force_unlock", "uid": UID})
+    assert resp["released"] is True
+
+    with pytest.raises(ConnectionError):
+        holder.recv()
+
+    admin.close()
+    holder.close()
+
+
+@pytest.mark.requires_af_unix
+def test_force_unlock_does_not_close_an_unrelated_connection(make_server):
+    """The connection map is per-uid -- force_unlock on one uid must
+    never touch a different connection's own, still-held lock."""
+    srv = make_server(peer_pid_fn=_sequential_peer_pid_fn([PID_A, PID_B, PID_A]))
+    holder = _Client(srv.socket_path)
+    holder.request({"op": "lock", "uid": UID, "kind": KIND_SERIAL})
+
+    other_holder = _Client(srv.socket_path)
+    other_holder.request({"op": "lock", "uid": UID2, "kind": KIND_SERIAL})
+
+    admin = _Client(srv.socket_path)
+    admin.request({"op": "force_unlock", "uid": UID})
+
+    # other_holder's own connection/lock is untouched.
+    resp = other_holder.request({"op": "unlock", "uid": UID2})
+    assert resp == {"ok": True, "released": True}
+    admin.close()
+    holder.close()
+    other_holder.close()
+
+
+@pytest.mark.requires_af_unix
+def test_force_unlock_of_an_already_unlocked_device_reports_not_released_not_an_error(
+    make_server,
+):
+    srv = make_server()
+    client = _Client(srv.socket_path)
+
+    resp = client.request({"op": "force_unlock", "uid": UID})
+
+    assert resp["ok"] is True
+    assert resp["released"] is False
+    assert resp["uid"] == UID
+    client.close()
+
+
+@pytest.mark.requires_af_unix
+def test_force_unlock_unknown_device_is_not_found(make_server):
+    srv = make_server()
+    client = _Client(srv.socket_path)
+
+    resp = client.request({"op": "force_unlock", "uid": "nope"})
+
+    assert resp["ok"] is False
+    assert resp["code"] == CODE_NOT_FOUND
+    client.close()
+
+
+@pytest.mark.requires_af_unix
+def test_force_unlock_missing_uid_is_invalid_request(make_server):
+    srv = make_server()
+    client = _Client(srv.socket_path)
+
+    resp = client.request({"op": "force_unlock"})
+
+    assert resp["ok"] is False
+    assert resp["code"] == CODE_INVALID_REQUEST
+    client.close()
+
+
+# ---------------------------------------------------------------------------
 # connection close releases exactly that connection's locks
 # ---------------------------------------------------------------------------
 

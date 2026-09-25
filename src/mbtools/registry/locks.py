@@ -339,6 +339,34 @@ class LockManager:
         self._release(uid, current)
         return True
 
+    def force_release(self, uid: str) -> LockStatus | None:
+        """Release ``uid``'s lock regardless of who holds it (sprint 008,
+        ticket 003) -- the manual, operator-only override ``mbregistry
+        unlock --force`` needs.
+
+        A separate method, never a bypass parameter on :meth:`release` --
+        :meth:`release`'s own holder-equality check is completely
+        untouched, so no existing caller of ``release`` can accidentally
+        skip it. A no-op (not an error) if ``uid`` is already unlocked --
+        returns ``None`` in that case, exactly like :meth:`status`.
+
+        On an actual release, funnels through the same shared
+        :meth:`_release` mechanics :meth:`release`/:meth:`sweep` already
+        use (the flash-release callback, then the lock-display callback
+        with ``(uid, None, None, None, None)``), so a forced release is
+        indistinguishable, downstream (a ``watch`` client's ``lock_state``
+        event, a peer's replicated display), from an ordinary one. Returns
+        the :class:`LockStatus` that was released -- unlike
+        :meth:`release`'s bare ``bool`` -- so a caller (``api.py``'s
+        ``force_unlock`` op) can report what it broke (kind, holder,
+        label, since) without a second lookup.
+        """
+        current = self._locks.get(uid)
+        if current is None:
+            return None
+        self._release(uid, current)
+        return current
+
     def sweep(self, is_alive: Callable[[HolderRef], bool]) -> list[str]:
         """Release every lock whose holder ``is_alive`` reports as dead;
         leave live-holder locks untouched.

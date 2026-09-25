@@ -113,7 +113,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from mbtools.common import CODE_INVALID_REQUEST, CODE_NOT_FOUND, CODE_NOT_LOCKED
-from mbtools.registry._api_base import BaseAPIServer, _error
+from mbtools.registry._api_base import BaseAPIServer, _error, _holder_wire_dict
 from mbtools.registry.eventbus import EventBus
 from mbtools.registry.flash import FlashOp, HexValidationError
 from mbtools.registry.locks import KIND_FLASH, HolderRef, LockManager
@@ -344,6 +344,16 @@ class RegistryAPIServer(BaseAPIServer):
         self._accept_thread: threading.Thread | None = None
         self._sweep_thread: threading.Thread | None = None
         self._conn_threads: list[threading.Thread] = []
+        # Sprint 008 ticket 003: {uid: connection} for every uid *this*
+        # server has granted a lock on -- populated on a successful
+        # `lock` (`_dispatch_line`'s own lock branch, below), cleared on
+        # release via any path (`unlock`, connection close, sweep, or
+        # `_op_force_unlock`'s own force path). Never shared into
+        # `_api_base.py` -- the remote TCP port has no `force_unlock` op
+        # and no reason to track this. Guarded by `self._lock`, same as
+        # `store`/`locks` access, so a `force_unlock` on one connection's
+        # thread never races a `lock`/`unlock`/sweep on another's.
+        self._uid_connections: dict[str, socket.socket] = {}
 
     # -- lifecycle -----------------------------------------------------
 
@@ -473,6 +483,13 @@ class RegistryAPIServer(BaseAPIServer):
         while not self._stop_event.wait(self._sweep_interval_s):
             with self._lock:
                 released = self._locks.sweep(self._is_holder_alive)
+                # Sprint 008 ticket 003: a sweep-released uid's mapped
+                # connection (if any) is no longer this uid's holder --
+                # drop the stale entry so a later `force_unlock` never
+                # shuts down an unrelated connection that happens to
+                # still hold *other* locks.
+                for uid in released:
+                    self._uid_connections.pop(uid, None)
             if released:
                 logger.info("api: liveness sweep released locks for %s", released)
 
@@ -533,7 +550,7 @@ class RegistryAPIServer(BaseAPIServer):
                 line = raw_line.strip()
                 if not line:
                     continue
-                if self._dispatch_line(line, pid, holder, acquired_uids, wfile):
+                if self._dispatch_line(line, pid, holder, acquired_uids, wfile, conn):
                     # Sprint 008 ticket 001: ``watch`` was accepted --
                     # this connection leaves ordinary request/response
                     # dispatch for the rest of its life (mirrors
@@ -551,6 +568,7 @@ class RegistryAPIServer(BaseAPIServer):
             with self._lock:
                 for uid in list(acquired_uids):
                     self._locks.release(uid, holder)
+                    self._uid_connections.pop(uid, None)
             for f in (rfile, wfile):
                 try:
                     f.close()
@@ -568,6 +586,7 @@ class RegistryAPIServer(BaseAPIServer):
         holder: HolderRef,
         acquired_uids: set[str],
         wfile: Any,
+        conn: socket.socket,
     ) -> bool:
         """Dispatch one JSON request line and write its response.
 
@@ -578,6 +597,16 @@ class RegistryAPIServer(BaseAPIServer):
         mirroring how ``remote_api.RemoteAPIServer._dispatch_line``'s own
         non-``None`` return signals the same handoff for ``stream``.
         Every other op returns ``False``.
+
+        ``conn`` (sprint 008 ticket 003) is this connection's raw socket
+        -- recorded in :attr:`_uid_connections` for every uid a ``lock``
+        op on this line newly grants, and dropped from it for every uid
+        an ``unlock`` op on this line actually releases (diffed against
+        ``acquired_uids`` before/after each call, so both branches stay
+        exactly as thin as before this ticket). This is the *same*
+        connection object a later ``stream`` op (ticket 004) would switch
+        into framed-binary mode -- no separate bookkeeping needed for a
+        streaming holder.
         """
         try:
             req = json.loads(line)
@@ -594,9 +623,23 @@ class RegistryAPIServer(BaseAPIServer):
         elif op in ("get", "find"):
             resp = self._op_find(req)
         elif op == "lock":
+            before = set(acquired_uids)
             resp = self._op_lock(req, holder, acquired_uids)
+            newly_acquired = acquired_uids - before
+            if newly_acquired:
+                with self._lock:
+                    for uid in newly_acquired:
+                        self._uid_connections[uid] = conn
         elif op == "unlock":
+            before = set(acquired_uids)
             resp = self._op_unlock(req, holder, acquired_uids)
+            newly_released = before - acquired_uids
+            if newly_released:
+                with self._lock:
+                    for uid in newly_released:
+                        self._uid_connections.pop(uid, None)
+        elif op == "force_unlock":
+            resp = self._op_force_unlock(req)
         elif op == "flash":
             resp = self._op_flash(req, pid, acquired_uids, wfile)
         elif op == "mark_flashed":
@@ -622,7 +665,60 @@ class RegistryAPIServer(BaseAPIServer):
     #
     # list/find/lock/unlock/mark_flashed are inherited from BaseAPIServer
     # (ticket 006) -- see this class's own docstring and that module's.
-    # Only `flash` (ticket 008's remote-flash territory) stays here.
+    # `flash` (ticket 008's remote-flash territory) and `force_unlock`
+    # (sprint 008 ticket 003, local-socket only -- never shared into
+    # `_api_base.py`/dispatched by `remote_api.py`) stay here.
+
+    def _op_force_unlock(self, req: dict[str, Any]) -> dict[str, Any]:
+        """``force_unlock(uid)`` (sprint 008, ticket 003): drop ``uid``'s
+        lock regardless of who holds it, and close the holder's own
+        connection -- if this server is tracking one for it
+        (:attr:`_uid_connections`) -- from the server side, so that
+        connection's blocked read (an ordinary JSON-lines loop, or a
+        ``stream`` session's frame reader, ticket 004) unblocks with an
+        error/EOF and unwinds through its own existing ``finally``-block
+        cleanup. That cleanup's own ``self._locks.release(...)`` call is
+        a harmless no-op by the time it runs, since the lock is already
+        gone.
+
+        A manual, operator-only override -- no automatic pre-emption,
+        and no equivalent on the remote TCP port (sprint.md's Out of
+        Scope) -- so this method is never shared into ``_api_base.py``
+        and ``remote_api.RemoteAPIServer`` never dispatches this op; an
+        attempt there falls through to its own "unknown op" response.
+
+        Returns ``{"ok": True, "released": False, "uid": ...}`` (not an
+        error -- the CLI's own "not locked" reporting) if ``uid`` was
+        already unlocked, or ``{"ok": True, "released": True, "uid":
+        ..., "kind": ..., "holder": {...}}`` -- the same holder wire
+        shape a ``locked`` response carries, so the caller can report
+        what it broke, including ``label``/``since`` -- otherwise.
+        """
+        token = req.get("uid")
+        if not token:
+            return _error(CODE_INVALID_REQUEST, "'force_unlock' requires 'uid'")
+        with self._lock:
+            record, err = self._resolve_visible(str(token))
+            if err is not None:
+                return err
+            assert record is not None
+            uid = record.uid
+            status = self._locks.force_release(uid)
+            conn = self._uid_connections.pop(uid, None)
+        if conn is not None:
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        if status is None:
+            return {"ok": True, "released": False, "uid": uid}
+        return {
+            "ok": True,
+            "released": True,
+            "uid": uid,
+            "kind": status.kind,
+            "holder": _holder_wire_dict(status),
+        }
 
     def _op_flash(
         self,
@@ -705,6 +801,7 @@ class RegistryAPIServer(BaseAPIServer):
             with self._lock:
                 self._locks.release(uid, _local_holder(pid))
                 acquired_uids.discard(uid)
+                self._uid_connections.pop(uid, None)
             return {
                 "type": "result",
                 "ok": False,
@@ -721,6 +818,7 @@ class RegistryAPIServer(BaseAPIServer):
         with self._lock:
             self._locks.release(uid, _local_holder(pid))
             acquired_uids.discard(uid)
+            self._uid_connections.pop(uid, None)
         return {
             "type": "result",
             "ok": result.success,

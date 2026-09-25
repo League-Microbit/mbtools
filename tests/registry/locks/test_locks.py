@@ -139,6 +139,72 @@ def test_release_of_unlocked_device_is_noop():
 
 
 # ---------------------------------------------------------------------------
+# force_release (sprint 008, ticket 003)
+# ---------------------------------------------------------------------------
+
+
+def test_force_release_releases_regardless_of_holder():
+    manager = LockManager(now_fn=_fixed_now)
+    manager.acquire(UID, KIND_SERIAL, HOLDER)
+
+    released = manager.force_release(UID)
+
+    assert released == LockStatus(kind=KIND_SERIAL, holder=HOLDER, label=None, since=FIXED_NOW)
+    assert manager.status(UID) is None
+
+
+def test_force_release_of_unlocked_device_is_noop_not_error():
+    manager = LockManager()
+    assert manager.force_release(UID) is None
+
+
+def test_force_release_leaves_release_holder_equality_check_untouched():
+    """Acceptance criterion: force_release is a separate method, not a
+    bypass parameter on release -- release() still refuses a
+    non-matching holder after a force_release call exists in the API at
+    all."""
+    manager = LockManager()
+    manager.acquire(UID, KIND_SERIAL, HOLDER)
+
+    assert manager.release(UID, HOLDER2) is False
+    assert manager.status(UID) is not None
+
+
+def test_force_release_fires_flash_release_callback():
+    fired = []
+    manager = LockManager(flash_release_callback=fired.append)
+    manager.acquire(UID, KIND_FLASH, HOLDER)
+
+    manager.force_release(UID)
+
+    assert fired == [UID]
+
+
+def test_force_release_fires_lock_display_callback_same_as_ordinary_release():
+    calls = []
+    manager = LockManager(lock_display_callback=lambda *args: calls.append(args))
+    manager.acquire(UID, KIND_SERIAL, HOLDER, label="alice-laptop")
+    calls.clear()
+
+    manager.force_release(UID)
+
+    assert calls == [(UID, None, None, None, None)]
+
+
+def test_force_release_noop_does_not_fire_callbacks():
+    flash_calls = []
+    display_calls = []
+    manager = LockManager(
+        flash_release_callback=flash_calls.append,
+        lock_display_callback=lambda *args: display_calls.append(args),
+    )
+
+    assert manager.force_release(UID) is None
+    assert flash_calls == []
+    assert display_calls == []
+
+
+# ---------------------------------------------------------------------------
 # idempotent unlocked state
 # ---------------------------------------------------------------------------
 
