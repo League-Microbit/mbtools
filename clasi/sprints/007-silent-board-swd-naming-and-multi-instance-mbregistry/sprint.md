@@ -1,7 +1,7 @@
 ---
 id: '007'
 title: Silent-board SWD naming and multi-instance mbregistry
-status: ticketing
+status: executing
 branch: sprint/007-silent-board-swd-naming-and-multi-instance-mbregistry
 use-cases:
 - SUC-001

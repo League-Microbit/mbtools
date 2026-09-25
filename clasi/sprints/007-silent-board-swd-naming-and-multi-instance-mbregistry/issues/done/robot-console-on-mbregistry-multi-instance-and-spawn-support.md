@@ -1,5 +1,5 @@
 ---
-status: in-progress
+status: done
 split_into:
 - mbregistry-api-for-robot-console-watch-lock-label-unlock-force-local-stream.md
 - default-mbregistry-compatibility-shims-off-once-robot-console-is-native.md
