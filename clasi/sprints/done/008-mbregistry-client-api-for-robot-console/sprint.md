@@ -1,7 +1,7 @@
 ---
 id: 008
 title: mbregistry client API for robot-console
-status: executing
+status: done
 branch: sprint/008-mbregistry-client-api-for-robot-console
 use-cases:
 - SUC-001
