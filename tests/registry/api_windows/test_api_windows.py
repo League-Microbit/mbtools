@@ -255,7 +255,11 @@ def test_list_includes_every_device_with_lock_status_folded_in(make_server, lock
     assert set(by_uid) == {UID, UID2}
     assert by_uid[UID]["lock_kind"] == KIND_SERIAL
     assert by_uid[UID]["lock_pid"] == PID_A
+    assert by_uid[UID]["lock_label"] is None
+    assert isinstance(by_uid[UID]["lock_since"], float)
     assert by_uid[UID2]["lock_kind"] is None
+    assert by_uid[UID2]["lock_label"] is None
+    assert by_uid[UID2]["lock_since"] is None
 
 
 def test_find_by_uid_short_uid_and_device_name(make_server):
@@ -300,7 +304,10 @@ def test_lock_conflict_reports_existing_holder(make_server, locks):
 
     assert resp["ok"] is False
     assert resp["code"] == CODE_LOCKED
-    assert resp["holder"] == {"kind": KIND_SERIAL, "pid": PID_A}
+    assert resp["holder"]["kind"] == KIND_SERIAL
+    assert resp["holder"]["pid"] == PID_A
+    assert resp["holder"]["label"] is None
+    assert isinstance(resp["holder"]["since"], float)
 
 
 def test_mark_flashed_requires_flash_lock_held_by_this_connection(make_server, locks):

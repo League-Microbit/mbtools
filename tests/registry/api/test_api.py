@@ -32,6 +32,7 @@ from mbtools.common import (
     CODE_NOT_LOCKED,
 )
 from mbtools.registry.api import RegistryAPIServer, default_peer_pid
+from mbtools.registry.eventbus import EventBus
 from mbtools.registry.flash import FlashOp
 from mbtools.registry.identity import ProbeResult
 from mbtools.registry.locks import KIND_FLASH, KIND_SERIAL, HolderRef, LockManager
@@ -201,7 +202,7 @@ def make_server(socket_dir, store, locks):
     servers = []
 
     def _make(*, runner=None, peer_pid_fn=None, is_pid_alive_fn=None, sweep_interval_s=100.0,
-              name_set_callback=None, name_clear_callback=None):
+              name_set_callback=None, name_clear_callback=None, eventbus=None):
         flash_op = FlashOp(locks=locks, store=store, runner=runner if runner is not None else _SpyRunner())
         srv = RegistryAPIServer(
             socket_path=f"{socket_dir}/api.sock",
@@ -213,6 +214,7 @@ def make_server(socket_dir, store, locks):
             sweep_interval_s=sweep_interval_s,
             name_set_callback=name_set_callback,
             name_clear_callback=name_clear_callback,
+            eventbus=eventbus,
         )
         srv.start()
         servers.append(srv)
@@ -292,8 +294,12 @@ def test_list_includes_every_device_with_lock_status_folded_in(make_server, lock
     assert set(by_uid) == {UID, UID2}
     assert by_uid[UID]["lock_kind"] == KIND_SERIAL
     assert by_uid[UID]["lock_pid"] == PID_A
+    assert by_uid[UID]["lock_label"] is None
+    assert isinstance(by_uid[UID]["lock_since"], float)
     assert by_uid[UID2]["lock_kind"] is None
     assert by_uid[UID2]["lock_pid"] is None
+    assert by_uid[UID2]["lock_label"] is None
+    assert by_uid[UID2]["lock_since"] is None
     client.close()
 
 
@@ -465,7 +471,10 @@ def test_lock_already_locked_returns_holder_kind_and_pid(make_server):
 
     assert resp["ok"] is False
     assert resp["code"] == CODE_LOCKED
-    assert resp["holder"] == {"kind": KIND_FLASH, "pid": PID_A}
+    assert resp["holder"]["kind"] == KIND_FLASH
+    assert resp["holder"]["pid"] == PID_A
+    assert resp["holder"]["label"] is None
+    assert isinstance(resp["holder"]["since"], float)
     holder.close()
     contender.close()
 
@@ -492,6 +501,55 @@ def test_lock_unknown_kind_is_invalid_request(make_server):
     assert resp["ok"] is False
     assert resp["code"] == CODE_INVALID_REQUEST
     client.close()
+
+
+# ---------------------------------------------------------------------------
+# lock label/since (sprint 008, ticket 002)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.requires_af_unix
+def test_lock_without_label_behaves_exactly_as_before(make_server, locks):
+    """AC: omitting 'label' behaves exactly as before this ticket."""
+    srv = make_server(peer_pid_fn=_sequential_peer_pid_fn([PID_A]))
+    client = _Client(srv.socket_path)
+
+    resp = client.request({"op": "lock", "uid": UID, "kind": KIND_SERIAL})
+
+    assert resp == {"ok": True}
+    status = locks.status(UID)
+    assert status.label is None
+    assert isinstance(status.since, float)
+    client.close()
+
+
+@pytest.mark.requires_af_unix
+def test_label_since_round_trips_through_lock_list_and_locked(make_server, locks):
+    """AC: label/since round-trip through lock -> list -> locked."""
+    srv = make_server(peer_pid_fn=_sequential_peer_pid_fn([PID_A, PID_B]))
+    holder = _Client(srv.socket_path)
+
+    resp = holder.request(
+        {"op": "lock", "uid": UID, "kind": KIND_FLASH, "label": "alice-laptop"}
+    )
+    assert resp == {"ok": True}
+
+    # list's per-device dict
+    contender = _Client(srv.socket_path)
+    list_resp = contender.request({"op": "list"})
+    by_uid = {d["uid"]: d for d in list_resp["devices"]}
+    assert by_uid[UID]["lock_label"] == "alice-laptop"
+    assert isinstance(by_uid[UID]["lock_since"], float)
+
+    # locked's holder shape, seen by a contender
+    lock_resp = contender.request({"op": "lock", "uid": UID, "kind": KIND_SERIAL})
+    assert lock_resp["ok"] is False
+    assert lock_resp["code"] == CODE_LOCKED
+    assert lock_resp["holder"]["label"] == "alice-laptop"
+    assert lock_resp["holder"]["since"] == locks.status(UID).since
+
+    holder.close()
+    contender.close()
 
 
 @pytest.mark.requires_af_unix
@@ -521,6 +579,128 @@ def test_unlock_by_a_different_connection_cannot_steal_release(make_server, lock
     assert locks.status(UID).pid == PID_A
     owner.close()
     other.close()
+
+
+# ---------------------------------------------------------------------------
+# force_unlock (sprint 008, ticket 003)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.requires_af_unix
+def test_force_unlock_releases_a_lock_held_by_a_different_connection(make_server, locks):
+    srv = make_server(peer_pid_fn=_sequential_peer_pid_fn([PID_A, PID_B]))
+    holder = _Client(srv.socket_path)
+    holder.request({"op": "lock", "uid": UID, "kind": KIND_FLASH})
+
+    admin = _Client(srv.socket_path)
+    resp = admin.request({"op": "force_unlock", "uid": UID})
+
+    assert resp["ok"] is True
+    assert resp["released"] is True
+    assert resp["uid"] == UID
+    assert resp["kind"] == KIND_FLASH
+    assert resp["holder"]["pid"] == PID_A
+    assert locks.status(UID) is None
+    admin.close()
+    holder.close()
+
+
+@pytest.mark.requires_af_unix
+def test_force_unlock_echoes_label_and_since(make_server, locks):
+    """Handoff from ticket 002: the op response echoes the broken lock's
+    label/since (a caller like the CLI can report what it broke)."""
+    srv = make_server(peer_pid_fn=_sequential_peer_pid_fn([PID_A, PID_B]))
+    holder = _Client(srv.socket_path)
+    holder.request({"op": "lock", "uid": UID, "kind": KIND_SERIAL, "label": "alice-laptop"})
+    since = locks.status(UID).since
+
+    admin = _Client(srv.socket_path)
+    resp = admin.request({"op": "force_unlock", "uid": UID})
+
+    assert resp["holder"]["label"] == "alice-laptop"
+    assert resp["holder"]["since"] == since
+    admin.close()
+    holder.close()
+
+
+@pytest.mark.requires_af_unix
+def test_force_unlock_closes_the_holders_connection_so_its_read_observes_eof(make_server):
+    """Acceptance criterion: the holder's own blocked read observes EOF
+    (or a connection error), not a hang."""
+    srv = make_server(peer_pid_fn=_sequential_peer_pid_fn([PID_A, PID_B]))
+    holder = _Client(srv.socket_path)
+    holder.request({"op": "lock", "uid": UID, "kind": KIND_SERIAL})
+
+    admin = _Client(srv.socket_path)
+    resp = admin.request({"op": "force_unlock", "uid": UID})
+    assert resp["released"] is True
+
+    with pytest.raises(ConnectionError):
+        holder.recv()
+
+    admin.close()
+    holder.close()
+
+
+@pytest.mark.requires_af_unix
+def test_force_unlock_does_not_close_an_unrelated_connection(make_server):
+    """The connection map is per-uid -- force_unlock on one uid must
+    never touch a different connection's own, still-held lock."""
+    srv = make_server(peer_pid_fn=_sequential_peer_pid_fn([PID_A, PID_B, PID_A]))
+    holder = _Client(srv.socket_path)
+    holder.request({"op": "lock", "uid": UID, "kind": KIND_SERIAL})
+
+    other_holder = _Client(srv.socket_path)
+    other_holder.request({"op": "lock", "uid": UID2, "kind": KIND_SERIAL})
+
+    admin = _Client(srv.socket_path)
+    admin.request({"op": "force_unlock", "uid": UID})
+
+    # other_holder's own connection/lock is untouched.
+    resp = other_holder.request({"op": "unlock", "uid": UID2})
+    assert resp == {"ok": True, "released": True}
+    admin.close()
+    holder.close()
+    other_holder.close()
+
+
+@pytest.mark.requires_af_unix
+def test_force_unlock_of_an_already_unlocked_device_reports_not_released_not_an_error(
+    make_server,
+):
+    srv = make_server()
+    client = _Client(srv.socket_path)
+
+    resp = client.request({"op": "force_unlock", "uid": UID})
+
+    assert resp["ok"] is True
+    assert resp["released"] is False
+    assert resp["uid"] == UID
+    client.close()
+
+
+@pytest.mark.requires_af_unix
+def test_force_unlock_unknown_device_is_not_found(make_server):
+    srv = make_server()
+    client = _Client(srv.socket_path)
+
+    resp = client.request({"op": "force_unlock", "uid": "nope"})
+
+    assert resp["ok"] is False
+    assert resp["code"] == CODE_NOT_FOUND
+    client.close()
+
+
+@pytest.mark.requires_af_unix
+def test_force_unlock_missing_uid_is_invalid_request(make_server):
+    srv = make_server()
+    client = _Client(srv.socket_path)
+
+    resp = client.request({"op": "force_unlock"})
+
+    assert resp["ok"] is False
+    assert resp["code"] == CODE_INVALID_REQUEST
+    client.close()
 
 
 # ---------------------------------------------------------------------------
@@ -794,6 +974,107 @@ def test_unknown_op_returns_invalid_request(make_server):
     assert resp["ok"] is False
     assert resp["code"] == CODE_INVALID_REQUEST
     client.close()
+
+
+# ---------------------------------------------------------------------------
+# watch (sprint 008, ticket 001)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.requires_af_unix
+def test_watch_acks_then_streams_published_events_in_order(make_server):
+    bus = EventBus()
+    srv = make_server(eventbus=bus)
+    client = _Client(srv.socket_path)
+
+    ack = client.request({"op": "watch"})
+    assert ack == {"ok": True}
+
+    event1 = {"type": "attach", "uid": UID, "port": "/dev/ttyACM0", "vid_pid": VID_PID}
+    event2 = {"type": "lock_state", "uid": UID, "kind": "serial", "display": "pid 1"}
+    bus.publish(event1)
+    bus.publish(event2)
+
+    assert client.recv() == event1
+    assert client.recv() == event2
+    client.close()
+
+
+@pytest.mark.requires_af_unix
+def test_watch_fans_out_to_every_connected_watcher(make_server):
+    bus = EventBus()
+    srv = make_server(eventbus=bus)
+    watcher_a = _Client(srv.socket_path)
+    watcher_b = _Client(srv.socket_path)
+    assert watcher_a.request({"op": "watch"}) == {"ok": True}
+    assert watcher_b.request({"op": "watch"}) == {"ok": True}
+
+    event = {"type": "detach", "uid": UID}
+    bus.publish(event)
+
+    assert watcher_a.recv() == event
+    assert watcher_b.recv() == event
+    watcher_a.close()
+    watcher_b.close()
+
+
+@pytest.mark.requires_af_unix
+def test_watch_sees_no_snapshot_only_events_published_after_subscribing(make_server):
+    bus = EventBus()
+    srv = make_server(eventbus=bus)
+    # Published before any watch client connects -- must never be delivered.
+    bus.publish({"type": "attach", "uid": "before-watch"})
+
+    client = _Client(srv.socket_path)
+    assert client.request({"op": "watch"}) == {"ok": True}
+
+    after = {"type": "attach", "uid": "after-watch"}
+    bus.publish(after)
+
+    assert client.recv() == after
+    client.close()
+
+
+@pytest.mark.requires_af_unix
+def test_watch_client_disconnect_cleanly_unsubscribes(make_server):
+    """No leaked queue, no exception on the next publish() -- this
+    ticket's own acceptance criterion. The connection's own write is
+    what notices a disconnect (this handler thread is otherwise parked
+    on the subscriber queue, exactly like a real ``watch`` client with
+    nothing new to report) -- publishing after close is what surfaces
+    that, and must neither raise for the publisher nor leave the queue
+    subscribed afterwards.
+    """
+    bus = EventBus()
+    srv = make_server(eventbus=bus)
+    client = _Client(srv.socket_path)
+    assert client.request({"op": "watch"}) == {"ok": True}
+
+    client.close()
+    bus.publish({"type": "attach", "uid": "after-close"})  # must not raise
+
+    def _no_subscribers_left():
+        with bus._lock:
+            return len(bus._subscribers) == 0
+
+    _wait_until(_no_subscribers_left)
+
+
+@pytest.mark.requires_af_unix
+def test_watch_does_not_block_other_clients_from_being_served(make_server):
+    """A watch connection parks its own handler thread forever (by
+    design) -- an ordinary client on a separate connection must still be
+    served normally."""
+    srv = make_server()
+    watcher = _Client(srv.socket_path)
+    assert watcher.request({"op": "watch"}) == {"ok": True}
+
+    other = _Client(srv.socket_path)
+    resp = other.request({"op": "list"})
+    assert resp["ok"] is True
+
+    watcher.close()
+    other.close()
 
 
 # ---------------------------------------------------------------------------

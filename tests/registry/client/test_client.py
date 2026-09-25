@@ -207,7 +207,10 @@ def test_lock_already_held_raises_device_locked_with_holder_preserved(server, lo
 
     assert excinfo.value.exit_code == EXIT_LOCKED
     assert excinfo.value.code == "locked"
-    assert excinfo.value.holder == {"kind": KIND_FLASH, "pid": holder_pid}
+    assert excinfo.value.holder["kind"] == KIND_FLASH
+    assert excinfo.value.holder["pid"] == holder_pid
+    assert excinfo.value.holder["label"] is None
+    assert isinstance(excinfo.value.holder["since"], float)
 
 
 @pytest.mark.requires_af_unix

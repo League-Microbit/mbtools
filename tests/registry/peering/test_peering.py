@@ -367,14 +367,20 @@ def test_remove_service_is_a_discovery_only_no_op(store):
 
 
 def test_start_registers_own_service_with_txt_ports(store):
+    # ticket 008-007: pub_port/snapshot_port must never be the real
+    # DEFAULT_PUB_PORT/DEFAULT_SNAPSHOT_PORT (7442/7443) -- start() binds
+    # real ZMQ sockets at these values even though zeroconf itself is
+    # faked, and a real mbregistry daemon (e.g. the dev Mac's LaunchAgent)
+    # may already hold those ports. High, test-only ports sidestep the
+    # conflict; see this ticket's Implementation Notes.
     ns = _FakeZeroconfNamespace()
     pd = PeerDiscovery(
         store=store,
         host="loki",
         advertise_address="192.168.1.149",
-        remote_port=7440,
-        pub_port=7442,
-        snapshot_port=7443,
+        remote_port=18440,
+        pub_port=18442,
+        snapshot_port=18443,
         zeroconf=ns,
     )
     pd.start()
@@ -382,36 +388,41 @@ def test_start_registers_own_service_with_txt_ports(store):
     assert len(ns.instance.registered) == 1
     info = ns.instance.registered[0]
     assert info.name == "loki." + SERVICE_TYPE
-    assert info.port == 7440
+    assert info.port == 18440
     assert info.parsed_addresses() == ["192.168.1.149"]
     assert peering_mod._decode_txt(info.properties) == {
-        "remote_port": "7440",
-        "pub_port": "7442",
-        "snapshot_port": "7443",
+        "remote_port": "18440",
+        "pub_port": "18442",
+        "snapshot_port": "18443",
     }
     pd.stop()
 
 
 def test_start_uses_default_ports_when_not_overridden(store):
-    ns = _FakeZeroconfNamespace()
+    # ticket 008-007: this test's whole point is confirming the
+    # constructor falls back to DEFAULT_REMOTE_PORT/DEFAULT_PUB_PORT/
+    # DEFAULT_SNAPSHOT_PORT (7440/7442/7443) when the caller omits them --
+    # exactly the real production ports a live mbregistry daemon may
+    # already hold. Asserting on the constructor-time attributes directly
+    # proves the same fallback without ever calling start() (which would
+    # bind real 7442/7443 sockets and collide with that daemon).
     pd = PeerDiscovery(
-        store=store, host="loki", advertise_address="192.168.1.149", zeroconf=ns
+        store=store, host="loki", advertise_address="192.168.1.149"
     )
-    pd.start()
-
-    info = ns.instance.registered[0]
-    assert peering_mod._decode_txt(info.properties) == {
-        "remote_port": str(DEFAULT_REMOTE_PORT),
-        "pub_port": str(DEFAULT_PUB_PORT),
-        "snapshot_port": str(DEFAULT_SNAPSHOT_PORT),
-    }
-    pd.stop()
+    assert pd._remote_port == DEFAULT_REMOTE_PORT
+    assert pd._pub_port == DEFAULT_PUB_PORT
+    assert pd._snapshot_port == DEFAULT_SNAPSHOT_PORT
 
 
 def test_start_creates_browser_for_service_type(store):
     ns = _FakeZeroconfNamespace()
     pd = PeerDiscovery(
-        store=store, host="loki", advertise_address="192.168.1.149", zeroconf=ns
+        store=store,
+        host="loki",
+        advertise_address="192.168.1.149",
+        pub_port=18452,
+        snapshot_port=18453,
+        zeroconf=ns,
     )
     pd.start()
 
@@ -424,7 +435,12 @@ def test_start_creates_browser_for_service_type(store):
 def test_stop_unregisters_and_closes(store):
     ns = _FakeZeroconfNamespace()
     pd = PeerDiscovery(
-        store=store, host="loki", advertise_address="192.168.1.149", zeroconf=ns
+        store=store,
+        host="loki",
+        advertise_address="192.168.1.149",
+        pub_port=18462,
+        snapshot_port=18463,
+        zeroconf=ns,
     )
     pd.start()
     browser = pd._browser
@@ -449,7 +465,12 @@ def test_stop_before_start_is_a_no_op(store):
 def test_start_is_idempotent(store):
     ns = _FakeZeroconfNamespace()
     pd = PeerDiscovery(
-        store=store, host="loki", advertise_address="192.168.1.149", zeroconf=ns
+        store=store,
+        host="loki",
+        advertise_address="192.168.1.149",
+        pub_port=18472,
+        snapshot_port=18473,
+        zeroconf=ns,
     )
     pd.start()
     pd.start()
@@ -460,7 +481,12 @@ def test_start_is_idempotent(store):
 def test_stop_is_idempotent(store):
     ns = _FakeZeroconfNamespace()
     pd = PeerDiscovery(
-        store=store, host="loki", advertise_address="192.168.1.149", zeroconf=ns
+        store=store,
+        host="loki",
+        advertise_address="192.168.1.149",
+        pub_port=18482,
+        snapshot_port=18483,
+        zeroconf=ns,
     )
     pd.start()
     pd.stop()
@@ -476,7 +502,12 @@ def test_self_check_ok_when_own_registration_resolves(store, caplog):
     """
     ns = _FakeZeroconfNamespace()
     pd = PeerDiscovery(
-        store=store, host="loki", advertise_address="192.168.1.149", zeroconf=ns
+        store=store,
+        host="loki",
+        advertise_address="192.168.1.149",
+        pub_port=18492,
+        snapshot_port=18493,
+        zeroconf=ns,
     )
     pd.start()
     caplog.set_level("WARNING", logger="mbtools.registry.peering")
@@ -498,7 +529,12 @@ def test_self_check_warns_when_own_registration_stops_resolving(store, caplog):
     """
     ns = _FakeZeroconfNamespace()
     pd = PeerDiscovery(
-        store=store, host="loki", advertise_address="192.168.1.149", zeroconf=ns
+        store=store,
+        host="loki",
+        advertise_address="192.168.1.149",
+        pub_port=18502,
+        snapshot_port=18503,
+        zeroconf=ns,
     )
     pd.start()
     ns.instance.self_check_fails = True
@@ -520,7 +556,12 @@ def test_self_check_thread_is_started_and_stopped_with_peer_discovery(store):
     """
     ns = _FakeZeroconfNamespace()
     pd = PeerDiscovery(
-        store=store, host="loki", advertise_address="192.168.1.149", zeroconf=ns
+        store=store,
+        host="loki",
+        advertise_address="192.168.1.149",
+        pub_port=18512,
+        snapshot_port=18513,
+        zeroconf=ns,
     )
     assert pd._self_check_thread is None
     pd.start()
@@ -537,7 +578,9 @@ def test_default_host_and_advertise_address_are_not_empty(store):
     host's own hostname / best-effort LAN IP) -- confirms the escape
     hatches are optional, not required, for production use."""
     ns = _FakeZeroconfNamespace()
-    pd = PeerDiscovery(store=store, zeroconf=ns)
+    pd = PeerDiscovery(
+        store=store, zeroconf=ns, pub_port=18522, snapshot_port=18523
+    )
     pd.start()
 
     info = ns.instance.registered[0]
@@ -555,7 +598,9 @@ def test_browser_discovery_records_peer_end_to_end(store):
         store=store,
         host="loki",
         advertise_address="192.168.1.149",
-        remote_port=7440,
+        remote_port=18530,
+        pub_port=18532,
+        snapshot_port=18533,
         zeroconf=ns,
     )
     pd.start()
@@ -576,7 +621,9 @@ def test_browser_discovery_excludes_self_end_to_end(store):
         store=store,
         host="loki",
         advertise_address="192.168.1.149",
-        remote_port=7440,
+        remote_port=18540,
+        pub_port=18542,
+        snapshot_port=18543,
         zeroconf=ns,
     )
     pd.start()
@@ -598,6 +645,19 @@ def test_browser_discovery_excludes_self_end_to_end(store):
 
 
 def test_real_zeroconf_loopback_two_registries_discover_each_other(tmp_path):
+    # ticket 008-007: this is the one test in the package that uses the
+    # real ``zeroconf`` package rather than the fake namespace above, so
+    # it necessarily performs real mDNS multicast on the LAN, not just
+    # loopback-local traffic (mDNS/UDP 5353 is not loopback-scoped). Left
+    # on ``SERVICE_TYPE`` (the real ``_mbregistry._tcp.local.``), a real
+    # mbregistry daemon on the same LAN discovers these ephemeral
+    # "peer-a"/"peer-b" test hosts and logs them as if they were real
+    # peers -- confirmed via the dev Mac's LaunchAgent log. A dedicated,
+    # non-production service type keeps this test's real-zeroconf
+    # coverage while a production daemon (which only browses
+    # ``SERVICE_TYPE``) never sees or logs it.
+    _TEST_SERVICE_TYPE = "_mbregistry-test._tcp.local."
+
     store_a = Store(tmp_path / "a.db")
     store_b = Store(tmp_path / "b.db")
 
@@ -605,17 +665,19 @@ def test_real_zeroconf_loopback_two_registries_discover_each_other(tmp_path):
         store=store_a,
         host="peer-a",
         advertise_address="127.0.0.1",
-        remote_port=17440,
-        pub_port=17442,
-        snapshot_port=17443,
+        remote_port=19440,
+        pub_port=19442,
+        snapshot_port=19443,
+        service_type=_TEST_SERVICE_TYPE,
     )
     pd_b = PeerDiscovery(
         store=store_b,
         host="peer-b",
         advertise_address="127.0.0.1",
-        remote_port=27440,
-        pub_port=27442,
-        snapshot_port=27443,
+        remote_port=29440,
+        pub_port=29442,
+        snapshot_port=29443,
+        service_type=_TEST_SERVICE_TYPE,
     )
     pd_a.start()
     pd_b.start()
@@ -630,9 +692,9 @@ def test_real_zeroconf_loopback_two_registries_discover_each_other(tmp_path):
                 time.sleep(0.2)
 
         assert peer_of_a is not None, "host A never discovered host B via real mDNS"
-        assert peer_of_a.endpoint == "127.0.0.1:27440"
+        assert peer_of_a.endpoint == "127.0.0.1:29440"
         assert peer_of_b is not None, "host B never discovered host A via real mDNS"
-        assert peer_of_b.endpoint == "127.0.0.1:17440"
+        assert peer_of_b.endpoint == "127.0.0.1:19440"
     finally:
         pd_a.stop()
         pd_b.stop()

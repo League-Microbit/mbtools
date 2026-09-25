@@ -507,6 +507,27 @@ class RegistryClient:
         resp = self._request({"op": "unlock", "uid": uid})
         return bool(resp.get("released", False))
 
+    def force_unlock(self, uid: str) -> dict[str, Any] | None:
+        """Forcibly release ``uid``'s lock, regardless of who holds it,
+        and close the holder's own connection so it observes EOF rather
+        than silently losing exclusivity (sprint 008, ticket 003 --
+        ``mbregistry unlock --force``'s own op, local-socket only; there
+        is no remote-TCP-port equivalent, per sprint.md's Decisions).
+
+        Returns ``None`` (not an error) if ``uid`` was already unlocked
+        -- mirrors :meth:`~mbtools.registry.locks.LockManager
+        .force_release`'s own "no-op, not an error" contract. Otherwise
+        returns ``{"kind": ..., "holder": {...}}`` -- the released
+        lock's kind and the same holder wire shape a ``locked`` response
+        carries (including ``label``/``since``), so a caller can report
+        what it broke. Raises :class:`DeviceNotFoundError` if ``uid``
+        doesn't resolve.
+        """
+        resp = self._request({"op": "force_unlock", "uid": uid})
+        if not resp.get("released"):
+            return None
+        return {"kind": resp["kind"], "holder": resp["holder"]}
+
     # -- name-registry ops (sprint 004, ticket 005) -----------------------
     #
     # Not device ops -- no uid, no lock -- see ``registry._api_base``'s

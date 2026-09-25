@@ -107,6 +107,20 @@ would not be seen by the socket-level reader that follows. A client that
 already waits for each op's response before sending the next thing --
 true of every op this protocol has -- satisfies this for free.
 
+**The ``watch`` op (sprint 008, ticket 001)**: any connection may send
+``{"op": "watch"}`` -- no lock or other precondition required. On
+success (``{"ok": true}``), the connection leaves ordinary
+request/response dispatch for the rest of its life, exactly like
+``stream`` above, and instead receives one JSON line per event published
+on :attr:`RemoteAPIServer._eventbus` (subscribed at that moment; no
+snapshot of already-connected devices is sent -- see
+``_api_base.BaseAPIServer._handle_watch``'s own docstring for the
+change-only rationale) until the connection closes. This is the same
+shared mechanism ``api.RegistryAPIServer``'s local socket uses -- see
+that module's own docstring -- so a Node client (robot-console) gets
+change notifications without linking ``pyzmq`` or knowing this
+registry's PUB port, on either transport.
+
 **Remote flash and hex staging (sprint 003, ticket 008)**: a connection
 that already holds a ``flash``-kind lock on ``uid`` (via this same
 connection's own ``lock`` call -- checked via :class:`HolderRef` equality,
@@ -164,27 +178,12 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from mbtools.common import CODE_INVALID_REQUEST, CODE_NOT_LOCKED, CODE_UNAUTHORIZED
-from mbtools.registry._api_base import BaseAPIServer, _error
+from mbtools.registry._api_base import _WATCH, BaseAPIServer, _error
+from mbtools.registry.eventbus import EventBus
 from mbtools.registry.flashlogic import flash_hex
-from mbtools.registry.locks import KIND_FLASH, KIND_RELAY, KIND_SERIAL, HolderRef, LockManager
+from mbtools.registry.locks import KIND_FLASH, HolderRef, LockManager
 from mbtools.registry.store import DeviceRecord, Store
-from mbtools.registry.stream_frame import (
-    FRAME_BREAK,
-    FRAME_CLOSE,
-    FRAME_DATA,
-    FRAME_SET_DTR,
-    FRAME_SET_RTS,
-    FrameError,
-    encode_frame,
-    read_frame,
-)
-from mbtools.serial.connect import BAUD_RATE, BREAK_DURATION, OPEN_SETTLE, ConnectError, open_no_reboot
-
-try:  # pyserial is a declared dependency, but keep this importable without
-    # a real port available (mirrors serial.connect's own optional import).
-    import serial as _pyserial  # type: ignore
-except Exception:  # pragma: no cover
-    _pyserial = None  # type: ignore
+from mbtools.serial.connect import BAUD_RATE, BREAK_DURATION, OPEN_SETTLE
 
 __all__ = [
     "RemoteAPIServer",
@@ -274,6 +273,7 @@ class RemoteAPIServer(BaseAPIServer):
         stream_baud: int = BAUD_RATE,
         stream_settle_s: float | None = None,
         break_duration_s: float = BREAK_DURATION,
+        eventbus: EventBus | None = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -281,6 +281,11 @@ class RemoteAPIServer(BaseAPIServer):
         self._locks = locks
         self._auth_token = auth_token
         self._sweep_interval_s = sweep_interval_s
+        # Sprint 008 ticket 001: same "watch" event source as
+        # api.RegistryAPIServer's own eventbus parameter -- see that
+        # class's own docstring note for the default-when-omitted
+        # convention this mirrors.
+        self._eventbus = eventbus if eventbus is not None else EventBus()
         self._serial_factory = serial_factory
         self._stream_baud = stream_baud
         self._stream_settle = OPEN_SETTLE if stream_settle_s is None else stream_settle_s
@@ -481,6 +486,7 @@ class RemoteAPIServer(BaseAPIServer):
         try:
             authenticated = self._auth_token is None
             stream_record: DeviceRecord | None = None
+            watch_requested = False
             for raw_line in rfile:
                 line = raw_line.strip()
                 if not line:
@@ -490,17 +496,28 @@ class RemoteAPIServer(BaseAPIServer):
                     if not authenticated:
                         break
                     continue
-                stream_record = self._dispatch_line(
+                result = self._dispatch_line(
                     line, holder, acquired_uids, uploaded_hex_paths, wfile
                 )
-                if stream_record is not None:
+                if result is _WATCH:
+                    # sprint 008 ticket 001: "watch" was accepted -- same
+                    # "leaves ordinary request/response dispatch for the
+                    # rest of this connection's life" handoff "stream"
+                    # already uses, just to a JSON-lines event feed
+                    # instead of the binary frame sub-protocol.
+                    watch_requested = True
+                    break
+                if result is not None:
+                    stream_record = result
                     # ticket 007: "stream" was accepted -- the connection
                     # leaves newline-JSON framing for the rest of its
                     # life (module docstring's own note); nothing here
                     # goes back to reading JSON lines from `rfile` after
                     # this, ever, on any exit path.
                     break
-            if stream_record is not None:
+            if watch_requested:
+                self._handle_watch(wfile)
+            elif stream_record is not None:
                 self._handle_stream(conn, holder, acquired_uids, stream_record)
         except (ConnectionError, OSError):
             pass
@@ -560,15 +577,17 @@ class RemoteAPIServer(BaseAPIServer):
         acquired_uids: set[str],
         uploaded_hex_paths: set[str],
         wfile: Any,
-    ) -> DeviceRecord | None:
+    ) -> DeviceRecord | object | None:
         """Dispatch one JSON request line and write its response.
 
-        Returns ``None`` for every op except a successfully-accepted
-        ``stream`` (ticket 007), which returns the resolved
-        :class:`~mbtools.registry.store.DeviceRecord` to stream -- the
-        caller (:meth:`_handle_connection`) uses a non-``None`` return to
-        know it must stop reading JSON lines and hand the connection to
-        :meth:`_handle_stream` instead.
+        Returns ``None`` for every ordinary op; a successfully-accepted
+        ``stream`` (ticket 007) returns the resolved
+        :class:`~mbtools.registry.store.DeviceRecord` to stream; a
+        successfully-accepted ``watch`` (sprint 008 ticket 001) returns
+        the module-level :data:`_WATCH` sentinel. Either non-``None``
+        return tells the caller (:meth:`_handle_connection`) to stop
+        reading further JSON lines and hand the connection to
+        :meth:`_handle_stream`/:meth:`_handle_watch` respectively.
         """
         try:
             req = json.loads(line)
@@ -598,80 +617,20 @@ class RemoteAPIServer(BaseAPIServer):
             resp, record = self._op_stream_precheck(req, holder)
             self._write(wfile, resp)
             return record
+        elif op == "watch":
+            resp = self._op_watch()
+            self._write(wfile, resp)
+            return _WATCH
         else:
             resp = _error(CODE_INVALID_REQUEST, f"unknown op {op!r}")
         self._write(wfile, resp)
         return None
 
-    def _op_stream_precheck(
-        self, req: dict[str, Any], holder: HolderRef
-    ) -> tuple[dict[str, Any], DeviceRecord | None]:
-        """``stream(uid)`` (ticket 007): the JSON-op half only -- resolve
-        ``uid``, confirm *this connection's own* ``HolderRef`` already
-        holds a ``serial``- or ``relay``-kind lock on it (the same "this
-        connection's own holder, not merely some holder" check
-        ``api.RegistryAPIServer._op_flash`` makes for its own
-        ``flash``-kind precondition), and confirm the device has a known
-        port to open. Returns ``(resp, record)`` -- ``record`` is
-        ``None`` on any failure, or the resolved
-        :class:`~mbtools.registry.store.DeviceRecord` on success, for
-        :meth:`_handle_connection` to hand to :meth:`_handle_stream`.
-
-        ``relay``-kind was added by ticket 011's real-hardware pass: this
-        precheck originally only accepted ``KIND_SERIAL`` (ticket 007,
-        written for ``mbserial``'s own remote passthrough), and sprint
-        004's ``relay.channel.RemoteRelayChannel`` (ticket 004) was built
-        to call this same ``stream`` op after locking the device
-        ``relay``-kind -- but every test on both sides used a fake peer
-        (``tests/relay/test_cli.py``'s ``FakeRemoteRegistryClient`` never
-        exercises this real precheck), so the mismatch only surfaced as
-        an uncaught ``RegistryClientError`` ("stream requires a
-        serial-kind lock...") the first time ``mbrelay connect
-        <robot>@<host>`` was run against a real, different-host relay.
-        The raw byte-stream op itself (:meth:`_handle_stream`) has no
-        serial-specific behavior -- BREAK/DTR/RTS frames are meaningful
-        for a relay channel too (``RemoteRelayChannel`` uses exactly the
-        same ``RemoteStream.send_break()``/``set_dtr()``/``set_rts()``
-        primitives ``mbserial`` does, architecture Decision 4) -- so
-        widening the accepted kind set is the correct fix, not a
-        workaround; ``flash``/``debug``-kind locks are deliberately still
-        excluded, since neither of those has any legitimate reason to
-        open a raw byte stream.
-
-        Held under ``self._lock`` for exactly this bookkeeping, same as
-        every other op above -- opening the port itself happens later,
-        in :meth:`_handle_stream`, deliberately outside any lock (this
-        module's "serial port I/O never happens while holding the shared
-        lock" rule).
-        """
-        token = req.get("uid")
-        if not token:
-            return _error(CODE_INVALID_REQUEST, "'stream' requires 'uid'"), None
-        with self._lock:
-            record, err = self._resolve_visible(str(token))
-            if err is not None:
-                return err, None
-            assert record is not None
-            status = self._locks.status(record.uid)
-            if (
-                status is None
-                or status.kind not in (KIND_SERIAL, KIND_RELAY)
-                or status.holder != holder
-            ):
-                return (
-                    _error(
-                        CODE_NOT_LOCKED,
-                        f"{record.uid}: stream requires a serial- or relay-kind "
-                        "lock held by this connection (call 'lock' first)",
-                    ),
-                    None,
-                )
-            if not record.port:
-                return (
-                    _error(CODE_INVALID_REQUEST, f"{record.uid} has no known port to open"),
-                    None,
-                )
-            return {"ok": True}, record
+    # ``_op_stream_precheck`` is inherited from ``_api_base.BaseAPIServer``
+    # (relocated there sprint 008 ticket 004 -- see this module's own
+    # docstring, "The `stream` op and the binary sub-protocol" note, and
+    # that module's docstring for the full relocation story). No behavior
+    # change for an existing remote `stream` caller.
 
     # -- remote flash and hex staging (ticket 008) ------------------------
 
@@ -863,147 +822,9 @@ class RemoteAPIServer(BaseAPIServer):
             "error": error,
         }
 
-    # -- stream sub-protocol (ticket 007) ---------------------------------
-
-    def _handle_stream(
-        self,
-        conn: socket.socket,
-        holder: HolderRef,
-        acquired_uids: set[str],
-        record: DeviceRecord,
-    ) -> None:
-        """Run the binary data+control sub-protocol
-        (:mod:`mbtools.registry.stream_frame`) for a ``stream`` session
-        already accepted by :meth:`_op_stream_precheck`, until ``CLOSE``,
-        a malformed frame, or the connection ends.
-
-        Opens the local port with DTR/RTS held low (no reboot), via
-        :func:`mbtools.serial.connect.open_no_reboot` -- reused, not
-        duplicated, per ticket 007's own acceptance criterion -- and,
-        deliberately, entirely outside ``self._lock`` (the port I/O this
-        method and its reader thread do must never happen while holding
-        the shared store/locks lock). A background thread mirrors
-        ``serial.connect.interact``'s own reader-thread pattern, pumping
-        whatever the port produces back to the client as ``DATA`` frames;
-        this method's own loop reads frames from the client and applies
-        them (``DATA`` -> port write, ``BREAK`` -> a real serial break,
-        ``SET_DTR``/``SET_RTS`` -> the corresponding line). On any exit
-        path -- ``CLOSE``, a malformed frame, a port failure, or the
-        connection simply going away -- the port is closed and ``record
-        .uid``'s ``serial``-kind lock is released exactly once, the same
-        "always release on session end" guarantee
-        ``serial.connect.Session.close`` gives a local session.
-        """
-        uid = record.uid
-        port = record.port
-        assert port  # _op_stream_precheck already confirmed this
-
-        factory = self._serial_factory
-        if factory is None:
-            if _pyserial is None:  # pragma: no cover - pyserial is a dependency
-                logger.error(
-                    "remote_api: pyserial is not installed; cannot stream %s", uid
-                )
-                with self._lock:
-                    self._locks.release(uid, holder)
-                acquired_uids.discard(uid)
-                return
-            factory = _pyserial.Serial
-
-        try:
-            ser = open_no_reboot(factory, port, self._stream_baud, self._stream_settle)
-        except ConnectError:
-            logger.exception("remote_api: could not open %s for stream %s", port, uid)
-            with self._lock:
-                self._locks.release(uid, holder)
-            acquired_uids.discard(uid)
-            return
-
-        stop = threading.Event()
-
-        def _pump_port_to_client() -> None:
-            while not stop.is_set():
-                try:
-                    data = ser.read(max(1, ser.in_waiting))
-                except Exception:
-                    break  # port went away -- the main loop will notice too
-                if data:
-                    try:
-                        conn.sendall(encode_frame(FRAME_DATA, data))
-                    except OSError:
-                        break
-
-        reader = threading.Thread(
-            target=_pump_port_to_client, name=f"remote-stream-{uid}", daemon=True
-        )
-        reader.start()
-
-        def _read_exact(n: int) -> bytes:
-            chunks: list[bytes] = []
-            remaining = n
-            while remaining > 0:
-                chunk = conn.recv(remaining)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                remaining -= len(chunk)
-            return b"".join(chunks)
-
-        try:
-            while True:
-                try:
-                    frame = read_frame(_read_exact)
-                except FrameError as exc:
-                    logger.warning(
-                        "remote_api: malformed frame on stream %s (%s); closing", uid, exc
-                    )
-                    break
-                if frame is None:
-                    break  # clean EOF -- a plain connection drop
-                frame_type, payload = frame
-                if frame_type == FRAME_DATA:
-                    try:
-                        ser.write(payload)
-                    except Exception:
-                        logger.exception(
-                            "remote_api: write to %s failed on stream %s", port, uid
-                        )
-                        break
-                elif frame_type == FRAME_BREAK:
-                    try:
-                        ser.send_break(self._break_duration)
-                    except Exception:
-                        logger.exception(
-                            "remote_api: BREAK on %s failed on stream %s", port, uid
-                        )
-                        break
-                elif frame_type == FRAME_SET_DTR:
-                    if payload:
-                        ser.dtr = bool(payload[0])
-                elif frame_type == FRAME_SET_RTS:
-                    if payload:
-                        ser.rts = bool(payload[0])
-                elif frame_type == FRAME_CLOSE:
-                    break
-                else:
-                    logger.warning(
-                        "remote_api: unknown frame type %#x on stream %s; closing",
-                        frame_type,
-                        uid,
-                    )
-                    break
-        except (ConnectionError, OSError):
-            pass
-        finally:
-            stop.set()
-            reader.join(timeout=2.0)
-            try:
-                ser.close()
-            except Exception:
-                pass
-            with self._lock:
-                self._locks.release(uid, holder)
-            acquired_uids.discard(uid)
+    # ``_handle_stream`` is inherited from ``_api_base.BaseAPIServer``
+    # (relocated there sprint 008 ticket 004, mechanics unchanged) -- see
+    # that module's own docstring for the full relocation story.
 
     # -- visibility scope: this registry's own devices only ------------------
 

@@ -27,6 +27,7 @@ and the code disagree, the code wins. Run `<program> --help` or
 |---|---|---|
 | `mbregistry run` | The daemon. One per host. Watches USB, identifies micro:bits, keeps the device database, grants locks, peers with other hosts. | It *is* the daemon. |
 | `mbregistry list` | Client | yes |
+| `mbregistry unlock --force` | Client (local socket only) | yes |
 | `mbdeploy deploy / list / debug` | Client | yes |
 | `mbdeploy build` | Local build helper | no |
 | `mbserial` | Client | yes |
@@ -155,11 +156,18 @@ uv run pytest
 
 ```sh
 mbregistry --help && mbdeploy --help && mbserial --help && mbrelay --help
-/opt/mbtools/bin/python -c "import importlib.metadata as m; print(m.version('mbtools'))"
+mbregistry --version
 ```
 
-None of the four programs has a `--version` flag. Use the
-`importlib.metadata` line above, or `pip show mbtools`.
+`mbregistry` has a top-level `--version` flag (sprint 008 ticket 006,
+works without a subcommand): it prints `mbregistry <version>` — e.g.
+`mbregistry 0.20260924.6` — where `<version>` is
+`importlib.metadata.version("mbtools")`, and exits 0. This is the same
+version string the `--ready-json` line's `version` key reports (section
+3's spawn recipe). `mbdeploy`, `mbserial`, and `mbrelay` still have no
+`--version` flag of their own; for those, use
+`/opt/mbtools/bin/python -c "import importlib.metadata as m; print(m.version('mbtools'))"`
+or `pip show mbtools`.
 
 ## 3. `mbregistry run`: defaults
 
@@ -240,6 +248,12 @@ and interfaces whose names start with `docker`, `br-`, `veth`, `virbr`,
 
 ## 5. Flags and environment variables
 
+### `mbregistry` (top-level)
+
+| Flag | Env var | Default | Notes |
+|---|---|---|---|
+| `--version` | (none) | n/a | Print `mbregistry <version>` to stdout and exit 0; works without a subcommand (sprint 008 ticket 006) |
+
 ### `mbregistry run`
 
 | Flag | Env var | Default | Notes |
@@ -304,7 +318,8 @@ mbregistry run --socket /tmp/mbregistry-session/api.sock \
   prints goes to stderr, so a parent can read just stdout):
 
   ```json
-  {"ready": true, "instance": "session-1234", "socket": "/tmp/mbregistry-session/api.sock",
+  {"ready": true, "instance": "session-1234", "version": "0.20260924.6",
+   "socket": "/tmp/mbregistry-session/api.sock",
    "ports": {"remote": 7440, "pool": 7444, "names": 7445}}
   ```
 
@@ -316,6 +331,10 @@ mbregistry run --socket /tmp/mbregistry-session/api.sock \
   requested) **except** `peer_pub`/`peer_snapshot`, which report the
   resolved requested value — `registry.peering.PeerDiscovery` (unchanged
   this sprint) exposes no bound-port equivalent to read back from.
+  `version` (sprint 008 ticket 006) is `importlib.metadata.version
+  ("mbtools")` — the same string `mbregistry --version` prints, below —
+  so a spawning parent (robot-console's own minimum-version check) can
+  read it from either surface.
 - `--exit-with-parent` watches stdin for EOF (the parent closing its end of
   an inherited pipe, or dying outright) and then shuts down cleanly through
   the same path `SIGTERM` already takes.
@@ -335,6 +354,28 @@ mbregistry run --socket /tmp/mbregistry-session/api.sock \
 
 `mbdeploy deploy --repo` caches downloaded hex files in
 `~/.cache/mbtools/hex/<owner>/<repo>/<tag>/`.
+
+### `mbregistry unlock --force` (sprint 008)
+
+```text
+mbregistry unlock UID|NAME --force [--socket PATH]
+```
+
+A manual, operator-only override for a stale lock: drops the device's
+lock regardless of who holds it, and closes the holder's own connection
+so it observes EOF rather than silently losing exclusivity. `--force` is
+required — there is no non-forcing `unlock` subcommand to fall back to
+by omitting it. Local Unix socket / named pipe only: there is no
+equivalent on the remote TCP port, and no automatic pre-emption — this
+is always a deliberate action an operator takes. A device with no active
+lock reports `not locked` and exits `0`, not an error.
+
+```text
+$ mbregistry unlock 9d2f... --force
+mbregistry: 9d2f...: released flash lock (alice-laptop, 12m)
+$ mbregistry unlock 9d2f... --force
+mbregistry: 9d2f...: not locked
+```
 
 ### `mbregistry service install` / `uninstall` / `status`
 

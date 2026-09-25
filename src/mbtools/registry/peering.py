@@ -188,6 +188,36 @@ test" is required for peering, and unlike zeroconf's discovery-only
 concern, the ZeroMQ half's whole job (snapshot convergence, live event
 application, vanish detection) is only meaningfully proven against real
 sockets.
+
+**Peer reachability on the event bus, not onward over PUB (sprint 008
+ticket 001)**: :meth:`PeerDiscovery._on_peer_reachable`/
+:meth:`_on_peer_unreachable` -- already this module's own reachability
+callbacks, wired into every :class:`_PeerLink` -- additionally publish
+``EVENT_PEER_UP``/``EVENT_PEER_DOWN`` to :attr:`PeerDiscovery._eventbus`
+(an optional, injected :class:`~mbtools.registry.eventbus.EventBus`;
+``registry.cli``'s assembly always passes the one it constructs for the
+whole daemon pipeline). This is a purely local notification -- this
+host's own view of one peer's reachability is never re-published onward
+over this host's PUB socket to a third host (unlike every other event
+this module publishes); a peer never needs to know that *this* host
+noticed *it* going up or down, since that peer's own ``PeerDiscovery``
+independently detects its own links' state the same way. ``eventbus``
+defaults to ``None`` (no-op publish), unaffected for every pre-ticket
+caller/test that omits it -- see :meth:`PeerDiscovery.__init__`'s own
+docstring.
+
+The four wire-payload builder functions just below
+(:func:`daemon_event_payload`/:func:`lock_event_payload`/
+:func:`name_set_payload`/:func:`name_clear_payload`) are shared, pure
+helpers extracted from :meth:`PeerDiscovery.publish_daemon_event`/
+:meth:`publish_lock_event`/:meth:`publish_name_set`/
+:meth:`publish_name_clear` for the same reason: sprint.md's Decision 3
+has ``registry.cli``'s own assembly closures build the *same* wire-shaped
+event dict this module's own ``publish_*`` methods send over PUB, so a
+``watch`` client sees identical event shapes whether or not this host is
+peering with anyone -- extracting the shaping logic into one place per
+event type is what keeps the two call sites (this module's PUB path, and
+``cli.py``'s always-on event-bus path) from drifting apart.
 """
 
 from __future__ import annotations
@@ -196,12 +226,15 @@ import json
 import logging
 import socket as _socket
 import threading
+import time
 from typing import Any, Callable
 
 import zeroconf as _real_zeroconf
 import zmq as _real_zmq
 from zmq.utils.monitor import recv_monitor_message
 
+from mbtools.registry.eventbus import EventBus
+from mbtools.registry.locks import format_lock_suffix
 from mbtools.registry.netaddr import local_ip
 from mbtools.registry.identity import ProbeResult
 from mbtools.registry.store import (
@@ -229,6 +262,12 @@ __all__ = [
     "EVENT_LOCK_STATE",
     "EVENT_NAME_SET",
     "EVENT_NAME_CLEAR",
+    "EVENT_PEER_UP",
+    "EVENT_PEER_DOWN",
+    "daemon_event_payload",
+    "lock_event_payload",
+    "name_set_payload",
+    "name_clear_payload",
 ]
 
 logger = logging.getLogger(__name__)
@@ -271,6 +310,12 @@ EVENT_LOCK_STATE = "lock_state"
 # event bus -- see the module docstring's "sprint 004 ticket 002" note.
 EVENT_NAME_SET = "name_set"
 EVENT_NAME_CLEAR = "name_clear"
+
+# sprint 008 ticket 001: this host's own view of a peer's reachability --
+# published to the local EventBus only, never onward over PUB (see the
+# module docstring's "Peer reachability on the event bus" note).
+EVENT_PEER_UP = "peer_up"
+EVENT_PEER_DOWN = "peer_down"
 
 #: How long a snapshot REQ waits for its peer's REP reply before giving up.
 _DEFAULT_SNAPSHOT_TIMEOUT_MS = 5000
@@ -1121,6 +1166,98 @@ class _PeerLink:
         self._started = False
 
 
+# ---------------------------------------------------------------------------
+# sprint 008 ticket 001: pure event-payload builders, shared between this
+# module's own PUB-publishing methods (PeerDiscovery.publish_daemon_event/
+# publish_lock_event/publish_name_set/publish_name_clear) and registry.cli's
+# always-on event-bus fan-out closures -- see the module docstring's
+# "shared, pure helpers" note for why this extraction exists.
+# ---------------------------------------------------------------------------
+
+
+def daemon_event_payload(event_type: str, record: DeviceRecord) -> dict[str, Any] | None:
+    """The wire payload for one of :class:`~mbtools.registry.daemon.Daemon`'s
+    ``event_callback(event_type, record)`` calls -- ``event_type`` is one
+    of ``EVENT_ATTACH``/``EVENT_DETACH``/``EVENT_IDENTITY``. Returns
+    ``None`` when the event should be suppressed entirely (see below);
+    every other caller than :meth:`PeerDiscovery.publish_daemon_event`
+    (currently: ``registry.cli``'s event-bus fan-out closure) must honor
+    that ``None`` the same way -- never publish the event at all.
+
+    An ``EVENT_ATTACH``/``EVENT_IDENTITY`` for a record whose ``state``
+    is ``disconnected`` is suppressed (sprint 005 ticket 011): such a
+    record is a locally-owned row this host no longer has attached, and
+    publishing it would re-assert ownership of it on every peer/watch
+    subscriber -- the same stale-claim bug
+    :meth:`~mbtools.registry.store.Store.snapshot_local_devices` avoids
+    on the snapshot path. This does not lose the disconnect notification
+    -- a detach fires its own ``EVENT_DETACH`` publish, which is never
+    suppressed.
+    """
+    if event_type in (EVENT_ATTACH, EVENT_IDENTITY) and record.state == STATE_DISCONNECTED:
+        return None
+    if event_type == EVENT_ATTACH:
+        return {"uid": record.uid, "port": record.port, "vid_pid": record.vid_pid}
+    if event_type == EVENT_DETACH:
+        return {"uid": record.uid}
+    return {
+        "uid": record.uid,
+        "state": record.state,
+        "role": record.role,
+        "common_name": record.common_name,
+        "device_name": record.device_name,
+        "serial_payload": record.serial_payload,
+        "raw_announcement": record.raw_announcement,
+    }
+
+
+def lock_event_payload(
+    uid: str,
+    kind: str | None,
+    display: str | None,
+    label: str | None = None,
+    since: float | None = None,
+) -> dict[str, Any]:
+    """The wire payload for :class:`~mbtools.registry.locks.LockManager`'s
+    ``lock_display_callback(uid, kind, display, label, since)`` calls.
+
+    Sprint 008, ticket 002 extended this signature (rather than adding a
+    second payload builder, per ticket 001's own implementation note) to
+    carry ``label``/``since`` as their own keys, ``null`` on release just
+    like ``kind``/``display`` -- what a local ``watch`` client (this same
+    dict, published on the event bus) reads structured fields off of. A
+    receiving peer's own ``_apply_event`` (this module, below) never
+    reads these two keys back out of an incoming ``lock_state`` event --
+    it forwards only ``kind``/``display`` into
+    ``store.apply_remote_lock_state``, so no new SQLite column or
+    queryable field is added on the receiving side (Design Rationale
+    Decision 2's "no new PUB field" is about that replicated store shape,
+    not about these two harmless extra keys on the wire message itself).
+    """
+    return {"uid": uid, "kind": kind, "display": display, "label": label, "since": since}
+
+
+def name_set_payload(entry: Entry) -> dict[str, Any]:
+    """The wire payload for a ``name_registry`` ``set`` event -- every
+    field the receiving side's ``_apply_event``/``_apply_snapshot_name``
+    read is included; ``source`` is carried for wire completeness even
+    though applying always ends up ``SOURCE_REGISTRY`` on the receiving
+    side (see the module docstring's "Name registry replication" note).
+    """
+    return {
+        "name": entry.name,
+        "channel": entry.channel,
+        "group": entry.group,
+        "source": entry.source,
+        "updated": entry.updated,
+    }
+
+
+def name_clear_payload(name: str) -> dict[str, Any]:
+    """The wire payload for a ``name_registry`` ``clear`` event."""
+    return {"name": name}
+
+
 class PeerDiscovery:
     """mDNS advertise/browse (ticket 004) plus the ZeroMQ PUB/REP event
     bus and per-peer SUB/REQ links (ticket 005) for ``_mbregistry._tcp``
@@ -1158,6 +1295,7 @@ class PeerDiscovery:
         lock: threading.RLock | None = None,
         auth_token: str | None = None,
         self_check_interval_s: float = _DEFAULT_SELF_CHECK_INTERVAL_S,
+        eventbus: EventBus | None = None,
     ) -> None:
         self._store = store
         self._host = host if host is not None else _short_hostname()
@@ -1186,6 +1324,14 @@ class PeerDiscovery:
         #: handshake auth" note below and :meth:`_rep_loop`/
         #: :class:`_PeerLink`'s own use of it.
         self._auth_token = auth_token
+        #: Sprint 008 ticket 001: where :meth:`_on_peer_reachable`/
+        #: :meth:`_on_peer_unreachable` publish ``peer_up``/``peer_down``
+        #: -- see the module docstring's "Peer reachability on the event
+        #: bus" note. ``None`` (the default) leaves those two methods'
+        #: existing ``store.mark_peer_reachable``/``mark_peer_unreachable``
+        #: behavior completely unchanged, unaffected for every
+        #: pre-ticket-008-001 caller/test that omits it.
+        self._eventbus = eventbus
 
         self._zc: Any = None
         self._own_info: Any = None
@@ -1563,12 +1709,16 @@ class PeerDiscovery:
             self._store.mark_peer_unreachable(host)
         except KeyError:
             logger.warning("peering: unreachable callback for unknown peer %s", host)
+        if self._eventbus is not None:
+            self._eventbus.publish({"type": EVENT_PEER_DOWN, "host": host})
 
     def _on_peer_reachable(self, host: str) -> None:
         try:
             self._store.mark_peer_reachable(host)
         except KeyError:
             logger.warning("peering: reachable callback for unknown peer %s", host)
+        if self._eventbus is not None:
+            self._eventbus.publish({"type": EVENT_PEER_UP, "host": host})
 
     # -- ticket 005: publishing (this host's own event bus) -------------
 
@@ -1599,46 +1749,52 @@ class PeerDiscovery:
         wires this in directly (``Daemon(..., event_callback=peering.
         publish_daemon_event)``), no glue code needed at the call site.
 
-        ``event_type`` is one of ``EVENT_ATTACH``/``EVENT_DETACH``/
-        ``EVENT_IDENTITY``; the payload fields sent are exactly what
-        :func:`_apply_event`'s matching branch reads back out on the
-        receiving side.
-
-        An ``EVENT_ATTACH``/``EVENT_IDENTITY`` publish for a record whose
-        ``state`` is ``disconnected`` is suppressed (sprint 005 ticket
-        011): such a record is a locally-owned row this host no longer
-        has attached, and publishing it would re-assert ownership of it
-        on every peer -- the same stale-claim bug
-        :meth:`~mbtools.registry.store.Store.snapshot_local_devices`
-        avoids on the snapshot path. This does not lose the disconnect
-        notification -- a detach fires its own ``EVENT_DETACH`` publish
-        through this same method, which is never suppressed.
+        The payload is built by :func:`daemon_event_payload` (sprint 008
+        ticket 001 extracted this module-level, so ``registry.cli``'s
+        always-on event-bus fan-out can build the identical dict without
+        going through a live ``PeerDiscovery``/PUB socket -- see the
+        module docstring's "shared, pure helpers" note); a ``None``
+        result means the disconnected-state suppression below fired, and
+        nothing is published.
         """
-        if event_type in (EVENT_ATTACH, EVENT_IDENTITY) and record.state == STATE_DISCONNECTED:
+        payload = daemon_event_payload(event_type, record)
+        if payload is None:
             return
-        if event_type == EVENT_ATTACH:
-            payload = {"uid": record.uid, "port": record.port, "vid_pid": record.vid_pid}
-        elif event_type == EVENT_DETACH:
-            payload = {"uid": record.uid}
-        else:
-            payload = {
-                "uid": record.uid,
-                "state": record.state,
-                "role": record.role,
-                "common_name": record.common_name,
-                "device_name": record.device_name,
-                "serial_payload": record.serial_payload,
-                "raw_announcement": record.raw_announcement,
-            }
         self.publish_event(event_type, payload)
 
-    def publish_lock_event(self, uid: str, kind: str | None, display: str | None) -> None:
+    def publish_lock_event(
+        self,
+        uid: str,
+        kind: str | None,
+        display: str | None,
+        label: str | None = None,
+        since: float | None = None,
+    ) -> None:
         """Adapter matching :class:`~mbtools.registry.locks.LockManager`'s
         ``lock_display_callback`` signature exactly -- ticket 009's
         assembly wires this in directly (``LockManager(...,
         lock_display_callback=peering.publish_lock_event)``).
+
+        Sprint 008, ticket 002 (Design Rationale Decision 2): ``display``
+        gains ``label``/``since`` text baked in inline (e.g. ``"pid 4821
+        (alice-laptop, 12m)"``) before being sent, via the shared
+        :func:`~mbtools.registry.locks.format_lock_suffix` formatter --
+        so a peer's replicated ``remote_lock_display`` cache picks it up
+        automatically, with no new SQLite column or PUB-replicated field
+        on the receiving side (``store.apply_remote_lock_state`` keeps
+        its original three-argument shape; see :func:`_apply_event`'s
+        ``EVENT_LOCK_STATE`` branch below). ``label``/``since`` also ride
+        along as their own keys on the published payload (via
+        :func:`lock_event_payload`, extended together with this method's
+        signature per ticket 001's own note) for a ``watch`` client
+        reusing this identical event shape -- harmless extra keys a peer
+        receiver never reads back out.
         """
-        self.publish_event(EVENT_LOCK_STATE, {"uid": uid, "kind": kind, "display": display})
+        suffix = format_lock_suffix(label, since, now=time.time())
+        wire_display = f"{display}{suffix}" if display is not None else display
+        self.publish_event(
+            EVENT_LOCK_STATE, lock_event_payload(uid, kind, wire_display, label, since)
+        )
 
     def publish_name_set(self, entry: Entry) -> None:
         """Publish a ``name_registry`` ``set`` event for ``entry`` (ticket
@@ -1651,23 +1807,8 @@ class PeerDiscovery:
         ``event_callback``/``LockManager``'s ``lock_display_callback``
         already invoke :meth:`publish_daemon_event`/:meth:`publish_lock_event`
         after their own local writes.
-
-        Every field of ``entry`` the receiving side's ``_apply_event``/
-        ``_apply_snapshot_name`` read is included; ``source`` is carried
-        for wire completeness even though applying always ends up
-        ``SOURCE_REGISTRY`` on the receiving side (see the module
-        docstring's "Name registry replication" note).
         """
-        self.publish_event(
-            EVENT_NAME_SET,
-            {
-                "name": entry.name,
-                "channel": entry.channel,
-                "group": entry.group,
-                "source": entry.source,
-                "updated": entry.updated,
-            },
-        )
+        self.publish_event(EVENT_NAME_SET, name_set_payload(entry))
 
     def publish_name_clear(self, name: str) -> None:
         """Publish a ``name_registry`` ``clear`` event for ``name``
@@ -1675,4 +1816,4 @@ class PeerDiscovery:
         local ``Store.clear(name)`` call succeeds. Same "not wired to a
         call site by this ticket" note as :meth:`publish_name_set`.
         """
-        self.publish_event(EVENT_NAME_CLEAR, {"name": name})
+        self.publish_event(EVENT_NAME_CLEAR, name_clear_payload(name))

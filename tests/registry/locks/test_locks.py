@@ -25,12 +25,23 @@ from mbtools.registry.locks import (
     LockHeldError,
     LockManager,
     LockStatus,
+    format_lock_suffix,
 )
 
 UID = "uid-1"
 UID2 = "uid-2"
 PID = 1001
 PID2 = 1002
+
+#: A fixed clock (sprint 008, ticket 002) for tests that assert
+#: ``LockStatus.since``/a lock-display callback's ``since`` argument by
+#: value -- injected via ``LockManager(now_fn=...)`` so those assertions
+#: don't depend on real wall-clock time.
+FIXED_NOW = 1_700_000_000.0
+
+
+def _fixed_now() -> float:
+    return FIXED_NOW
 
 
 def _local(pid: int) -> HolderRef:
@@ -50,12 +61,14 @@ HOLDER2 = _local(PID2)
 
 
 def test_acquire_grants_lock_on_unlocked_device():
-    manager = LockManager()
+    manager = LockManager(now_fn=_fixed_now)
 
     granted = manager.acquire(UID, KIND_SERIAL, HOLDER)
 
     assert granted is True
-    assert manager.status(UID) == LockStatus(kind=KIND_SERIAL, holder=HOLDER)
+    assert manager.status(UID) == LockStatus(
+        kind=KIND_SERIAL, holder=HOLDER, label=None, since=FIXED_NOW
+    )
 
 
 def test_status_none_for_unlocked_device():
@@ -69,7 +82,7 @@ def test_status_none_for_unlocked_device():
 
 
 def test_acquire_when_already_locked_raises_with_holder_info():
-    manager = LockManager()
+    manager = LockManager(now_fn=_fixed_now)
     manager.acquire(UID, KIND_SERIAL, HOLDER)
 
     with pytest.raises(LockHeldError) as exc_info:
@@ -77,18 +90,20 @@ def test_acquire_when_already_locked_raises_with_holder_info():
 
     err = exc_info.value
     assert err.uid == UID
-    assert err.holder == LockStatus(kind=KIND_SERIAL, holder=HOLDER)
+    assert err.holder == LockStatus(kind=KIND_SERIAL, holder=HOLDER, label=None, since=FIXED_NOW)
 
 
 def test_failed_acquire_does_not_mutate_state():
-    manager = LockManager()
+    manager = LockManager(now_fn=_fixed_now)
     manager.acquire(UID, KIND_SERIAL, HOLDER)
 
     with pytest.raises(LockHeldError):
         manager.acquire(UID, KIND_FLASH, HOLDER2)
 
     # Original holder is untouched -- not overwritten, not cleared.
-    assert manager.status(UID) == LockStatus(kind=KIND_SERIAL, holder=HOLDER)
+    assert manager.status(UID) == LockStatus(
+        kind=KIND_SERIAL, holder=HOLDER, label=None, since=FIXED_NOW
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -107,18 +122,86 @@ def test_release_by_current_holder_unlocks_device():
 
 
 def test_release_with_wrong_holder_is_noop():
-    manager = LockManager()
+    manager = LockManager(now_fn=_fixed_now)
     manager.acquire(UID, KIND_SERIAL, HOLDER)
 
     released = manager.release(UID, HOLDER2)
 
     assert released is False
-    assert manager.status(UID) == LockStatus(kind=KIND_SERIAL, holder=HOLDER)
+    assert manager.status(UID) == LockStatus(
+        kind=KIND_SERIAL, holder=HOLDER, label=None, since=FIXED_NOW
+    )
 
 
 def test_release_of_unlocked_device_is_noop():
     manager = LockManager()
     assert manager.release(UID, HOLDER) is False
+
+
+# ---------------------------------------------------------------------------
+# force_release (sprint 008, ticket 003)
+# ---------------------------------------------------------------------------
+
+
+def test_force_release_releases_regardless_of_holder():
+    manager = LockManager(now_fn=_fixed_now)
+    manager.acquire(UID, KIND_SERIAL, HOLDER)
+
+    released = manager.force_release(UID)
+
+    assert released == LockStatus(kind=KIND_SERIAL, holder=HOLDER, label=None, since=FIXED_NOW)
+    assert manager.status(UID) is None
+
+
+def test_force_release_of_unlocked_device_is_noop_not_error():
+    manager = LockManager()
+    assert manager.force_release(UID) is None
+
+
+def test_force_release_leaves_release_holder_equality_check_untouched():
+    """Acceptance criterion: force_release is a separate method, not a
+    bypass parameter on release -- release() still refuses a
+    non-matching holder after a force_release call exists in the API at
+    all."""
+    manager = LockManager()
+    manager.acquire(UID, KIND_SERIAL, HOLDER)
+
+    assert manager.release(UID, HOLDER2) is False
+    assert manager.status(UID) is not None
+
+
+def test_force_release_fires_flash_release_callback():
+    fired = []
+    manager = LockManager(flash_release_callback=fired.append)
+    manager.acquire(UID, KIND_FLASH, HOLDER)
+
+    manager.force_release(UID)
+
+    assert fired == [UID]
+
+
+def test_force_release_fires_lock_display_callback_same_as_ordinary_release():
+    calls = []
+    manager = LockManager(lock_display_callback=lambda *args: calls.append(args))
+    manager.acquire(UID, KIND_SERIAL, HOLDER, label="alice-laptop")
+    calls.clear()
+
+    manager.force_release(UID)
+
+    assert calls == [(UID, None, None, None, None)]
+
+
+def test_force_release_noop_does_not_fire_callbacks():
+    flash_calls = []
+    display_calls = []
+    manager = LockManager(
+        flash_release_callback=flash_calls.append,
+        lock_display_callback=lambda *args: display_calls.append(args),
+    )
+
+    assert manager.force_release(UID) is None
+    assert flash_calls == []
+    assert display_calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -146,7 +229,7 @@ def test_never_locked_and_released_devices_are_indistinguishable():
 
 
 def test_sweep_releases_only_dead_holders():
-    manager = LockManager()
+    manager = LockManager(now_fn=_fixed_now)
     manager.acquire(UID, KIND_SERIAL, HOLDER)
     manager.acquire(UID2, KIND_DEBUG, HOLDER2)
 
@@ -157,17 +240,21 @@ def test_sweep_releases_only_dead_holders():
 
     assert released_uids == [UID]
     assert manager.status(UID) is None
-    assert manager.status(UID2) == LockStatus(kind=KIND_DEBUG, holder=HOLDER2)
+    assert manager.status(UID2) == LockStatus(
+        kind=KIND_DEBUG, holder=HOLDER2, label=None, since=FIXED_NOW
+    )
 
 
 def test_sweep_with_all_holders_alive_releases_nothing():
-    manager = LockManager()
+    manager = LockManager(now_fn=_fixed_now)
     manager.acquire(UID, KIND_SERIAL, HOLDER)
 
     released_uids = manager.sweep(lambda holder: True)
 
     assert released_uids == []
-    assert manager.status(UID) == LockStatus(kind=KIND_SERIAL, holder=HOLDER)
+    assert manager.status(UID) == LockStatus(
+        kind=KIND_SERIAL, holder=HOLDER, label=None, since=FIXED_NOW
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -182,14 +269,16 @@ def test_remote_holder_acquire_release_sweep_conflict_reporting():
     conflict-reporting -- no real network involved, LockManager
     constructed and driven directly.
     """
-    manager = LockManager()
+    manager = LockManager(now_fn=_fixed_now)
     remote_holder = HolderRef(
         origin="remote", ref="session-abc", host="loki"
     )
 
     # acquire
     assert manager.acquire(UID, KIND_SERIAL, remote_holder) is True
-    assert manager.status(UID) == LockStatus(kind=KIND_SERIAL, holder=remote_holder)
+    assert manager.status(UID) == LockStatus(
+        kind=KIND_SERIAL, holder=remote_holder, label=None, since=FIXED_NOW
+    )
     assert manager.status(UID).pid is None  # remote holder has no pid
 
     # conflict-reporting: a second acquire on the same uid is refused,
@@ -306,27 +395,50 @@ def test_flash_callback_fires_exactly_once_per_release():
 
 # ---------------------------------------------------------------------------
 # lock-display callback (ticket 005) -- fires on every acquire/release,
-# any kind, carrying (uid, kind, display) -- never the raw HolderRef.
+# any kind, carrying (uid, kind, display, label, since) (sprint 008,
+# ticket 002 widened the tuple from (uid, kind, display) to carry the new
+# per-acquisition label/since fields alongside it) -- never the raw
+# HolderRef.
 # ---------------------------------------------------------------------------
 
 
 def test_display_callback_fires_on_acquire_with_local_holder_display():
     calls = []
-    manager = LockManager(lock_display_callback=lambda *args: calls.append(args))
+    manager = LockManager(
+        lock_display_callback=lambda *args: calls.append(args), now_fn=_fixed_now
+    )
 
     manager.acquire(UID, KIND_SERIAL, HOLDER)
 
-    assert calls == [(UID, KIND_SERIAL, f"pid {PID}")]
+    assert calls == [(UID, KIND_SERIAL, f"pid {PID}", None, FIXED_NOW)]
 
 
 def test_display_callback_fires_on_acquire_with_remote_holder_display():
     calls = []
-    manager = LockManager(lock_display_callback=lambda *args: calls.append(args))
+    manager = LockManager(
+        lock_display_callback=lambda *args: calls.append(args), now_fn=_fixed_now
+    )
     remote_holder = HolderRef(origin="remote", ref="session-abc", host="loki")
 
     manager.acquire(UID, KIND_FLASH, remote_holder)
 
-    assert calls == [(UID, KIND_FLASH, "session session-abc on loki")]
+    assert calls == [(UID, KIND_FLASH, "session session-abc on loki", None, FIXED_NOW)]
+
+
+def test_display_callback_carries_the_supplied_label():
+    """Sprint 008, ticket 002: an optional ``label`` passed to
+    ``acquire`` rides through to the display callback's fourth
+    argument, alongside the unchanged ``display`` text (never folded
+    into it -- that's ``registry.render``/``registry.peering``'s own
+    job, not this module's)."""
+    calls = []
+    manager = LockManager(
+        lock_display_callback=lambda *args: calls.append(args), now_fn=_fixed_now
+    )
+
+    manager.acquire(UID, KIND_SERIAL, HOLDER, label="alice-laptop")
+
+    assert calls == [(UID, KIND_SERIAL, f"pid {PID}", "alice-laptop", FIXED_NOW)]
 
 
 def test_display_callback_never_receives_the_raw_holder_ref():
@@ -335,7 +447,7 @@ def test_display_callback_never_receives_the_raw_holder_ref():
 
     manager.acquire(UID, KIND_SERIAL, HOLDER)
 
-    _uid, _kind, display = calls[0]
+    _uid, _kind, display, _label, _since = calls[0]
     assert isinstance(display, str)
     assert not isinstance(display, HolderRef)
 
@@ -348,7 +460,7 @@ def test_display_callback_fires_on_release_with_none_none():
 
     manager.release(UID, HOLDER)
 
-    assert calls == [(UID, None, None)]
+    assert calls == [(UID, None, None, None, None)]
 
 
 def test_display_callback_fires_for_every_kind_not_only_flash():
@@ -361,7 +473,7 @@ def test_display_callback_fires_for_every_kind_not_only_flash():
 
     manager.release(UID, HOLDER)
 
-    assert calls == [(UID, None, None)]
+    assert calls == [(UID, None, None, None, None)]
 
 
 def test_display_callback_not_fired_on_failed_acquire():
@@ -395,7 +507,7 @@ def test_display_callback_fires_on_sweep_release():
 
     manager.sweep(lambda holder: False)  # everyone dead
 
-    assert calls == [(UID, None, None)]
+    assert calls == [(UID, None, None, None, None)]
 
 
 def test_both_callbacks_fire_independently_for_flash_release():
@@ -411,7 +523,7 @@ def test_both_callbacks_fire_independently_for_flash_release():
     manager.release(UID, HOLDER)
 
     assert flash_calls == [UID]
-    assert display_calls == [(UID, None, None)]
+    assert display_calls == [(UID, None, None, None, None)]
 
 
 def test_no_display_callback_registered_is_a_silent_no_op():
@@ -425,6 +537,95 @@ def test_no_display_callback_registered_is_a_silent_no_op():
     manager.release(UID, HOLDER)  # would raise if release assumed a callback exists
 
     assert manager.status(UID) is None
+
+
+# ---------------------------------------------------------------------------
+# label/since (sprint 008, ticket 002) -- per-acquisition, not per-holder
+# ---------------------------------------------------------------------------
+
+
+def test_acquire_without_label_leaves_label_none():
+    manager = LockManager(now_fn=_fixed_now)
+
+    manager.acquire(UID, KIND_SERIAL, HOLDER)
+
+    status = manager.status(UID)
+    assert status.label is None
+    assert status.since == FIXED_NOW
+
+
+def test_acquire_with_label_sets_label_and_since():
+    manager = LockManager(now_fn=_fixed_now)
+
+    manager.acquire(UID, KIND_SERIAL, HOLDER, label="alice-laptop")
+
+    status = manager.status(UID)
+    assert status.label == "alice-laptop"
+    assert status.since == FIXED_NOW
+
+
+def test_since_is_stamped_fresh_per_acquisition_not_cached_on_holder():
+    """Proves ``since`` lives on ``LockStatus`` (per-acquisition), not on
+    ``HolderRef`` (per-connection, reused across every lock that
+    connection acquires) -- sprint.md's Design Rationale Decision 1's own
+    reason for the placement. The *same* ``HolderRef`` acquiring two
+    different uids at two different times gets two independent ``since``
+    values, not one shared value fixed at first use."""
+    clock = iter([100.0, 200.0])
+    manager = LockManager(now_fn=lambda: next(clock))
+
+    manager.acquire(UID, KIND_SERIAL, HOLDER)
+    manager.acquire(UID2, KIND_DEBUG, HOLDER)  # same holder, later acquisition
+
+    assert manager.status(UID).since == 100.0
+    assert manager.status(UID2).since == 200.0
+
+    # And releasing + re-acquiring the same uid with the same holder
+    # stamps a fresh since, not the original one.
+    manager.release(UID, HOLDER)
+    clock2 = iter([300.0])
+    manager2 = LockManager(now_fn=lambda: next(clock2))
+    manager2.acquire(UID, KIND_SERIAL, HOLDER)
+    assert manager2.status(UID).since == 300.0
+
+
+def test_label_never_participates_in_release_holder_matching():
+    """AC: LockManager.release's holder-equality check is unaffected --
+    label/since never participate in matching who may release a lock.
+    Proven by acquiring with a label, then releasing with the identical
+    HolderRef (no label concept on HolderRef at all) -- it still
+    succeeds, since release matches on HolderRef, never on LockStatus."""
+    manager = LockManager(now_fn=_fixed_now)
+    manager.acquire(UID, KIND_SERIAL, HOLDER, label="alice-laptop")
+
+    assert manager.release(UID, HOLDER) is True
+    assert manager.status(UID) is None
+
+
+# ---------------------------------------------------------------------------
+# format_lock_suffix (sprint 008, ticket 002) -- the shared display
+# formatter registry.render/registry.peering both use.
+# ---------------------------------------------------------------------------
+
+
+def test_format_lock_suffix_empty_when_since_is_none():
+    assert format_lock_suffix("alice-laptop", None, now=FIXED_NOW) == ""
+    assert format_lock_suffix(None, None, now=FIXED_NOW) == ""
+
+
+def test_format_lock_suffix_with_label_and_since():
+    assert format_lock_suffix("alice-laptop", FIXED_NOW - 725, now=FIXED_NOW) == (
+        " (alice-laptop, 12m)"
+    )
+
+
+def test_format_lock_suffix_with_since_only():
+    assert format_lock_suffix(None, FIXED_NOW - 725, now=FIXED_NOW) == " (12m)"
+
+
+def test_format_lock_suffix_seconds_and_hours():
+    assert format_lock_suffix(None, FIXED_NOW - 30, now=FIXED_NOW) == " (30s)"
+    assert format_lock_suffix(None, FIXED_NOW - 7200, now=FIXED_NOW) == " (2h)"
 
 
 # ---------------------------------------------------------------------------

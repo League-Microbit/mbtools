@@ -253,6 +253,35 @@ def test_apply_event_lock_state_sets_display_cache(store):
     assert record.remote_lock_display is None
 
 
+def test_apply_event_lock_state_ignores_label_and_since_keys(store):
+    """Sprint 008, ticket 002: even when an incoming ``lock_state`` event
+    carries ``label``/``since`` keys (sent alongside a baked-in
+    ``display``, per ``lock_event_payload``), the receiving side only
+    ever reads ``kind``/``display`` off it -- no new SQLite column or
+    queryable field is added by this ticket (Design Rationale Decision
+    2's "no new PUB field" is about this replicated shape)."""
+    peering_mod._apply_event(store, "alpha", {"type": "attach", "uid": UID, "port": "p", "vid_pid": "v"})
+
+    peering_mod._apply_event(
+        store,
+        "alpha",
+        {
+            "type": "lock_state",
+            "uid": UID,
+            "kind": "flash",
+            "display": "pid 4821 (alice-laptop, 3m)",
+            "label": "alice-laptop",
+            "since": 1000.0,
+        },
+    )
+
+    record = store.get(UID)
+    assert record.remote_lock_kind == "flash"
+    assert record.remote_lock_display == "pid 4821 (alice-laptop, 3m)"
+    assert not hasattr(record, "remote_lock_label")
+    assert not hasattr(record, "remote_lock_since")
+
+
 def test_apply_event_for_unknown_uid_is_dropped_not_raised(store):
     # No preceding "attach" -- detach/identity/lock_state for a uid this
     # store has never heard of must be logged and dropped, never raise.
@@ -472,6 +501,38 @@ def test_publish_daemon_event_suppresses_attach_for_disconnected_record(store):
     peering.publish_daemon_event(peering_mod.EVENT_ATTACH, record)
     assert len(published) == 2
     assert published[1][0] == peering_mod.EVENT_ATTACH
+
+
+def test_publish_lock_event_bakes_label_and_since_into_display(store):
+    """Sprint 008, ticket 002, Design Rationale Decision 2: a peer's
+    replicated ``remote_lock_display`` string carries label/since as
+    baked-in text, not a new SQLite column or PUB field -- proven here at
+    the ``publish_lock_event``/``lock_event_payload`` boundary, before
+    ``test_apply_event_lock_state_sets_display_cache`` proves the
+    receiving side never reads the ``label``/``since`` keys back out."""
+    peering = _make_peering(store, host="torture", pub_port=17594, snapshot_port=17595)
+    published: list[tuple[str, dict]] = []
+    peering.publish_event = lambda event_type, payload: published.append((event_type, payload))
+
+    peering.publish_lock_event(UID, "flash", "pid 4821", "alice-laptop", time.time())
+
+    assert len(published) == 1
+    event_type, payload = published[0]
+    assert event_type == peering_mod.EVENT_LOCK_STATE
+    assert payload["display"].startswith("pid 4821 (alice-laptop, ")
+    assert payload["label"] == "alice-laptop"
+    assert payload["since"] is not None
+
+    # No label/since -- display is passed through unchanged, same as
+    # before this ticket.
+    published.clear()
+    peering.publish_lock_event(UID, "flash", "pid 4821")
+    assert published[0][1]["display"] == "pid 4821"
+
+    # A release (kind/display both None) never grows a suffix.
+    published.clear()
+    peering.publish_lock_event(UID, None, None)
+    assert published[0][1]["display"] is None
 
 
 def test_snapshot_payload_round_trips_through_apply(store):

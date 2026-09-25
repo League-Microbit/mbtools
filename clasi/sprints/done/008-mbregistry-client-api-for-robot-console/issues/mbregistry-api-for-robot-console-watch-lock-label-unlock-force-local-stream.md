@@ -8,6 +8,8 @@ tickets:
 - 008-003
 - 008-004
 - 008-005
+- 008-006
+- 008-007
 ---
 
 # mbregistry client API for robot-console: watch, lock label and since, unlock --force, stream on the local socket

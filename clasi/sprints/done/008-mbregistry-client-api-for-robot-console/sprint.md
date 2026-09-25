@@ -1,7 +1,7 @@
 ---
 id: 008
 title: mbregistry client API for robot-console
-status: ticketing
+status: done
 branch: sprint/008-mbregistry-client-api-for-robot-console
 use-cases:
 - SUC-001
@@ -532,5 +532,7 @@ Before tickets can be created, all of the following must be true:
 | 003 | mbregistry unlock --force | 002 |
 | 004 | stream op on the local socket | 002 |
 | 005 | Hardware acceptance: watch and unlock --force | 001, 002, 003, 004 |
+| 006 | mbregistry --version flag and version in --ready-json | — |
+| 007 | Make test_peering.py use ephemeral ports instead of the fixed production peering ports | — |
 
 Tickets execute serially in the order listed.

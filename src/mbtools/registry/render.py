@@ -19,8 +19,10 @@ rendering code exists").
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
+from mbtools.registry.locks import format_lock_suffix
 from mbtools.registry.store import (
     STATE_ATTACHED_NO_ANNOUNCE,
     STATE_ATTACHED_UNPROBED,
@@ -57,13 +59,24 @@ def _sort_devices(devices: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(devices, key=lambda d: d.get("short_uid") or d["uid"])
 
 
-def _state_cell(device: dict[str, Any]) -> str:
+def _state_cell(device: dict[str, Any], now: float) -> str:
     """UC-004's STATE column: ``free`` / ``locked by <kind> pid <n>`` /
     ``no-answer`` / ``no-firmware`` / ``gone`` / ``peer unreachable``.
     Lock status (folded into the ``list`` response by
     ``api._device_dict``) takes precedence over either no-firmware state
     -- a device can be locked (e.g. mid-flash) while its last-known state
     is still one of those, and the lock is the more useful thing to show.
+
+    Sprint 008 (ticket 002): a local row's lock cell appends the held
+    lock's label/since text (``format_lock_suffix``, e.g. ``"locked by
+    serial pid 4821 (alice-laptop, 12m)"``) when ``lock_since`` is set --
+    ``now`` (threaded down from :func:`render_table`, never read
+    internally, keeping this module's "no I/O outside its own arguments"
+    contract) is what the elapsed age is computed against. A peer-owned
+    row needs no equivalent change here: its ``remote_lock_display``
+    cell already carries the same text, baked in by
+    ``registry.peering.publish_lock_event`` (Design Rationale Decision 2)
+    before it ever reaches this store.
 
     Sprint 007 (ticket 001): ``no-answer`` (:data:`STATE_ATTACHED_NO_ANNOUNCE`)
     is a probe that got nothing back but doesn't know the board is blank;
@@ -96,7 +109,10 @@ def _state_cell(device: dict[str, Any]) -> str:
     else:
         lock_kind = device.get("lock_kind")
         if lock_kind:
-            return f"locked by {lock_kind} pid {device.get('lock_pid')}"
+            suffix = format_lock_suffix(
+                device.get("lock_label"), device.get("lock_since"), now=now
+            )
+            return f"locked by {lock_kind} pid {device.get('lock_pid')}{suffix}"
     if device["state"] == STATE_ATTACHED_NO_ANNOUNCE:
         return "no-answer"
     if device["state"] == STATE_CONNECTED_NO_FIRMWARE:
@@ -161,7 +177,7 @@ def _table(rows: list[list[str]], headers: list[str]) -> str:
     return "\n".join(out)
 
 
-def render_table(devices: list[dict[str, Any]]) -> str:
+def render_table(devices: list[dict[str, Any]], *, now: float | None = None) -> str:
     """The STATE/NAME/UID/FIRMWARE/HOST/PORT table -- exactly one header
     line, one rule line, and one row per device, nothing else (sprint 007,
     ticket 001 / SUC-003: ``render_table``'s output never contains a line
@@ -180,7 +196,16 @@ def render_table(devices: list[dict[str, Any]]) -> str:
     An empty ``devices`` list renders as the same "no devices known to
     the registry" line ``mbregistry list`` has always shown instead of an
     empty table.
+
+    ``now`` (sprint 008, ticket 002), if given, is the timestamp a local
+    row's lock-age suffix (see :func:`_state_cell`) is computed against
+    -- a test passes a fixed value for a deterministic assertion.
+    Defaults to :func:`time.time` (this function's only I/O, mirroring
+    every other module's ``now_fn``-style convention rather than
+    threading a clock through every caller that doesn't care about it).
     """
+    if now is None:
+        now = time.time()
     devices = _sort_devices(devices)
 
     if not devices:
@@ -188,7 +213,7 @@ def render_table(devices: list[dict[str, Any]]) -> str:
 
     rows = [
         [
-            _state_cell(d),
+            _state_cell(d, now),
             d.get("device_name") or d.get("chip_identity_name") or "-",
             d.get("short_uid") or d["uid"][-8:],
             _firmware_cell(d),

@@ -5,13 +5,16 @@ over a local Unix socket, and, since sprint 003 ticket 006, by
 `mbtools.registry.remote_api.RemoteAPIServer` over TCP for the same
 `list`/`find`/`lock`/`unlock`/`mark_flashed` ops (see "Remote TCP control
 plane" below) — the two share one dispatch implementation
-(`mbtools.registry._api_base.BaseAPIServer`) — plus, TCP-only, a `stream`
-op (sprint 003, ticket 007) that switches the connection into a separate
-binary framed sub-protocol (`mbtools.registry.stream_frame`) for serial
-data and out-of-band control, and, local-socket-only as of sprint 004
+(`mbtools.registry._api_base.BaseAPIServer`), which also now includes a
+`stream` op (sprint 003, ticket 007; relocated into this shared base,
+and dispatched by both transports, sprint 008 ticket 004) that switches
+the connection into a separate binary framed sub-protocol
+(`mbtools.registry.stream_frame`) for serial data and out-of-band
+control — see "`stream`" below. Local-socket-only as of sprint 004
 ticket 005, four name-registry ops (`names_get`/`names_set`/
 `names_clear`/`names_list` — see "Name-registry ops" below) that are not
-device ops at all. Since sprint 005 ticket 003,
+device ops at all; also local-socket-only, sprint 008 ticket 003's
+`force_unlock`. Since sprint 005 ticket 003,
 `mbtools.registry.api_windows.WindowsPipeAPIServer` is a third server
 sharing that same dispatch implementation, over a Windows named pipe
 instead of a Unix socket — the local-socket transport's Windows
@@ -52,12 +55,14 @@ Every request is a JSON object with an `"op"` field:
 | `get` / `find` | `uid` | resolve a device by uid, short_uid, or device_name (`store.find`'s precedence) — `get` and `find` are aliases for the same op |
 | `lock` | `uid`, `kind` | acquire an exclusive lock of `kind` (`serial`/`relay`/`flash`/`debug`) on the device, tied to this connection's peer PID |
 | `unlock` | `uid` | release this connection's own lock on the device (a no-op, not an error, if this connection doesn't hold it) |
+| `force_unlock` | `uid` | sprint 008, ticket 003: **local Unix socket only** (never dispatched on the remote TCP port) — drop the device's lock regardless of who holds it, and close the holder's own connection so its blocked read observes EOF; see "`force_unlock`" below |
 | `flash` | `uid`, `hex_path` | flash `hex_path` to the device — requires a `flash`-kind lock already held by this same connection (call `lock` first) |
 | `mark_flashed` | `uid` | bookkeeping only: record that `uid` was flashed *outside* this op (sprint 002's `mbdeploy`, which flashes locally by running pyocd directly rather than through `flash`) — same `flash`-kind-lock-held-by-this-connection precondition as `flash`, no pyocd invocation |
 | `names_get` | `name` | sprint 004, ticket 005: the name registry's row for `name`, or `entry: null` (not an error) if it has none yet — the non-creating lookup |
 | `names_set` | `name`, `channel`, `group` | explicit assignment, `source: "registry"` — overwrites any existing row |
 | `names_clear` | `name` | drop `name`'s row, if any (not an error if it has none) |
 | `names_list` | — | every `name_registry` row, each annotated with its own `conflict`/`channel_conflict` names |
+| `watch` | — | sprint 008, ticket 001: no precondition — after `{"ok": true}`, the connection receives one JSON line per subsequent event (change-only, no snapshot) until it closes; see "`watch`" below |
 
 `uid` accepts any of uid / short_uid / device_name for every device op
 that takes one, since all of them resolve through `store.find`. The four
@@ -81,7 +86,7 @@ Every non-streaming response is one of:
 |---|---|
 | `not_found` | no device matches the given uid/short_uid/device_name (or, on the remote TCP API, the device exists in this registry's cache but is peer-owned — see "Remote TCP control plane" below) |
 | `locked` | `lock` failed — device already held by someone else. The response also carries a `"holder"` object — see "Lock holder wire shape" below |
-| `not_locked` | `flash` or `mark_flashed` was requested without this connection already holding a `flash`-kind lock on that device; or, sprint 003 ticket 007, remote TCP API only, `stream` was requested without this connection already holding a `serial`-kind lock on that device |
+| `not_locked` | `flash` or `mark_flashed` was requested without this connection already holding a `flash`-kind lock on that device; or `stream` (sprint 003 ticket 007; both transports since sprint 008 ticket 004) was requested without this connection already holding a `serial`- or `relay`-kind lock on that device |
 | `invalid_request` | malformed JSON, missing/bad fields, or an unknown `op` |
 | `internal_error` | reserved for an unexpected server-side failure (not raised by normal dispatch paths as of this ticket) |
 | `ambiguous_name` | sprint 003, ticket 006: a bare device-name token (no `@host` suffix) matches devices on more than one host — `store.find`'s `AmbiguousNameError` (ticket 001), translated here since `list`/`find`/`lock`/`unlock`/`mark_flashed` (both the local Unix API and the remote TCP API — they share one dispatch implementation, `registry._api_base`) are `store.find`'s first real API-layer callers. The response also carries `"hosts": [...]` (`null` for the local/`NULL` host), for a client to build a `name@host` suggestion from. |
@@ -90,23 +95,37 @@ Every non-streaming response is one of:
 ### Lock holder wire shape
 
 ```jsonc
-// a local holder (unchanged since sprint 001):
-"holder": {"kind": "flash", "pid": 4821}
+// a local holder, unlabeled (kind/pid unchanged since sprint 001; label/
+// since added sprint 008, ticket 002):
+"holder": {"kind": "flash", "pid": 4821, "label": null, "since": 1732400000.0}
+// a local holder with an operator-supplied label:
+"holder": {"kind": "flash", "pid": 4821, "label": "alice-laptop", "since": 1732400000.0}
 // a remote (session-tied) holder (sprint 003, ticket 006) -- an additive
 // superset, never a breaking change to the local shape above:
-"holder": {"kind": "flash", "pid": null, "origin": "remote", "host": "loki"}
+"holder": {"kind": "flash", "pid": null, "label": null, "since": 1732400000.0,
+           "origin": "remote", "host": "loki"}
 ```
 
 Since sprint 003 (ticket 002), a device's lock can be held by either a
 local (PID-tied) or a remote (session-tied) client — the local Unix API
 and the remote TCP API share one `LockManager` table (Decision 2), so a
 `locked` response on *either* API can name a holder of *either* origin.
-A local holder's wire shape is exactly the 2-key form shown above,
-unchanged since before this sprint. A remote holder adds `origin`/`host`
-and reports `pid: null` ("a PID means nothing across hosts") — a client
-that only ever checked `holder.kind`/`holder.pid` keeps working
-unmodified; only a client that wants to show "locked by loki" instead of
-"locked by pid 4821" needs to look at the new keys.
+A remote holder adds `origin`/`host` and reports `pid: null` ("a PID
+means nothing across hosts") — a client that only ever checked
+`holder.kind`/`holder.pid` keeps working unmodified; only a client that
+wants to show "locked by loki" instead of "locked by pid 4821" needs to
+look at the new keys.
+
+**`label`/`since`** (sprint 008, ticket 002): an optional, display-only
+label supplied on `lock` (see below), and the timestamp that acquisition
+happened, both added to *every* holder's wire shape regardless of
+origin — additive to whatever shape existed before this ticket (the
+local holder's shape grew from 2 keys to 4; the remote holder's from 4
+to 6). `label` is `null` when the caller omitted it on `lock`; `since`
+is always a real timestamp once a lock exists — there is no "unset"
+case for a resolved holder. Neither field ever participates in
+`unlock`'s holder-matching check — that's still `HolderRef`
+(`origin`/`ref`/`pid`/`host`) equality only, untouched by this ticket.
 
 ### `list`
 
@@ -120,15 +139,21 @@ unmodified; only a client that wants to show "locked by loki" instead of
    "error_note": "...", "flash_count": 0,
    "chip_identity_name": "...", "chip_identity_serial": 0,
    "first_seen": 0.0, "last_seen": 0.0, "last_probe": 0.0,
-   "lock_kind": "serial|relay|flash|debug|null", "lock_pid": 1234}
+   "lock_kind": "serial|relay|flash|debug|null", "lock_pid": 1234,
+   "lock_label": "alice-laptop|null", "lock_since": 1732400000.0}
 ]}
 ```
 
 Every field on the device dict is `store.DeviceRecord`'s own columns
-(`dataclasses.asdict`), plus two folded-in lock-status fields
-(`lock_kind`/`lock_pid`, both `null` when unlocked, from `locks.status`) so a
-client building a STATE column (ticket 009) never needs a second round-trip
-per device.
+(`dataclasses.asdict`), plus four folded-in lock-status fields
+(`lock_kind`/`lock_pid`/`lock_label`/`lock_since`, all `null` when
+unlocked, from `locks.status`) so a client building a STATE column
+(ticket 009) never needs a second round-trip per device.
+`lock_label`/`lock_since` (sprint 008, ticket 002) are `null` for a
+peer-owned row too (`host` set) — a remote device's label/since text
+rides inside its `remote_lock_display` string instead (Design Rationale
+Decision 2), never as its own structured field for a row this registry
+doesn't own.
 
 **`state` (sprint 007, ticket 001)**: `connected_no_firmware` narrowed to
 mean only "confirmed blank" — a board a flash-triggered re-probe
@@ -176,13 +201,13 @@ is only available through this `--json`/`list` response's own
 ### `lock`
 
 ```jsonc
-// request
-{"op": "lock", "uid": "...", "kind": "serial"}
+// request, label optional (sprint 008, ticket 002):
+{"op": "lock", "uid": "...", "kind": "serial", "label": "alice-laptop"}
 // response
 {"ok": true}
 // or, already locked by someone else:
 {"ok": false, "code": "locked", "error": "...",
- "holder": {"kind": "flash", "pid": 4821}}
+ "holder": {"kind": "flash", "pid": 4821, "label": "alice-laptop", "since": 1732400000.0}}
 // or, bad kind / missing fields:
 {"ok": false, "code": "invalid_request", "error": "..."}
 // or:
@@ -193,6 +218,16 @@ The PID recorded as the holder is **never** taken from the request — it is
 read from the connection's own kernel-verified peer credentials (see below),
 so a client cannot lock, or unlock, on another process's behalf.
 
+`label` (sprint 008, ticket 002) is an optional, free-text, **display-only**
+string — omitting it behaves exactly as before this ticket (`label: null` in
+every holder shape). It is never used for authorization or holder identity:
+`unlock`'s holder-matching check is still `HolderRef` equality only, and a
+`label` value is never compared against anything. `since` (always present
+once a lock exists, no request-side equivalent — it is stamped server-side
+at the moment `lock` succeeds) is the acquisition timestamp; both fields
+also appear in `list`'s per-device dict and in a `lock_state` `watch` event
+(see below) for the same lock.
+
 ### `unlock`
 
 ```jsonc
@@ -201,6 +236,28 @@ so a client cannot lock, or unlock, on another process's behalf.
 // response
 {"ok": true, "released": true}   // or false if this connection didn't hold it -- still ok:true, not an error
 ```
+
+### `force_unlock` (sprint 008, ticket 003)
+
+**Local Unix socket only** — `mbtools.registry.api.RegistryAPIServer` dispatches this op directly; it is never shared into `_api_base.py` and `remote_api.RemoteAPIServer` never dispatches it (an attempt on the remote TCP port gets the same `{"ok": false, "code": "invalid_request"}` any unrecognized op gets — see "Remote TCP control plane" below). A manual, operator-only override with no automatic pre-emption (sprint.md's Solution/Out of Scope): `mbregistry unlock --force UID|NAME` is its one intended caller.
+
+```jsonc
+// request
+{"op": "force_unlock", "uid": "..."}
+// response, a lock was held (by anyone -- local or remote origin):
+{"ok": true, "released": true, "uid": "<resolved uid>", "kind": "flash",
+ "holder": {"kind": "flash", "pid": 4821, "label": "alice-laptop", "since": 1732400000.0}}
+// response, uid was already unlocked -- not an error:
+{"ok": true, "released": false, "uid": "<resolved uid>"}
+// or:
+{"ok": false, "code": "not_found", "error": "..."}
+// or, missing uid:
+{"ok": false, "code": "invalid_request", "error": "..."}
+```
+
+Drops `uid`'s lock via `LockManager.force_release` — which skips the holder-equality check `unlock`/`release()` enforces, releasing it regardless of who holds it — then, if this server is tracking a connection for that uid (`RegistryAPIServer`'s own per-uid `{uid: connection}` map, populated on a successful `lock` and cleared on release via any path: `unlock`, connection close, the periodic sweep, or this op itself), shuts that connection down from the server side (`socket.shutdown(SHUT_RDWR)`, not a hard close — the holder's own connection-handler thread still runs its normal close/cleanup). The holder's blocked read (an ordinary JSON-lines loop, or a `stream` session's frame reader, ticket 004) then unblocks with an error/EOF and unwinds through its own existing `finally`-block cleanup — a harmless no-op release there, since the lock is already gone. `force_release` funnels through the same shared release mechanics `release`/`sweep` use (flash-release callback, then the lock-display callback), so a forced release fires a `lock_state` `watch` event and updates a peer's replicated display exactly as an ordinary release would.
+
+`"holder"` is the same wire shape `lock`'s own `locked` response carries (including `label`/`since`), so a caller can report what it broke — `mbregistry unlock --force`'s own CLI output does exactly this.
 
 ### `flash`
 
@@ -261,6 +318,201 @@ pyocd and — because it does not touch the lock at all — never releases it,
 so it triggers no re-probe of its own; the existing lock-release hook
 (`LockManager`'s `flash_release_callback`, fired on any `flash`-kind release
 regardless of what ran before it) is what does that, unaffected by this op.
+
+### `watch` (sprint 008, ticket 001)
+
+```jsonc
+// request
+{"op": "watch"}
+// response: one immediate ack, then one JSON line per subsequent event,
+// for as long as the connection stays open -- no "final" line, ever.
+{"ok": true}
+{"type": "attach", "host": "...", "uid": "...", "port": "...", "vid_pid": "..."}
+{"type": "lock_state", "host": "...", "uid": "...", "kind": "serial", "display": "...", "label": "alice-laptop", "since": 1732400000.0}
+{"type": "detach", "host": "...", "uid": "..."}
+// ...
+```
+
+Any connection may `watch` — there is no precondition (unlike
+`lock`/`unlock`, every connection may watch, regardless of what else it
+holds). Once `{"ok": true}` is sent, the connection leaves ordinary
+request/response dispatch for the rest of its life: it never reads
+another request line, and every subsequent write is one JSON line per
+event, until the connection closes (from either end). This is the same
+shared mechanism (`_api_base.BaseAPIServer._op_watch`/`_handle_watch`) on
+both the local Unix socket (`api.py`) and the remote TCP port
+(`remote_api.py`, see "Remote TCP control plane" below) — a Node client
+(robot-console) gets change notifications on either transport without
+linking `pyzmq` or knowing this registry's PUB port.
+
+**Change-only, no snapshot on connect** (stakeholder decision): a
+`watch` client sees only events published *after* it subscribes, never a
+replay of current state — `list` is this protocol's own point-in-time
+snapshot call; a client that wants both calls `list` first, then
+`watch`, per `docs/design/robot-console-integration.md` §3.1's own
+two-step sequence. This mirrors the existing ZeroMQ PUB bus, which is
+also change-only (a new peer gets a snapshot separately, via the
+REQ/REP snapshot exchange, not via the PUB stream).
+
+**Event vocabulary** — exactly the event types the ZeroMQ PUB bus already
+emits, plus two new ones this ticket adds:
+
+| `"type"` | Fields | Source |
+|---|---|---|
+| `attach` | `uid`, `port`, `vid_pid` | `Daemon`'s own attach detection |
+| `detach` | `uid` | `Daemon`'s own detach detection |
+| `identity` | `uid`, `state`, `role`, `common_name`, `device_name`, `serial_payload`, `raw_announcement` | `Daemon`'s own probe/identify step |
+| `lock_state` | `uid`, `kind`, `display`, `label`, `since` (sprint 008 ticket 002; all four `null` on release) | `LockManager.acquire`/`release`/`sweep` |
+| `name_set` | `name`, `channel`, `group`, `source`, `updated` | `Store.set`/`Store.resolve` (via `names_set`) |
+| `name_clear` | `name` | `Store.clear` (via `names_clear`) |
+| `peer_up` | `host` (the peer that became reachable) | `registry.peering`'s own reachability tracking (new this ticket) |
+| `peer_down` | `host` (the peer that became unreachable) | `registry.peering`'s own reachability tracking (new this ticket) |
+
+Every event also carries a `"host"` field — the name of the registry
+instance that produced it (this instance's own short hostname, or
+`--instance` override), the same field the ZeroMQ PUB bus's own messages
+already carry — except `peer_up`/`peer_down`, whose `"host"` names the
+*peer* whose reachability changed, not this instance.
+
+**Works identically under `--no-peering`**: `watch` is sourced from the
+daemon's own event hooks (`Daemon.event_callback`,
+`LockManager.lock_display_callback`,
+`_api_base.BaseAPIServer._name_set_callback`/`_name_clear_callback`) via
+an always-constructed `registry.eventbus.EventBus`, never from a ZeroMQ
+subscription — so a `watch` client on a `--no-peering`-spawned instance
+still sees `attach`/`detach`/`identity`/`lock_state`/`name_set`/
+`name_clear` exactly as it would with peering on. The one thing it never
+sees is `peer_up`/`peer_down` — an unpeered instance has no peers to
+report on. When peering *is* on, the event bus is additive, not a
+replacement for the existing ZeroMQ PUB publish: a peer keeps receiving
+everything except `peer_up`/`peer_down` over its own PUB subscription
+exactly as before this ticket — `peer_up`/`peer_down` are a purely local
+notification (this host's own view of one peer's reachability) and are
+never re-published onward over PUB to a third host.
+
+### `stream` (sprint 003, ticket 007; widened sprint 004, ticket 011; available on this transport too, sprint 008 ticket 004)
+
+`{"op": "stream", "uid": "..."}` works identically on the local Unix
+socket and the remote TCP port (see "Remote TCP control plane" below) —
+same request/ack shape, same precondition, same wire format, dispatched
+through the same shared, relocated implementation
+(`_api_base.BaseAPIServer._op_stream_precheck`/`_handle_stream`) both
+servers use. It is the one JSON-op request that does **not** get an
+ordinary JSON response and go on to the next line. It requires the
+calling connection to already hold a `serial`- **or `relay`-kind** lock
+on `uid` — acquired by *this same connection's* own `lock` call, checked
+the same "this connection's own holder, not merely some holder" way
+`flash` checks its own `flash`-kind precondition:
+
+```jsonc
+// request
+{"op": "stream", "uid": "..."}
+// response, success:
+{"ok": true}
+// or, no serial/relay-kind lock held by this connection (or a different kind is held):
+{"ok": false, "code": "not_locked", "error": "..."}
+// or:
+{"ok": false, "code": "not_found", "error": "..."}
+// or, missing uid:
+{"ok": false, "code": "invalid_request", "error": "..."}
+```
+
+`relay`-kind was added during ticket 011's real-hardware acceptance
+pass: `relay.channel.RemoteRelayChannel` (ticket 004 of sprint 004) was
+always meant to open a remote relay's byte stream this same way, but
+this op's precheck only ever accepted `serial`-kind, so every `mbrelay
+connect <robot>@<host>` against a *different*-host relay raised an
+uncaught `RegistryClientError` server-side ("stream requires a
+serial-kind lock held by this connection") — invisible to every
+unit/integration test on both sides of that RPC, since they exercise it
+against fakes, not each other. `flash`/`debug`-kind locks remain
+excluded; neither has any legitimate reason to open a raw byte stream.
+
+On `{"ok": true}`, the connection **permanently** leaves newline-JSON
+framing — there is no op after `stream`, and no way back to JSON mode on
+this connection. From this point on it speaks the length-prefixed binary
+frame format below, for as long as the connection stays open.
+
+**Client synchronization requirement**: the client must not send any
+frame bytes before it has received `stream`'s own `{"ok": true}` line.
+The server stops reading JSON lines and switches to reading raw bytes off
+the socket the moment it dispatches `stream`; bytes sent any earlier than
+the ack could already be sitting in the server's line-buffered JSON
+reader's own internal decode buffer and would never reach the frame
+reader. A client that (like every op above) always waits for a response
+before sending its next thing satisfies this automatically.
+
+**Wire format** — sprint.md's Architecture, Decision 1 (sprint 003):
+
+```
++----------+------------------+-----------------+
+| 1 byte   | 4 bytes          | length bytes    |
+| type     | length (BE u32)  | payload         |
++----------+------------------+-----------------+
+```
+
+| type | value | direction | payload |
+|---|---|---|---|
+| `DATA` | `0x01` | either | raw bytes to write to (or just read from) the serial port |
+| `BREAK` | `0x02` | client → server | none — triggers `ser.send_break(duration)` on the server's local port, `duration` fixed server-side (`mbtools.serial.connect.BREAK_DURATION`, matching local `mbserial --reset`'s own Linux BREAK duration) |
+| `SET_DTR` | `0x03` | client → server | one byte, `0x00`/`0x01` — sets DTR directly |
+| `SET_RTS` | `0x04` | client → server | one byte, `0x00`/`0x01` — sets RTS directly |
+| `CLOSE` | `0x05` | either | none — ends the stream (and the connection with it — see below) |
+
+A frame with an empty payload (e.g. a zero-length `DATA` frame) is valid
+and is simply a no-op write to the port — not an error. A declared length
+over `mbtools.registry.stream_frame.MAX_FRAME_PAYLOAD` (1 MiB), or a
+frame truncated by the connection ending mid-header or mid-payload, is
+rejected without a wire-level error response (there is no framing left
+to carry one) — the server logs it and tears the connection down, the
+same way a plain connection drop is handled. An unrecognized type byte is
+handled the same way. None of these crash the connection's handler
+thread or leak the device's lock.
+
+**Server-side mechanics** (`_api_base.BaseAPIServer._handle_stream`,
+shared by both transports since ticket 004 — originally
+`RemoteAPIServer`'s own private method, sprint 003 ticket 007): the
+local port is opened with DTR/RTS held low — no reboot — by calling
+`mbtools.serial.connect.open_no_reboot` (the same function
+`serial.connect.connect`'s own local path calls; ticket 007 factored it
+out of that module rather than duplicating it), and this happens, along
+with every subsequent frame read/write, entirely outside the shared
+`store`/`locks` lock — that lock is only ever held for the short
+`stream`-request precondition check above, never for any serial port
+I/O. A background thread pumps whatever the port produces back to the
+client as `DATA` frames (mirrors `serial.connect.interact`'s own
+reader-thread pattern); the connection's own thread reads frames from
+the client and applies them to the port. `CLOSE`, a malformed frame, a
+port failure, or the connection simply going away (including a
+*different* connection's `force_unlock`, local-socket only, shutting
+this one down from the server side — ticket 003/004) — any of these
+closes the local port and releases `uid`'s lock exactly once, the same
+"always release on session end" guarantee
+`serial.connect.Session.close` gives a local session.
+
+**Why exposing `SET_DTR`/`SET_RTS` as their own frames, not just
+`BREAK`**: local `mbserial --reset` picks BREAK (Linux) or a port reopen
+(macOS) depending on the *connecting* platform's DAPLink reset semantics
+(see "Ported unchanged..." / "Reset semantics" in
+`mbtools/serial/connect.py`'s own module docstring). Over the remote
+stream, it is the **owning host's** platform that decides which reset
+actually works (sprint.md SUC-004) — so the server exposes both
+primitives (`BREAK` and `SET_DTR`/`SET_RTS`), and ticket 013's
+`serial.remote_connect` composes whichever one the owning host's
+platform needs into its own `--reset`, without this module needing a
+third, composed RPC. Over the local socket (ticket 004), a client that
+wants the same behavior composes it the same way; `mbserial`'s own local
+(non-stream) path continues to use BREAK/a port reopen directly, per the
+connecting platform's own DAPLink reset semantics, unaffected by any of
+this.
+
+**`serial_factory`/`stream_baud`/`stream_settle_s`/`break_duration_s`**
+are test-only escape hatches both `api.RegistryAPIServer` and
+`remote_api.RemoteAPIServer` expose on their own constructors (a test
+passes a callable returning `mbtools.testing.fakes.FakeSerial` and
+`stream_settle_s=0` to skip the real-hardware settle delay); production
+code on both transports leaves all four at their defaults (real
+pyserial, `serial.connect.BAUD_RATE`/`OPEN_SETTLE`/`BREAK_DURATION`).
 
 ### Name-registry ops (sprint 004, ticket 005): `names_get` / `names_set` / `names_clear` / `names_list`
 
@@ -471,7 +723,13 @@ for existing (Open Question #1).
   replicated over the event bus (Decision 3) — never consulted for a
   local row, which always reads live `LockManager` state instead. Set
   only by `Store.apply_remote_lock_state`, never by anything that
-  touches `LockManager`.
+  touches `LockManager`. **Sprint 008, ticket 002**: a labeled lock's
+  `remote_lock_display` carries label/since text baked in as plain
+  prose (e.g. `"pid 4821 (alice-laptop, 12m)"`, via
+  `registry.peering.publish_lock_event`/`format_lock_suffix`) —
+  `Store.apply_remote_lock_state`'s own signature is unchanged (still
+  `(uid, kind, display)`), and no `remote_lock_label`/`remote_lock_since`
+  column was added, per that ticket's Design Rationale Decision 2.
 - **`peer` table** (new): one row per discovered registry —
   `host` (`TEXT PRIMARY KEY`), `endpoint` (`TEXT`, `host:port` of that
   peer's own `remote_api` listener), `last_seen` (`REAL`), `reachable`
@@ -540,13 +798,19 @@ appears. `cmd_run`'s own `--peer` handling always passes `remote_port`.
 ## Remote TCP control plane (sprint 003, ticket 006)
 
 Implemented by `mbtools.registry.remote_api.RemoteAPIServer`, sharing the
-`list`/`find`/`lock`/`unlock`/`mark_flashed` dispatch implementation
-above with the local Unix-socket `api.RegistryAPIServer`
+`list`/`find`/`lock`/`unlock`/`mark_flashed`/`watch`/`stream` dispatch
+implementation above with the local Unix-socket `api.RegistryAPIServer`
 (`mbtools.registry._api_base.BaseAPIServer`) — everything under
 "Framing"/"Requests"/"Responses" above applies unchanged to this
-transport too, for the five ops it supports, plus `stream` (sprint 003,
-ticket 007 — see "Stream sub-protocol" below) and `send_hex`/`flash`
-(sprint 003, ticket 008 — see "Remote flash and hex staging" below).
+transport too, for the seven ops it shares that way, plus `send_hex`/
+`flash` (sprint 003, ticket 008 — see "Remote flash and hex staging"
+below), which stay remote-only. **No `force_unlock`** (sprint 008,
+ticket 003): that op is local Unix
+socket only — this server has no dispatch entry for it at all, so a
+`{"op": "force_unlock", ...}` request here gets the same
+`{"ok": false, "code": "invalid_request"}` any other unrecognized op
+gets, per sprint.md's Solution/Out of Scope ("no equivalent on the
+remote TCP port").
 
 ### Transport
 
@@ -637,108 +901,30 @@ ignored (and never acted on) until authentication succeeds on a
 handshake is skipped entirely and a connection's first line is
 dispatched as a normal op, exactly like the local Unix socket.
 
-### Stream sub-protocol (sprint 003, ticket 007; widened sprint 004, ticket 011)
+### `watch` (sprint 008, ticket 001)
 
-`{"op": "stream", "uid": "..."}` is the one JSON-op request that does
-**not** get an ordinary JSON response and go on to the next line. It
-requires the calling connection to already hold a `serial`- **or
-`relay`-kind** lock on `uid` — acquired by *this same connection's* own
-`lock` call, checked the same "this connection's own holder, not merely
-some holder" way `flash` checks its own `flash`-kind precondition:
+`{"op": "watch"}` works identically here to the local Unix socket's own
+`watch` op described above — same request/ack shape, same event
+vocabulary, same "leaves ordinary request/response dispatch for the rest
+of the connection's life" handoff, dispatched through the same shared
+`_api_base.BaseAPIServer._op_watch`/`_handle_watch` both servers use. No
+auth exemption: when `--auth-token` is configured, the same first-line
+token handshake described above still applies before `watch` (or any
+other op) is dispatched.
 
-```jsonc
-// request
-{"op": "stream", "uid": "..."}
-// response, success:
-{"ok": true}
-// or, no serial/relay-kind lock held by this connection (or a different kind is held):
-{"ok": false, "code": "not_locked", "error": "..."}
-// or:
-{"ok": false, "code": "not_found", "error": "..."}
-// or, missing uid:
-{"ok": false, "code": "invalid_request", "error": "..."}
-```
+### Stream sub-protocol (sprint 003, ticket 007; widened sprint 004, ticket 011; relocated sprint 008, ticket 004)
 
-`relay`-kind was added during ticket 011's real-hardware acceptance
-pass: `relay.channel.RemoteRelayChannel` (ticket 004) was always meant
-to open a remote relay's byte stream this same way, but this op's
-precheck only ever accepted `serial`-kind, so every `mbrelay connect
-<robot>@<host>` against a *different*-host relay raised an uncaught
-`RegistryClientError` server-side ("stream requires a serial-kind lock
-held by this connection") — invisible to every unit/integration test on
-both sides of this RPC, since they exercise it against fakes, not each
-other. `flash`/`debug`-kind locks remain excluded; neither has any
-legitimate reason to open a raw byte stream.
-
-On `{"ok": true}`, the connection **permanently** leaves newline-JSON
-framing — there is no op after `stream`, and no way back to JSON mode on
-this connection. From this point on it speaks the length-prefixed binary
-frame format below, for as long as the connection stays open.
-
-**Client synchronization requirement**: the client must not send any
-frame bytes before it has received `stream`'s own `{"ok": true}` line.
-The server stops reading JSON lines and switches to reading raw bytes off
-the socket the moment it dispatches `stream`; bytes sent any earlier than
-the ack could already be sitting in the server's line-buffered JSON
-reader's own internal decode buffer and would never reach the frame
-reader. A client that (like every op above) always waits for a response
-before sending its next thing satisfies this automatically.
-
-**Wire format** — sprint.md's Architecture, Decision 1:
-
-```
-+----------+------------------+-----------------+
-| 1 byte   | 4 bytes          | length bytes    |
-| type     | length (BE u32)  | payload         |
-+----------+------------------+-----------------+
-```
-
-| type | value | direction | payload |
-|---|---|---|---|
-| `DATA` | `0x01` | either | raw bytes to write to (or just read from) the serial port |
-| `BREAK` | `0x02` | client → server | none — triggers `ser.send_break(duration)` on the server's local port, `duration` fixed server-side (`mbtools.serial.connect.BREAK_DURATION`, matching local `mbserial --reset`'s own Linux BREAK duration) |
-| `SET_DTR` | `0x03` | client → server | one byte, `0x00`/`0x01` — sets DTR directly |
-| `SET_RTS` | `0x04` | client → server | one byte, `0x00`/`0x01` — sets RTS directly |
-| `CLOSE` | `0x05` | either | none — ends the stream (and the connection with it — see below) |
-
-A frame with an empty payload (e.g. a zero-length `DATA` frame) is valid
-and is simply a no-op write to the port — not an error. A declared length
-over `mbtools.registry.stream_frame.MAX_FRAME_PAYLOAD` (1 MiB), or a
-frame truncated by the connection ending mid-header or mid-payload, is
-rejected without a wire-level error response (there is no framing left
-to carry one) — the server logs it and tears the connection down, the
-same way a plain connection drop is handled. An unrecognized type byte is
-handled the same way. None of these crash the connection's handler
-thread or leak the device's lock.
-
-**Server-side mechanics** (`RemoteAPIServer._handle_stream`): the local
-port is opened with DTR/RTS held low — no reboot — by calling
-`mbtools.serial.connect.open_no_reboot` (the same function
-`serial.connect.connect`'s own local path calls; ticket 007 factored it
-out of that module rather than duplicating it), and this happens, along
-with every subsequent frame read/write, entirely outside the shared
-`store`/`locks` lock — that lock is only ever held for the short
-`stream`-request precondition check above, never for any serial port
-I/O. A background thread pumps whatever the port produces back to the
-client as `DATA` frames (mirrors `serial.connect.interact`'s own
-reader-thread pattern); the connection's own thread reads frames from
-the client and applies them to the port. `CLOSE`, a malformed frame, a
-port failure, or the connection simply going away — any of these closes
-the local port and releases `uid`'s `serial`-kind lock exactly once, the
-same "always release on session end" guarantee
-`serial.connect.Session.close` gives a local session.
-
-**Why exposing `SET_DTR`/`SET_RTS` as their own frames, not just
-`BREAK`**: local `mbserial --reset` picks BREAK (Linux) or a port reopen
-(macOS) depending on the *connecting* platform's DAPLink reset semantics
-(see "Ported unchanged..." / "Reset semantics" in
-`mbtools/serial/connect.py`'s own module docstring). Over the remote
-stream, it is the **owning host's** platform that decides which reset
-actually works (sprint.md SUC-004) — so the server exposes both
-primitives (`BREAK` and `SET_DTR`/`SET_RTS`), and ticket 013's
-`serial.remote_connect` composes whichever one the owning host's
-platform needs into its own `--reset`, without this module needing a
-third, composed RPC.
+`{"op": "stream", "uid": "..."}` works identically here to the local
+Unix socket's own `stream` op described above ("`stream`", earlier in
+this document) — same request/ack shape, same precondition, same wire
+format, same "permanently leaves newline-JSON framing" handoff,
+dispatched through the same shared, relocated implementation
+(`_api_base.BaseAPIServer._op_stream_precheck`/`_handle_stream`, moved
+here from this class's own private methods by ticket 004 — mechanics
+unchanged, no behavior change for an existing remote `stream` caller)
+both servers use. No auth exemption: when `--auth-token` is configured,
+the same first-line token handshake described above still applies
+before `stream` (or any other op) is dispatched.
 
 ### Remote flash and hex staging (sprint 003, ticket 008)
 
@@ -863,6 +1049,38 @@ not: there is no Windows hardware acceptance target. Ticket 006's
 `windows-latest` GitHub Actions CI job is the first, and only, real
 verification this transport's `ctypes` bindings get.
 
+## `mbregistry --version` and `--ready-json`'s `version` key (sprint 008, ticket 006)
+
+robot-console checks a minimum `mbregistry` version before spawning or
+using it, and fails closed if it can't determine the version (see
+`docs/design/robot-console-integration.md` §4 item 5). Two surfaces
+report the same version string, both derived from one call —
+`importlib.metadata.version("mbtools")`, wrapped by
+`registry.cli._mbtools_version()` so neither call site duplicates the
+lookup:
+
+- **`mbregistry --version`** — a top-level `argparse` flag
+  (`action="version"`), so it works without a subcommand even though
+  every subcommand (`list`/`run`/…) is otherwise `required=True`; the
+  `version` action exits before that requirement is checked. Prints
+  `mbregistry <version>` to stdout (e.g. `mbregistry 0.20260924.6`) and
+  exits 0.
+- **`--ready-json`'s `version` key** — the JSON ready-line `mbregistry
+  run --ready-json` prints (sprint 007 ticket 005; shape documented in
+  `docs/service.md`'s spawn-recipe section) gained a top-level
+  `"version"` key equal to the same string, alongside `"ready"`,
+  `"instance"`, `"socket"`, and `"ports"`:
+
+  ```json
+  {"ready": true, "instance": "session-1234", "version": "0.20260924.6",
+   "socket": "/tmp/mbregistry-session/api.sock",
+   "ports": {"remote": 7440, "pool": 7444, "names": 7445}}
+  ```
+
+  This lets a parent process that spawns `mbregistry run` as a child
+  (rather than shelling out to `mbregistry --version` separately) read
+  the version off the same ready-line it already waits for.
+
 ## Exit codes
 
 `mbtools.common` defines the stable process exit codes ticket 009's CLI (and
@@ -886,21 +1104,24 @@ listed above, for the same one-place reason.
 
 ## Known limitations / forward notes for ticket 009 and sprint 002
 
-- **Shared dispatch base (sprint 003, ticket 006).** `list`/`find`/
-  `lock`/`unlock`/`mark_flashed` moved into `registry._api_base.
-  BaseAPIServer`, a mixin both `api.RegistryAPIServer` (Unix) and
-  `remote_api.RemoteAPIServer` (TCP) extend, parametrized on
+- **Shared dispatch base (sprint 003, ticket 006; extended sprint 008,
+  ticket 004).** `list`/`find`/`lock`/`unlock`/`mark_flashed` moved into
+  `registry._api_base.BaseAPIServer`, a mixin both `api.RegistryAPIServer`
+  (Unix) and `remote_api.RemoteAPIServer` (TCP) extend, parametrized on
   `_holder_for_connection`/`_list_visible_devices`/`_device_visible`.
   `flash` stays out of the shared base — the local Unix socket's own
   `flash` op (`registry.flash.FlashOp`) and the remote TCP API's own
   `flash` op (`flashlogic.flash_hex`, ticket 008) are deliberately
   different implementations with different robustness levels (sprint.md
   Decision 4), each living in its own module. The `stream` op and its
-  binary frame sub-protocol (ticket 007), and `send_hex` (ticket 008),
-  live entirely in `remote_api.py` — the Unix socket has no equivalent of
-  either (a local `mbserial` opens its port directly, and a local `flash`
-  request already has the hex file on the same filesystem), so there is
-  nothing to share into the base for them.
+  binary frame sub-protocol (ticket 007) *used* to live entirely in
+  `remote_api.py`, with no Unix-socket equivalent; ticket 004 (sprint 008)
+  moved `_op_stream_precheck`/`_handle_stream` into the shared base
+  (mechanics unchanged) so both transports now dispatch `stream` into the
+  one implementation, the same way they already share the other five ops
+  — see "`stream`" above. `send_hex` (ticket 008) remains remote-only — a
+  local `flash` request already has the hex file on the same filesystem,
+  so there is nothing to share into the base for it.
 - **Threading model.** One OS thread per accepted connection, plus one
   sweep thread, serialized by a single `threading.RLock` around every call
   into `store`/`locks`/`flash_op` — **except** the `flash` op's own pyocd
@@ -960,6 +1181,8 @@ listed above, for the same one-place reason.
   sprint completed items 1 (configurable pool/names ports, advertise what's
   bound), 4 (`--instance`/`--pipe`), 5 (the cross-instance claim,
   `--only-uid`/`--exclude-uid`), and 6 (`--ready-json`/
-  `--exit-with-parent`/`--no-peering`). Items 2 (`watch` op), 3 (lock
-  `label`), 7 (understandable stale-lock breaking), and 8 (`stream` on the
-  local socket) remain open, planned for sprint 008 per that document.
+  `--exit-with-parent`/`--no-peering`). Sprint 008 completed items 2
+  (`watch` op, ticket 001), 3 (lock `label`, ticket 002), 7
+  (understandable stale-lock breaking — `mbregistry unlock --force`,
+  ticket 003), and 8 (`stream` on the local socket, ticket 004) — every
+  item that document's section 5 lists is now done.
