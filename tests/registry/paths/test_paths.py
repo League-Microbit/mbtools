@@ -19,6 +19,11 @@ from mbtools.registry.paths import (
     default_pipe_name,
     default_socket_path,
     find_client_socket,
+    linux_user_unit_path,
+    macos_launch_agent_path,
+    macos_launch_daemon_path,
+    macos_system_log_path,
+    macos_user_log_path,
 )
 
 
@@ -191,3 +196,49 @@ def test_find_client_socket_names_first_candidate_when_none_exist(as_platform):
 def test_default_pipe_name_fixed_and_callable_on_any_platform(monkeypatch, platform):
     monkeypatch.setattr(paths_module.sys, "platform", platform)
     assert default_pipe_name() == r"\\.\pipe\mbregistry"
+
+
+# -- service artifacts (ticket 006-001) ---------------------------------------
+
+
+def test_macos_launch_agent_path(as_platform):
+    home = as_platform("darwin", root=False)
+    assert macos_launch_agent_path() == (
+        home / "Library" / "LaunchAgents" / "org.jointheleague.mbregistry.plist"
+    )
+
+
+def test_macos_launch_daemon_path(as_platform):
+    as_platform("darwin", root=True)
+    assert macos_launch_daemon_path() == Path(
+        "/Library/LaunchDaemons/org.jointheleague.mbregistry.plist"
+    )
+
+
+def test_macos_user_log_path(as_platform):
+    home = as_platform("darwin", root=False)
+    assert macos_user_log_path() == home / "Library" / "Logs" / "mbregistry.log"
+
+
+def test_macos_system_log_path(as_platform):
+    as_platform("darwin", root=True)
+    assert macos_system_log_path() == Path("/Library/Logs/mbregistry.log")
+
+
+def test_linux_user_unit_path(as_platform):
+    home = as_platform("linux", root=False)
+    assert linux_user_unit_path() == (
+        home / ".config" / "systemd" / "user" / "mbregistry.service"
+    )
+
+
+#: Ticket 006-004 note: this file used to carry
+#: test_linux_system_unit_path_matches_cli_default_unit_path/
+#: test_linux_udev_rule_path_matches_cli_default_udev_rule_path, a pair of
+#: cross-check tests guarding against LINUX_SYSTEM_UNIT_PATH/
+#: LINUX_UDEV_RULE_PATH (this module) silently drifting from
+#: registry.cli's own DEFAULT_UNIT_PATH/DEFAULT_UDEV_RULE_PATH. Ticket
+#: 006-004 unified them -- registry.cli's two constants are now plain
+#: aliases onto this module's values (``DEFAULT_UNIT_PATH =
+#: LINUX_SYSTEM_UNIT_PATH``, see cli.py) -- so drift is no longer
+#: possible and the cross-check tests were deleted rather than kept.

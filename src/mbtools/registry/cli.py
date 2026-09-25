@@ -55,7 +55,6 @@ invoking user can write, e.g. ``--socket
 from __future__ import annotations
 
 import argparse
-import getpass
 import json
 import os
 import signal
@@ -64,7 +63,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from mbtools.common import EXIT_ERROR, EXIT_NO_DAEMON, EXIT_OK
+from mbtools.common import EXIT_ERROR, EXIT_LINUX_USER_PREFLIGHT, EXIT_NO_DAEMON, EXIT_OK
 from mbtools.registry.api import DEFAULT_SOCKET_PATH, RegistryAPIServer
 from mbtools.registry.api_windows import WindowsPipeAPIServer
 from mbtools.registry.client import (
@@ -88,7 +87,18 @@ from mbtools.registry.peering import (
     PeerDiscovery,
 )
 from mbtools.registry.remote_api import DEFAULT_REMOTE_PORT, RemoteAPIServer
+from mbtools.registry.paths import LINUX_SYSTEM_UNIT_PATH, LINUX_UDEV_RULE_PATH
 from mbtools.registry.render import render_json, render_table
+from mbtools.registry.service import (
+    DryRunCommandRunner,
+    LinuxUserPreflightError,
+    linux_install,
+    linux_status,
+    linux_uninstall,
+    macos_install,
+    macos_status,
+    macos_uninstall,
+)
 from mbtools.registry.service_windows import (
     cmd_install_service_windows,
     run_as_windows_service,
@@ -102,44 +112,35 @@ __all__ = [
     "cmd_list",
     "cmd_run",
     "cmd_install_service",
+    "cmd_service_install",
+    "cmd_service_uninstall",
+    "cmd_service_status",
     "assemble_daemon_and_api",
     "assemble_registry",
     "assemble_relay_pool",
     "assemble_names_api",
-    "render_systemd_unit",
-    "render_udev_rule",
     "DEFAULT_UNIT_PATH",
     "DEFAULT_UDEV_RULE_PATH",
 ]
 
-#: Standard systemd system-unit install location -- ``install-service``'s
-#: default target, overridable with ``--output`` (every test uses that
-#: override; writing to the real path needs root, per the ticket's own
-#: "installing into a real systemd is not part of this ticket's automated
-#: tests" scoping).
-DEFAULT_UNIT_PATH = Path("/etc/systemd/system/mbregistry.service")
+#: Standard systemd system-unit install location -- ticket 006-004 replaces
+#: this module's own literal ``Path("/etc/systemd/system/mbregistry.service")``
+#: with an alias onto :data:`~mbtools.registry.paths.LINUX_SYSTEM_UNIT_PATH`,
+#: the single definition ``registry.service``'s own Linux orchestration
+#: (:func:`linux_install`/:func:`linux_uninstall`/:func:`linux_status`)
+#: already uses, so the two can never drift apart (this is what let
+#: ``tests/registry/paths/test_paths.py``'s cross-check tests be deleted
+#: rather than kept). Kept as a name here only for backward-compatible
+#: imports (``from mbtools.registry.cli import DEFAULT_UNIT_PATH``) --
+#: nothing in this module computes a path from it anymore, since the
+#: deprecated :func:`cmd_install_service` now delegates entirely to
+#: :func:`linux_install`/:func:`macos_install`.
+DEFAULT_UNIT_PATH = LINUX_SYSTEM_UNIT_PATH
 
-#: Standard ``udev`` rules.d install location -- ``install-service``'s
-#: default target for ticket 008's non-root-USB-access rule, overridable
-#: with ``--udev-output`` (every test uses that override, mirroring
-#: ``DEFAULT_UNIT_PATH``'s own "writing to the real path needs root"
-#: scoping). ``99-`` sorts after every distro-shipped rule so this one's
-#: ``GROUP=``/``MODE=``/``TAG+=`` assignments win if anything else also
-#: matches this VID:PID.
-DEFAULT_UDEV_RULE_PATH = Path("/etc/udev/rules.d/99-mbregistry-cmsis-dap.rules")
-
-#: The micro:bit DAPLink interface's fixed VID:PID (sprint.md SUC-005,
-#: Decision 9; confirmed on the Nolanet nodes -- see CLAUDE.md's hardware
-#: test hosts table and ``docs/acceptance/002-hardware.md``). Shared
-#: between the tty/usb/hidraw match rules in :func:`render_udev_rule` so
-#: they can never drift apart from each other.
-_USB_VENDOR_ID = "0d28"
-_USB_PRODUCT_ID = "0204"
-
-#: The group :func:`render_udev_rule`'s rules grant access via, alongside
-#: ``TAG+="uaccess"`` -- see that function's own docstring for why both
-#: mechanisms are written into the same rule rather than picking just one.
-_UDEV_GROUP = "plugdev"
+#: Standard ``udev`` rules.d install location -- same "alias, not a second
+#: definition" treatment as :data:`DEFAULT_UNIT_PATH` above, onto
+#: :data:`~mbtools.registry.paths.LINUX_UDEV_RULE_PATH`.
+DEFAULT_UDEV_RULE_PATH = LINUX_UDEV_RULE_PATH
 
 _DB_ENV_VAR = "MBREGISTRY_DB"
 
@@ -207,32 +208,19 @@ def _resolve_int(flag_value: int | None, env_var: str, default: int) -> int:
     return default
 
 
-def _resolve_operating_user(flag_value: str | None) -> str:
-    """``--user`` (ticket 008's own escape hatch for :func:`cmd_install_service`)
-    wins if given; else ``$SUDO_USER``; else ``$USER``; else
-    :func:`getpass.getuser`. No env-var-name parameter like the other
-    ``_resolve_*`` helpers here, since this one checks two env vars in a
-    fixed order rather than one.
-
-    ``install-service`` is typically invoked with ``sudo`` (writing
-    ``DEFAULT_UNIT_PATH``/``DEFAULT_UDEV_RULE_PATH`` needs root), so
-    ``getpass.getuser()``/``$USER`` alone would report ``"root"`` --
-    ``$SUDO_USER`` (set by ``sudo`` itself to the *invoking* user) is
-    checked first so the ``usermod -aG plugdev <user>`` line
-    :func:`cmd_install_service` prints names the actual operator, not
-    ``root``, in the common case. Falls through to ``$USER``/
-    :func:`getpass.getuser` for a non-``sudo`` invocation (e.g. a
-    root-shell host, or a test).
-    """
-    if flag_value:
-        return flag_value
-    sudo_user = os.environ.get("SUDO_USER")
-    if sudo_user:
-        return sudo_user
-    user = os.environ.get("USER")
-    if user:
-        return user
-    return getpass.getuser()
+#: Ticket 006-004 consolidation: this module used to define its own
+#: ``_resolve_operating_user`` (ticket 008's escape hatch for the old
+#: ``install-service --user`` flag), byte-for-byte identical to
+#: ``registry.service``'s own ``_resolve_linux_operating_user`` (tickets
+#: 002/003 duplicated it there rather than import from here, since
+#: sprint.md's Architecture fixes the dependency direction as
+#: ``cli`` -> ``service``, never the reverse -- importing this module's
+#: version from ``service.py`` would be a real circular import). Now that
+#: :func:`cmd_install_service` delegates its whole write+run sequence to
+#: :func:`linux_install` (which already resolves the operating user
+#: itself via that function), this module has no caller left for its own
+#: copy -- deleted here, per the ticket's "consolidate into one (in
+#: service.py)" instruction, rather than kept as unused dead code.
 
 
 def _resolve_token(flag_value: str | None, env_var: str) -> str | None:
@@ -870,228 +858,198 @@ def _run_registry(args: argparse.Namespace, stop_event: threading.Event) -> int:
 
 
 # ---------------------------------------------------------------------------
-# install-service -- write the systemd unit
+# service install|uninstall|status -- ticket 006-004's own new command
+# group, dispatching straight into registry.service's per-platform
+# orchestration (macos_install/macos_uninstall/macos_status,
+# linux_install/linux_uninstall/linux_status). Per sprint.md's Architecture
+# and Design Rationale, this module owns argparse + user-facing text only;
+# every actual write/run decision lives in registry.service.
+#
+# install-service (below, ticket 008/009's original command) is kept as a
+# hidden, deprecated alias for exactly one release, per this ticket's own
+# Migration guidance -- see cmd_install_service's own docstring.
 # ---------------------------------------------------------------------------
 
-#: Rendered with ``str.format(exec_start=...)``. ``RuntimeDirectory=``/
-#: ``StateDirectory=`` are systemd's own directive for "create this
-#: subdirectory of /run or /var/lib, owned by this service, before
-#: ExecStart runs" -- the Design Rationale's "install-service's systemd
-#: unit must create both directories (or rely on RuntimeDirectory=/
-#: StateDirectory= systemd directives)" satisfied without this module
-#: ever shelling out to ``mkdir`` itself. Named ``mbregistry.service``,
-#: distinct from the fleet's existing ``mbrelay.service``/old ``mbdeploy
-#: serve`` per sprint.md's Migration Concerns -- this ticket does not
-#: need to detect or retire those.
-_SYSTEMD_UNIT_TEMPLATE = """\
-[Unit]
-Description=mbregistry -- micro:bit device registry daemon
-After=network.target
-
-[Service]
-Type=simple
-ExecStart={exec_start}
-Restart=on-failure
-RestartSec=2
-RuntimeDirectory=mbregistry
-StateDirectory=mbregistry
-
-[Install]
-WantedBy=multi-user.target
-"""
+#: Platforms ``service ...``/the deprecated ``install-service`` alias
+#: actually dispatch orchestration for -- everything else (``win32``, and
+#: any platform this package has never run on) is the Windows-guard's
+#: "not supported" branch below. Named for both call sites (ticket 006-004
+#: also uses it for the deprecated alias's generic platform dispatch) so
+#: the two can never independently drift on which platforms are "real".
+_SERVICE_PLATFORMS = ("darwin", "linux")
 
 
-def render_systemd_unit(exec_start: str | None = None) -> str:
-    """The systemd unit's text. ``exec_start`` defaults to invoking
-    ``mbregistry run`` through the current interpreter
-    (``{sys.executable} -m mbtools.registry.cli run``) -- the same
-    "invoke through the running interpreter, not a bare PATH lookup"
-    reasoning ``flash.py``'s own ``_PYOCD`` already documents: mbtools is
-    typically installed into an isolated venv whose ``bin/`` directory is
-    not on the ``PATH`` systemd uses for a unit's ``ExecStart=``, but the
-    package is always importable through the interpreter that installed
-    it.
+def _service_not_supported(subcommand: str) -> int:
+    """The Windows guard every ``cmd_service_*`` function below takes
+    first, per this ticket's own acceptance criterion: print
+    ``"mbregistry: service <subcommand> is not supported on Windows"``
+    (or the real platform name, for a platform that is neither Windows
+    nor one of :data:`_SERVICE_PLATFORMS`) to stderr and return
+    :data:`~mbtools.common.EXIT_ERROR` -- never importing or calling any
+    of ``registry.service``'s platform-specific functions (they are
+    already imported at module scope for ``darwin``/``linux`` callers,
+    but this function itself never calls one).
     """
-    if exec_start is None:
-        exec_start = f"{sys.executable} -m mbtools.registry.cli run"
-    return _SYSTEMD_UNIT_TEMPLATE.format(exec_start=exec_start)
-
-
-# ---------------------------------------------------------------------------
-# install-service -- write the non-root-USB-access udev rule (ticket 008)
-# ---------------------------------------------------------------------------
-
-#: Three match rules, one per device node ``mbserial``/pyOCD open for the
-#: micro:bit DAPLink interface (sprint.md SUC-005):
-#:
-#: 1. The CDC-ACM ``tty`` device node -- what ``mbserial`` and pyOCD's own
-#:    serial transport use (matches the legacy
-#:    ``microbit-radio-relay/server/packaging/99-microbit-relay.rules``
-#:    shape: ``SUBSYSTEM=="tty", SUBSYSTEMS=="usb"``).
-#: 2. The raw ``usb`` device node -- what pyOCD's CMSIS-DAP v2 (WinUSB)
-#:    transport opens *directly*, bypassing the tty layer entirely (pyOCD's
-#:    own udev guidance ships a ``SUBSYSTEM=="usb"`` rule for exactly this
-#:    reason -- the tty-only legacy rule above does not cover it).
-#: 3. Any ``hidraw*`` device node -- what pyOCD's CMSIS-DAP v1 (HID)
-#:    transport opens instead, on DAPLink firmware that negotiates HID
-#:    rather than WinUSB (also called out in pyOCD's own udev guidance).
-#:
-#: Covering all three means the same rule works regardless of which
-#: transport a given board's DAPLink firmware happens to negotiate, without
-#: this module needing to know that ahead of time.
-#:
-#: ``GROUP="plugdev"``/``MODE="0660"`` *and* ``TAG+="uaccess"`` are both
-#: written into every rule (not one or the other) -- see
-#: :func:`render_udev_rule`'s own docstring, "Decision: GROUP *and*
-#: TAG+=uaccess, not either alone", for why.
-_UDEV_RULE_TEMPLATE = """\
-# mbregistry -- non-root access to the micro:bit DAPLink interface
-# (VID:PID {vendor_id}:{product_id}). Written by `mbregistry install-service`
-# (ticket 008) -- re-running it overwrites this file with identical
-# content, so re-running install-service is idempotent. See
-# mbtools.registry.cli.render_udev_rule()'s docstring for why each rule
-# below grants access via both the {group} group and uaccess rather than
-# just one of the two.
-
-# CDC-ACM tty device node (mbserial, and pyOCD's DAPLink serial transport)
-SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{{idVendor}}=="{vendor_id}", ATTRS{{idProduct}}=="{product_id}", GROUP="{group}", MODE="0660", TAG+="uaccess"
-
-# Raw USB device node (CMSIS-DAP v2 / WinUSB transport, opened directly by pyOCD)
-SUBSYSTEM=="usb", ATTRS{{idVendor}}=="{vendor_id}", ATTRS{{idProduct}}=="{product_id}", GROUP="{group}", MODE="0660", TAG+="uaccess"
-
-# hidraw device node (CMSIS-DAP v1 / HID transport)
-KERNEL=="hidraw*", ATTRS{{idVendor}}=="{vendor_id}", ATTRS{{idProduct}}=="{product_id}", GROUP="{group}", MODE="0660", TAG+="uaccess"
-"""
-
-
-def render_udev_rule() -> str:
-    """The udev rule text :func:`cmd_install_service` writes to
-    :data:`DEFAULT_UDEV_RULE_PATH` (or ``--udev-output``) to grant the
-    operating (non-root) user access to the micro:bit DAPLink interface
-    (VID:PID ``0d28:0204``) -- sprint.md SUC-005/Decision 9, closing out
-    the issue this ticket completes
-    (``non-root-usb-access-and-pyocd-permission-hang.md``). See
-    :data:`_UDEV_RULE_TEMPLATE`'s own comment for what each of the three
-    match rules (tty/usb/hidraw) covers and why all three are needed.
-
-    **Decision: grant access via both ``GROUP="plugdev"`` and
-    ``TAG+="uaccess"``, not just one of the two** (the ticket's Description
-    frames this as a choice between the two -- this implementation makes
-    both, deliberately, rather than picking one):
-
-    - ``TAG+="uaccess"`` is systemd-logind's ACL mechanism: it grants the
-      user of the *active session on a seat* access the moment the rule is
-      (re-)applied, with no group-membership or relogin step at all. It's
-      the cleaner fit *when it works* -- but it is scoped to a seat's
-      active session, and the four Nolanet nodes this ticket targets
-      (CLAUDE.md's hardware test hosts table) are reached **only over
-      SSH**, with no local console/graphical seat for logind to track.  An
-      SSH session is not reliably assigned a seat, so relying on
-      ``uaccess`` alone risks silently granting nothing at all on exactly
-      the hosts this ticket exists for.
-    - ``GROUP="plugdev"``/``MODE="0660"`` has no seat/session dependency:
-      any process the operating user starts, in any session (including
-      SSH) opened *after* the group membership below takes effect, gets
-      access -- deterministic and reliable on a headless host. The one
-      cost is that a *newly added* group membership needs a fresh login
-      session to take effect in that session (standard Linux behavior for
-      any group-based grant, not specific to this rule) -- documented in
-      :func:`cmd_install_service`'s own printed follow-up instructions.
-
-    Writing both into the same rule costs nothing (they're independent
-    grant mechanisms; a udev rule can assign both) and means access works
-    immediately wherever ``uaccess`` happens to apply (e.g. a future
-    graphical/console login), while still working reliably on the
-    SSH-only hosts this ticket was written for once the printed
-    ``usermod``/relogin step is done.
-    """
-    return _UDEV_RULE_TEMPLATE.format(
-        vendor_id=_USB_VENDOR_ID, product_id=_USB_PRODUCT_ID, group=_UDEV_GROUP
+    platform_name = "Windows" if sys.platform == "win32" else sys.platform
+    print(
+        f"mbregistry: service {subcommand} is not supported on {platform_name}",
+        file=sys.stderr,
     )
+    return EXIT_ERROR
+
+
+def _service_scope(args: argparse.Namespace) -> str:
+    """``"user"``/``"system"`` from ``install``/``uninstall``'s own
+    ``--user``/``--system`` mutually-exclusive, required flags -- argparse
+    itself guarantees exactly one of the two booleans is ``True`` (this
+    function is never called for ``status``, which takes neither flag).
+    """
+    return "user" if args.user else "system"
+
+
+def cmd_service_install(args: argparse.Namespace) -> int:
+    """``mbregistry service install (--user | --system) [--dry-run]`` --
+    dispatch on ``sys.platform`` to :func:`macos_install`/
+    :func:`linux_install`, forwarding ``--dry-run`` verbatim (both
+    functions already implement "render/write, or print what would be
+    written, and run commands through the same runner seam told to print
+    instead of execute" -- see ``registry.service``'s own Design
+    Rationale). This function does nothing itself beyond parsing,
+    dispatch, and printing the one-line outcome; every decision about
+    *what* gets written or run lives in ``registry.service``.
+
+    Catches :class:`LinuxUserPreflightError` (only ever raised by
+    :func:`linux_install`'s ``scope="user"`` path) and turns it into
+    :data:`~mbtools.common.EXIT_LINUX_USER_PREFLIGHT` -- a distinct
+    nonzero exit, per this ticket's own instruction, rather than letting
+    it propagate as an uncaught exception/traceback. The remediation text
+    itself was already printed to stderr by ``linux_install`` before it
+    raised (see that exception's own docstring), so this function does
+    not print anything additional for that case.
+    """
+    if sys.platform not in _SERVICE_PLATFORMS:
+        return _service_not_supported("install")
+
+    scope = _service_scope(args)
+    install_fn = macos_install if sys.platform == "darwin" else linux_install
+    try:
+        path = install_fn(scope, dry_run=args.dry_run)
+    except LinuxUserPreflightError:
+        return EXIT_LINUX_USER_PREFLIGHT
+
+    verb = "would install" if args.dry_run else "installed"
+    print(f"mbregistry: {verb} the {scope} service ({path}).", file=sys.stderr)
+    return EXIT_OK
+
+
+def cmd_service_uninstall(args: argparse.Namespace) -> int:
+    """``mbregistry service uninstall (--user | --system) [--purge]`` --
+    dispatch on ``sys.platform`` to :func:`macos_uninstall`/
+    :func:`linux_uninstall` and print the outcome message either one
+    returns. Always exits :data:`~mbtools.common.EXIT_OK`, even when
+    nothing was installed at the requested scope -- both orchestration
+    functions are themselves a safe no-op in that case (spec's own
+    "uninstall ... is a safe no-op (exit 0 ...) when nothing is
+    installed"), so there is no separate error branch here to exit
+    nonzero from.
+    """
+    if sys.platform not in _SERVICE_PLATFORMS:
+        return _service_not_supported("uninstall")
+
+    scope = _service_scope(args)
+    uninstall_fn = macos_uninstall if sys.platform == "darwin" else linux_uninstall
+    message = uninstall_fn(scope, purge=args.purge, dry_run=args.dry_run)
+    print(message, file=sys.stderr)
+    return EXIT_OK
+
+
+def cmd_service_status(args: argparse.Namespace) -> int:
+    """``mbregistry service status`` -- report *both* scopes' installed/
+    running state and resolved paths (SUC-004), on whichever platform
+    this host is (:func:`macos_status`/:func:`linux_status`). Takes no
+    flags -- unlike ``install``/``uninstall``, there is no scope choice
+    to make; a status check always looks at both.
+
+    Plain ``print`` lines (per this ticket's own Description -- this
+    output shape is not specified elsewhere, and ``render.py``'s table
+    conventions are shaped for a list of *devices*, not a two-row
+    scope/state/path report), one line per scope:
+    ``<scope> <installed/running state> <path>``.
+    """
+    if sys.platform not in _SERVICE_PLATFORMS:
+        return _service_not_supported("status")
+
+    status_fn = macos_status if sys.platform == "darwin" else linux_status
+    for scope in ("user", "system"):
+        status = status_fn(scope)
+        print(f"{scope:<6} {status.describe():<24} {status.path}")
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# install-service -- deprecated, hidden alias for `service install --system`
+# ---------------------------------------------------------------------------
 
 
 def cmd_install_service(args: argparse.Namespace) -> int:
-    """``mbregistry install-service`` -- write the systemd unit file and
-    the non-root-USB-access udev rule (ticket 008), then print (not run)
-    the ``systemctl``/``udevadm``/``usermod`` commands the operator needs.
-    Printing rather than running them is this ticket's implementer
-    choice (its Description explicitly allows either, matching the
-    pre-existing systemd-unit precedent below) -- it keeps this command
-    safe to exercise without root or a real systemd/udev, matching
-    sprint.md's Test Strategy ("installing it into a real systemd is out
-    of scope for automated tests").
+    """``mbregistry install-service`` -- deprecated (sprint 006, ticket
+    006-004) hidden alias for ``mbregistry service install --system``,
+    kept for exactly one release per the linked issue's own Migration
+    guidance, so a script that still invokes it does not suddenly start
+    and enable a real service it never asked to run.
 
-    **``sys.platform == "win32"`` (sprint 005 ticket 005)**: dispatches
-    to :func:`~mbtools.registry.service_windows.cmd_install_service_windows`
-    instead -- the ``sc.exe create``/``sc.exe failure`` commands (no
-    udev/systemd at all on Windows), with ``exec_path`` explicitly
-    including ``--windows-service`` so the rendered ``binPath=`` invokes
-    exactly the SCM-aware entry point :func:`cmd_run`'s own
-    ``--windows-service`` branch provides (see that function's own
-    docstring, "A plain console app is not a real service") -- never the
-    bare ``mbregistry run`` :func:`~mbtools.registry.service_windows
-    .render_windows_service_install`'s own *default* still renders for
-    ticket 004's own (unchanged) golden-file tests. The systemd-unit/
-    udev-rule code below this branch is never reached on Windows.
+    **``sys.platform == "win32"`` is untouched** (sprint 005 ticket 005's
+    own branch, unchanged by this ticket per the stakeholder's explicit
+    "leave Windows code alone"): dispatches to
+    :func:`~mbtools.registry.service_windows.cmd_install_service_windows`
+    exactly as before, never printing the deprecation notice below or
+    reaching ``registry.service`` at all.
 
-    Both files are written unconditionally on every call, each to its own
-    fixed default path (:data:`DEFAULT_UNIT_PATH`/
-    :data:`DEFAULT_UDEV_RULE_PATH`, each independently overridable via
-    ``--output``/``--udev-output``) with deterministic content -- so
-    re-running this command on a host that already has both installed
-    simply rewrites each file with the same bytes (this ticket's own
-    "idempotent... no duplicate rule file, no service disruption"
-    acceptance criterion): neither write depends on, or touches, whether
-    ``mbregistry.service`` is currently running, and this function never
-    itself starts, stops, or restarts it.
+    **On macOS/Linux**, prints the one-line deprecation notice, then
+    reconciles two statements from this ticket's own spec that are in
+    tension for a literal ``dry_run=True`` call: "matches ``service
+    install --system --dry-run``" (Description item 2) vs. "still writes
+    the systemd unit/udev rule files ... unchanged observable behavior"
+    (this ticket's own Acceptance Criteria) -- :func:`linux_install`/
+    :func:`macos_install`'s ``dry_run`` bool, per their own docstrings,
+    only gates whether the plist/unit file is written; it is independent
+    of the ``runner`` a caller injects. Passing ``dry_run=False`` (so the
+    file *is* written, matching the old command's observable behavior)
+    together with an explicit :class:`DryRunCommandRunner` as ``runner``
+    (so every ``launchctl``/``systemctl``/``udevadm``/``usermod`` call
+    only ever prints ``"would run: ..."`` instead of executing) satisfies
+    both: files written, commands printed, nothing actually loaded or
+    started -- exactly the old command's "write files, print commands,
+    start nothing" contract, still using ``service install --system``'s
+    own code path rather than a second, parallel implementation.
+
+    ``--user`` (a *string* override here -- the operating user named in
+    the printed ``usermod`` line -- unrelated to ``service install``'s
+    own boolean ``--user``/``--system`` scope flags, a different
+    subparser's namespace) is forwarded to :func:`linux_install` as
+    ``operating_user``; ``macos_install`` has no such parameter (macOS
+    has no ``plugdev``/``usermod`` equivalent) so it is not passed there.
     """
     if sys.platform == "win32":
         exec_path = f"{sys.executable} -m mbtools.registry.cli run --windows-service"
         return cmd_install_service_windows(exec_path)
 
-    unit_path = Path(args.output) if args.output else DEFAULT_UNIT_PATH
-    unit_text = render_systemd_unit()
-
-    try:
-        unit_path.parent.mkdir(parents=True, exist_ok=True)
-        unit_path.write_text(unit_text)
-    except OSError as exc:
-        print(f"mbregistry: could not write {unit_path}: {exc}", file=sys.stderr)
-        return EXIT_ERROR
-
-    print(f"mbregistry: wrote {unit_path}", file=sys.stderr)
-
-    udev_path = Path(args.udev_output) if args.udev_output else DEFAULT_UDEV_RULE_PATH
-    udev_text = render_udev_rule()
-
-    try:
-        udev_path.parent.mkdir(parents=True, exist_ok=True)
-        udev_path.write_text(udev_text)
-    except OSError as exc:
-        print(f"mbregistry: could not write {udev_path}: {exc}", file=sys.stderr)
-        return EXIT_ERROR
-
-    print(f"mbregistry: wrote {udev_path}", file=sys.stderr)
-
-    operating_user = _resolve_operating_user(args.user)
-
-    print("Run as root to enable and start the service:", file=sys.stderr)
-    print("  systemctl daemon-reload", file=sys.stderr)
-    print("  systemctl enable --now mbregistry.service", file=sys.stderr)
     print(
-        "Run as root to activate the udev rule for an already-attached "
-        "device (a fresh plug-in picks it up automatically):",
+        "mbregistry: install-service is deprecated, use 'mbregistry "
+        "service install --system' -- this will be removed in a future "
+        "release.",
         file=sys.stderr,
     )
-    print("  udevadm control --reload-rules", file=sys.stderr)
-    print("  udevadm trigger", file=sys.stderr)
-    print(
-        f"Run as root to grant {operating_user!r} non-root USB access "
-        "(new login session -- e.g. a new SSH connection -- needed for "
-        "this to take effect):",
-        file=sys.stderr,
-    )
-    print(f"  usermod -aG {_UDEV_GROUP} {operating_user}", file=sys.stderr)
+
+    runner = DryRunCommandRunner()
+    if sys.platform == "darwin":
+        path = macos_install("system", dry_run=False, runner=runner)
+    else:
+        path = linux_install(
+            "system", dry_run=False, runner=runner, operating_user=args.user
+        )
+
+    print(f"mbregistry: wrote {path}", file=sys.stderr)
     return EXIT_OK
 
 
@@ -1192,26 +1150,87 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_p.set_defaults(func=cmd_run)
 
-    install_p = sub.add_parser(
-        "install-service",
-        help="write the mbregistry systemd unit and non-root-USB-access udev rule",
-    )
-    install_p.add_argument(
-        "--output",
-        help=f"where to write the unit file (default {DEFAULT_UNIT_PATH})",
-    )
-    install_p.add_argument(
-        "--udev-output",
+    service_p = sub.add_parser(
+        "service",
         help=(
-            "where to write the udev rule (default "
-            f"{DEFAULT_UDEV_RULE_PATH})"
+            "install, uninstall, or report the mbregistry service "
+            "(macOS/Linux only)"
         ),
     )
+    service_sub = service_p.add_subparsers(dest="service_command", required=True)
+
+    service_install_p = service_sub.add_parser(
+        "install", help="write the service file(s) and load/start the service"
+    )
+    service_install_scope = service_install_p.add_mutually_exclusive_group(
+        required=True
+    )
+    service_install_scope.add_argument(
+        "--user",
+        action="store_true",
+        help="install for the current user (launchd LaunchAgent / systemd --user)",
+    )
+    service_install_scope.add_argument(
+        "--system",
+        action="store_true",
+        help=(
+            "install machine-wide, needs root/sudo (launchd LaunchDaemon / "
+            "systemd system unit)"
+        ),
+    )
+    service_install_p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print what would be written and run, touching nothing",
+    )
+    service_install_p.set_defaults(func=cmd_service_install)
+
+    service_uninstall_p = service_sub.add_parser(
+        "uninstall", help="stop and remove the service"
+    )
+    service_uninstall_scope = service_uninstall_p.add_mutually_exclusive_group(
+        required=True
+    )
+    service_uninstall_scope.add_argument(
+        "--user", action="store_true", help="uninstall the current user's service"
+    )
+    service_uninstall_scope.add_argument(
+        "--system",
+        action="store_true",
+        help="uninstall the machine-wide service, needs root/sudo",
+    )
+    service_uninstall_p.add_argument(
+        "--purge",
+        action="store_true",
+        help="also remove devices.db (kept by default)",
+    )
+    service_uninstall_p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print what would be stopped and removed, touching nothing",
+    )
+    service_uninstall_p.set_defaults(func=cmd_service_uninstall)
+
+    service_status_p = service_sub.add_parser(
+        "status", help="report both scopes' installed/running state and paths"
+    )
+    service_status_p.set_defaults(func=cmd_service_status)
+
+    #: Hidden, deprecated alias for `service install --system` (sprint 006,
+    #: ticket 006-004) -- no ``help=`` kwarg at all, which is what keeps
+    #: argparse from listing it in the "positional arguments" subcommand
+    #: descriptions below `--help`'s usage line (it still necessarily
+    #: appears in that usage line's own `{list,run,service,install-
+    #: service}` choice brace -- argparse has no clean way to hide a
+    #: subparser from that specifically). Kept for exactly one release,
+    #: per cmd_install_service's own docstring.
+    install_p = sub.add_parser("install-service")
     install_p.add_argument(
         "--user",
         help=(
             "operating user named in the printed usermod command "
-            "(default $SUDO_USER, then $USER, then the current user)"
+            "(default $SUDO_USER, then $USER, then the current user); "
+            "Linux only"
         ),
     )
     install_p.set_defaults(func=cmd_install_service)
