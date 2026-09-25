@@ -31,6 +31,7 @@ from mbtools.registry.peering import PeerDiscovery
 from mbtools.registry.store import (
     SOURCE_DERIVED,
     SOURCE_REGISTRY,
+    STATE_ATTACHED_NO_ANNOUNCE,
     STATE_ATTACHED_UNPROBED,
     STATE_CONNECTED,
     STATE_CONNECTED_NO_FIRMWARE,
@@ -196,6 +197,13 @@ def test_apply_event_identity_connected_sets_announcement_fields(store):
 
 
 def test_apply_event_identity_no_firmware(store):
+    """Sprint 007, ticket 003: a peer's genuinely-known-blank board
+    (wire value ``STATE_CONNECTED_NO_FIRMWARE``) is applied via
+    ``store.apply_known_blank`` and lands on the same
+    ``STATE_CONNECTED_NO_FIRMWARE`` state here too -- not downgraded to
+    ``STATE_ATTACHED_NO_ANNOUNCE`` the way a naive reuse of
+    ``apply_remote_probe(uid, None)`` (-> ``apply_probe_result``, which
+    ticket 001 narrowed to mean didn't-announce) would have done."""
     peering_mod._apply_event(store, "alpha", {"type": "attach", "uid": UID, "port": "p", "vid_pid": "v"})
 
     peering_mod._apply_event(
@@ -203,6 +211,19 @@ def test_apply_event_identity_no_firmware(store):
     )
 
     assert store.get(UID).state == STATE_CONNECTED_NO_FIRMWARE
+
+
+def test_apply_event_identity_attached_no_announce(store):
+    """Sprint 007, ticket 003: the didn't-announce wire value is now
+    recognized at all -- before this ticket it matched neither branch and
+    was silently dropped (the uid's state never advanced)."""
+    peering_mod._apply_event(store, "alpha", {"type": "attach", "uid": UID, "port": "p", "vid_pid": "v"})
+
+    peering_mod._apply_event(
+        store, "alpha", {"type": "identity", "uid": UID, "state": STATE_ATTACHED_NO_ANNOUNCE}
+    )
+
+    assert store.get(UID).state == STATE_ATTACHED_NO_ANNOUNCE
 
 
 def test_apply_event_detach_marks_disconnected(store):
@@ -276,6 +297,30 @@ def test_apply_snapshot_device_disconnected(store):
     )
 
     assert store.get(UID).state == STATE_DISCONNECTED
+
+
+def test_apply_snapshot_device_known_blank(store):
+    """Sprint 007, ticket 003: a snapshot's known-blank state is applied
+    via apply_known_blank, not downgraded to didn't-announce."""
+    peering_mod._apply_snapshot_device(
+        store,
+        "alpha",
+        {"uid": UID, "port": "p", "vid_pid": "v", "state": STATE_CONNECTED_NO_FIRMWARE},
+    )
+
+    assert store.get(UID).state == STATE_CONNECTED_NO_FIRMWARE
+
+
+def test_apply_snapshot_device_attached_no_announce(store):
+    """Sprint 007, ticket 003: the didn't-announce wire value is now
+    recognized on the snapshot path too."""
+    peering_mod._apply_snapshot_device(
+        store,
+        "alpha",
+        {"uid": UID, "port": "p", "vid_pid": "v", "state": STATE_ATTACHED_NO_ANNOUNCE},
+    )
+
+    assert store.get(UID).state == STATE_ATTACHED_NO_ANNOUNCE
 
 
 # ---------------------------------------------------------------------------

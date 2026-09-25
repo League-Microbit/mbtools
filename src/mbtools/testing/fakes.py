@@ -11,11 +11,18 @@ avoids every later sprint reinventing the same fakes.
 from __future__ import annotations
 
 from collections import deque
-from typing import Deque, Iterable, Sequence
+from typing import Any, Callable, Deque, Iterable, Sequence
 
 from mbtools.common import DAPLINK_VID_PID, PortInfo
 
-__all__ = ["DAPLINK_VID_PID", "FakeSerial", "FakeUSBSource"]
+__all__ = [
+    "DAPLINK_VID_PID",
+    "FakeSerial",
+    "FakeUSBSource",
+    "FakeChipIdentitySession",
+    "fake_chip_identity_session_factory",
+    "unavailable_chip_identity_session_factory",
+]
 
 
 class FakeUSBSource:
@@ -207,3 +214,92 @@ class FakeSerial:
         Linux (ticket 009) instead of silently no-op'ing.
         """
         self.break_calls.append(duration)
+
+
+# ---------------------------------------------------------------------------
+# SWD chip-identity fakes (sprint 007, ticket 003) -- mirrors FakeSerial's
+# own "hardware-free by construction" role, but for
+# mbtools.registry.identity.read_device_id/read_chip_identity's
+# ConnectHelper.session_with_chosen_probe-shaped session_factory instead
+# of a serial port. Needed because pyocd is a real, installed dependency
+# of this project (unlike an optional import that's simply absent) -- a
+# daemon test that reaches the SWD fallback path (a silent probe with no
+# cached chip identity yet) without one of these fakes would otherwise
+# call into a *real* pyOCD session, exactly what CLAUDE.md's standing
+# hardware rule ("no micro:bits on the development Mac -- they lock it
+# up") and this ticket's own acceptance criteria ("no real hardware in
+# the automated suite") both forbid.
+# ---------------------------------------------------------------------------
+
+
+class FakeChipIdentitySession:
+    """A ``ConnectHelper.session_with_chosen_probe``-shaped context
+    manager for a *successful* SWD chip-identity read -- yields an object
+    whose ``.target.read32(addr)`` returns a scripted ``device_id``,
+    mirroring the exact shape ``identity.read_device_id`` calls it
+    against: ``with factory(...) as session:
+    session.target.read32(FICR_DEVICEID1)``.
+    """
+
+    def __init__(self, device_id: int) -> None:
+        self._device_id = device_id
+
+    def __enter__(self) -> "FakeChipIdentitySession":
+        return self
+
+    def __exit__(self, *exc_info: object) -> bool:
+        return False
+
+    @property
+    def target(self) -> "FakeChipIdentitySession":
+        return self
+
+    def read32(self, _addr: int) -> int:
+        return self._device_id
+
+
+def fake_chip_identity_session_factory(
+    device_id: int, *, fail_first_n: int = 0
+) -> Callable[..., FakeChipIdentitySession]:
+    """Build a ``chip_identity_session_factory`` that succeeds with
+    ``device_id`` -- optionally raising on the first ``fail_first_n``
+    calls before succeeding, so a test can prove
+    ``identity.read_device_id``'s own "try ``target_mcu``, then retry
+    with ``target_override=None``" fallback actually exercises both
+    attempts before succeeding (``fail_first_n=1``), or that a probe
+    that never succeeds on either attempt returns ``None``
+    (``fail_first_n=2`` -- or just always raise; see
+    :func:`unavailable_chip_identity_session_factory`).
+    """
+    calls = {"n": 0}
+
+    def factory(**_kwargs: object) -> FakeChipIdentitySession:
+        calls["n"] += 1
+        if calls["n"] <= fail_first_n:
+            raise RuntimeError("fake_chip_identity_session_factory: scripted failure")
+        return FakeChipIdentitySession(device_id)
+
+    return factory
+
+
+def unavailable_chip_identity_session_factory(**_kwargs: Any) -> Any:
+    """A ``chip_identity_session_factory`` fake guaranteeing a test never
+    opens a real pyOCD session, regardless of what happens to be
+    installed in the test environment -- ``pyocd`` is a real, declared
+    dependency of this project (``pyproject.toml``), not an optional
+    import that's simply absent in CI, so leaving
+    ``chip_identity_session_factory`` unset in a daemon test that reaches
+    the SWD fallback path would otherwise call ``pyocd``'s real
+    ``ConnectHelper.session_with_chosen_probe`` for real.
+
+    Raises unconditionally -- ``identity.read_device_id``'s own
+    try/except-and-continue loop treats that exactly like a busy or
+    locked probe (tries the next ``target_override``, then gives up and
+    returns ``None``), so a daemon test that incidentally reaches this
+    fallback path (a silent probe with no cached chip identity yet) but
+    isn't itself testing SWD naming gets a clean "unavailable" outcome.
+    """
+    raise RuntimeError(
+        "unavailable_chip_identity_session_factory: no real pyOCD session "
+        "may be opened in tests -- pass a scripted session_factory instead"
+    )

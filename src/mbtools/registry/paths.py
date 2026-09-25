@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 __all__ = [
@@ -67,6 +68,7 @@ __all__ = [
     "linux_user_unit_path",
     "LINUX_SYSTEM_UNIT_PATH",
     "LINUX_UDEV_RULE_PATH",
+    "claims_dir_path",
 ]
 
 #: Fixed named-pipe path, in the Windows ``\\.\pipe\`` namespace. Not a
@@ -289,3 +291,43 @@ LINUX_SYSTEM_UNIT_PATH = Path("/etc/systemd/system/mbregistry.service")
 #: rule — same value as ``registry.cli``'s ``DEFAULT_UDEV_RULE_PATH``
 #: (ticket 008). See the "service artifacts" module comment above.
 LINUX_UDEV_RULE_PATH = Path("/etc/udev/rules.d/99-mbregistry-cmsis-dap.rules")
+
+
+# -- cross-instance board claim (sprint 007, ticket 002) ---------------------
+#
+# Where every ``mbregistry`` instance on this host -- regardless of
+# privilege level -- locks a per-uid claim file, per
+# ``mbtools.registry.claims``'s own module docstring. Deliberately a
+# *single*, scope-agnostic location (unlike the db/socket helpers above,
+# which each have a distinct system/user pair) -- sprint.md's Open
+# Question 4 asks this ticket to confirm the claims directory works for a
+# system-scope (root) daemon and a user-scope (unprivileged) daemon
+# sharing one host: a claim's entire point is being visible to *every*
+# ``mbregistry`` process on the host, so splitting it by scope the way
+# ``system_db_path``/``user_db_path`` do would defeat the purpose -- a
+# root daemon and a user daemon must contend for the *same* file to ever
+# stop each other from double-claiming a board. World-writable-sticky
+# (``/tmp``-style, ``01777``) is what makes one shared location safe for
+# both privilege levels to create/lock files in without a separate
+# install step or root-owned directory a normal user couldn't write to.
+
+
+def claims_dir_path() -> Path:
+    """The shared claims directory,
+    ``<tempfile.gettempdir()>/mbtools/claims`` -- world-writable-sticky
+    (``0o1777``), created on first use if missing by
+    :func:`mbtools.registry.claims.try_claim` itself (this function only
+    knows *where*, per this module's own boundary; it does no I/O beyond
+    what :func:`tempfile.gettempdir` itself might touch).
+
+    ``tempfile.gettempdir()`` (rather than a hardcoded ``/tmp``) is used
+    so a sandboxed test run or a host with ``$TMPDIR`` pointed elsewhere
+    still lands in a writable location -- the same reasoning
+    ``sprint.md``'s "``/tmp``-style" description already implies (it
+    describes the *permission model* the directory needs, not a literal
+    path). Callable on every platform, including ``win32`` -- harmless
+    there since :mod:`mbtools.registry.claims`'s Windows implementation
+    never calls this function at all (COM-port exclusivity is already
+    native, so no claims directory is ever created on Windows).
+    """
+    return Path(tempfile.gettempdir()) / "mbtools" / "claims"

@@ -61,7 +61,11 @@ from mbtools.registry.locks import KIND_FLASH, LockManager
 from mbtools.registry.remote_api import RemoteAPIServer
 from mbtools.registry.remote_client import RegistryUnavailable, RemoteRegistryClient
 from mbtools.registry.store import Store
-from mbtools.testing.fakes import FakeSerial, FakeUSBSource
+from mbtools.testing.fakes import (
+    FakeSerial,
+    FakeUSBSource,
+    unavailable_chip_identity_session_factory,
+)
 
 VID_PID = "0d28:0204"
 VID, PID_ = DAPLINK_VID_PID
@@ -520,6 +524,9 @@ def _run_owning_daemon_and_remote_api(tmp_path, uid, announcements):
         settle_s=0,
         probe_timeout_s=0.05,
         lock=shared_lock,
+        # pyocd is a real, installed dependency here -- never let this
+        # daemon touch a real session if a probe ever comes back silent.
+        chip_identity_session_factory=unavailable_chip_identity_session_factory,
     )
     remote_api = RemoteAPIServer(
         host="127.0.0.1",

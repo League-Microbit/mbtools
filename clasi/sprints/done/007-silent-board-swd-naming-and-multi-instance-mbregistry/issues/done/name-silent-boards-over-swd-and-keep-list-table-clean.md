@@ -1,5 +1,5 @@
 ---
-status: in-progress
+status: done
 sprint: '007'
 tickets:
 - 007-001

@@ -32,9 +32,38 @@ and the code disagree, the code wins. Run `<program> --help` or
 | `mbserial` | Client | yes |
 | `mbrelay connect / names` | Client | yes |
 
-Run **exactly one** `mbregistry` per host. Two daemons on one host (say a
-per-user one and a system one) fight over the same USB devices and the same
-TCP ports. The second one fails to bind port 7440.
+**One `mbregistry` per host, unless you give each instance its own
+identity and ports.** By default, two daemons on one host (say a per-user
+one and a system one) fight over the same TCP ports — the second one
+fails to bind port 7440. Since sprint 007, a second (or third) instance
+*can* coexist on the same host, if every instance that would otherwise
+collide is given distinct, non-colliding settings:
+
+- **Ports.** Give each instance its own `--remote-port`/`--peer-pub-port`/
+  `--peer-snapshot-port`/`--pool-port`/`--names-port` (explicit values, or
+  `0` for an ephemeral port — see section 4), or run extra instances with
+  `--no-relay-pool` if only one needs 7444/7445 at all. The local API
+  socket/pipe (`--socket`) also needs a distinct path per instance.
+- **mDNS/peer identity.** Give each instance its own `--instance NAME` (see
+  section 5) so they don't collide in mDNS or overwrite each other in
+  peers' `peer`/`device` tables.
+- **Which boards each instance may touch.** Every instance still competes
+  for the same physical USB boards. A same-host, cross-*process* claim
+  (`try_claim` on `<shared-runtime>/mbtools/claims/<uid>.lock`, section 5)
+  makes sure only one instance at a time treats a given board uid as its
+  own — the other instance simply skips that uid and doesn't list it,
+  rather than both instances racing to open the same port. Use
+  `--only-uid`/`--exclude-uid` (section 5) to partition boards
+  deliberately between instances instead of leaving it to whichever
+  instance wins the claim race.
+
+A second instance that still tries to bind a port an existing instance
+already holds — two instances both left at the default `--remote-port
+7440`, for example — still fails to bind, exactly as before this sprint.
+"Exactly one per host" remains the right mental model unless you have a
+concrete reason (e.g. a spawned per-session instance, section 5's
+`--ready-json`/`--exit-with-parent`/`--no-peering` recipe) to run more
+than one.
 
 Local vs. remote I/O. When a client works on a board plugged into **this**
 host, the client opens the USB serial or CMSIS-DAP device itself, so the
@@ -176,16 +205,21 @@ pool (`--no-relay-pool`).
 | **7440** | TCP | Remote API: how peers and remote `mbdeploy`/`mbserial`/`mbrelay` reach this host's devices | `--remote-port`, `$MBREGISTRY_REMOTE_PORT` |
 | **7442** | TCP | Peering ZeroMQ PUB (event bus) | `--peer-pub-port`, `$MBREGISTRY_PEER_PUB_PORT` |
 | **7443** | TCP | Peering ZeroMQ snapshot REQ/REP | `--peer-snapshot-port`, `$MBREGISTRY_PEER_SNAPSHOT_PORT` |
-| **7444** | TCP | Robot-console-compatible relay pool (`_mbrelay._tcp`) | no override; `--no-relay-pool` disables it |
-| **7445** | HTTP | Robot-console-compatible `/names/<name>` API | no override; always on |
+| **7444** | TCP | Robot-console-compatible relay pool (`_mbrelay._tcp`) | `--pool-port`, `$MBREGISTRY_POOL_PORT`; `--no-relay-pool` disables it |
+| **7445** | HTTP | Robot-console-compatible `/names/<name>` API | `--names-port`, `$MBREGISTRY_NAMES_PORT`; always on |
 | 5353 | UDP | mDNS (multicast) | n/a |
+
+`--pool-port 0`/`--names-port 0` bind an ephemeral port; the `_mbrelay._tcp`
+SRV port and its `registry=` TXT value always reflect the port actually
+bound, never the requested value (this also already held for 7440/7442/7443
+via `--remote-port`/etc.).
 
 mDNS service types:
 
 | Service | Advertised by | Instance name | Meaning |
 |---|---|---|---|
-| `_mbregistry._tcp` | every `mbregistry` | host name | Peer discovery. TXT carries this host's remote/peering ports. |
-| `_mbrelay._tcp` | the relay pool (unless `--no-relay-pool`) | host name | Legacy relay discovery for robot-console. SRV port = 7444, TXT `registry=7445`. |
+| `_mbregistry._tcp` | every `mbregistry` | `--instance`/`$MBREGISTRY_INSTANCE`, else host name | Peer discovery. TXT carries this host's remote/peering ports. |
+| `_mbrelay._tcp` | the relay pool (unless `--no-relay-pool`) | `--instance`/`$MBREGISTRY_INSTANCE`, else host name | Legacy relay discovery for robot-console. SRV port = the bound pool port (default 7444), TXT `registry=<bound names-API port>` (default 7445). |
 
 mDNS is built in (python-zeroconf). You don't need Avahi or Bonjour, and it
 coexists with both. To look from the command line:
@@ -218,8 +252,79 @@ and interfaces whose names start with `docker`, `br-`, `veth`, `virbr`,
 | `--peer-pub-port N` | `MBREGISTRY_PEER_PUB_PORT` | `7442` | |
 | `--peer-snapshot-port N` | `MBREGISTRY_PEER_SNAPSHOT_PORT` | `7443` | |
 | `--auth-token SECRET` | `MBREGISTRY_TOKEN` | unset (no auth) | See the limitation in section 9 |
+| `--pool-port N` | `MBREGISTRY_POOL_PORT` | `7444` | Relay pool (`_mbrelay._tcp`) TCP port; `0` = ephemeral |
+| `--names-port N` | `MBREGISTRY_NAMES_PORT` | `7445` | `/names` HTTP port; `0` = ephemeral |
+| `--instance NAME` | `MBREGISTRY_INSTANCE` | short hostname | mDNS/peer identity: the `_mbregistry._tcp`/`_mbrelay._tcp` instance name, and the value recorded as `peer.host`/`device.host` on peers |
+| `--pipe NAME` | (none) | `registry.paths.default_pipe_name()` | Windows named-pipe transport name; ignored on non-Windows |
+| `--only-uid UID` | (none) | no restriction | Only ever claim/probe this uid (repeatable) |
+| `--exclude-uid UID` | (none) | (none) | Never claim/probe this uid (repeatable) |
+| `--ready-json` | (none) | off | Print one JSON ready-line to stdout once every listener is bound (see the spawn recipe below) |
+| `--exit-with-parent` | (none) | off | Exit cleanly (same path as `SIGTERM`) when stdin reaches EOF |
+| `--no-peering` | (none) | peering on | Skip mDNS advertise/browse and the ZeroMQ peering bus entirely |
 | `--no-relay-pool` | (none) | pool on | Set on hosts with no relay boards |
 | `--windows-service` | (none) | off | Only for the Windows SCM `binPath=`; not for interactive use |
+
+### Cross-instance board claim
+
+Before any instance treats a USB-attached board as its own (lists it,
+probes it, opens its port), it takes a non-blocking, same-host claim on
+that board's uid — `flock` on
+`<tempfile.gettempdir()>/mbtools/claims/<uid>.lock` (a world-writable,
+sticky (`0o1777`) directory shared by every `mbregistry` on the host
+regardless of `--user`/`--system` scope), plus best-effort `TIOCEXCL` on
+the opened serial fd, on Unix; a no-op on Windows, where COM-port
+exclusivity is already OS-native. An instance that loses the race simply
+skips that uid for the current poll cycle and never lists it — it is
+retried on a later cycle, not treated as an error. The claim is released
+on detach, or automatically by the OS when the holding process exits
+(a crashed instance leaves nothing behind). This is a same-host,
+same-process-lifetime mechanism, entirely separate from the per-connection
+`lock`/`unlock` API (section 9's peering/`LockManager` machinery) — a
+board can be claimed by this instance and still be lock-free, or claimed
+and locked, exactly as with a single instance. `--only-uid`/`--exclude-uid`
+above partition which uids an instance will even attempt to claim, for
+deliberate multi-instance setups (e.g. two instances on one test bench
+each serving half the attached boards).
+
+### Spawn recipe: `--ready-json` / `--exit-with-parent` / `--no-peering`
+
+A parent process (robot-console, a test harness, …) that wants to spawn
+and supervise a short-lived `mbregistry run` child — without joining it to
+the mDNS/peering fleet — combines three flags:
+
+```sh
+mbregistry run --socket /tmp/mbregistry-session/api.sock \
+  --db /tmp/mbregistry-session/devices.db \
+  --instance session-1234 \
+  --ready-json --exit-with-parent --no-peering
+```
+
+- `--ready-json` prints exactly one JSON line to **stdout**, once every
+  requested listener is bound (every other diagnostic line this command
+  prints goes to stderr, so a parent can read just stdout):
+
+  ```json
+  {"ready": true, "instance": "session-1234", "socket": "/tmp/mbregistry-session/api.sock",
+   "ports": {"remote": 7440, "pool": 7444, "names": 7445}}
+  ```
+
+  (`peer_pub`/`peer_snapshot` would also appear here, alongside `remote`,
+  if `--no-peering` were left off.) `ports` only carries the ports
+  actually applicable: `peer_pub`/`peer_snapshot` are omitted under
+  `--no-peering` (as in the example above), and `pool` is omitted under
+  `--no-relay-pool`. Every value is the port actually bound (not merely
+  requested) **except** `peer_pub`/`peer_snapshot`, which report the
+  resolved requested value — `registry.peering.PeerDiscovery` (unchanged
+  this sprint) exposes no bound-port equivalent to read back from.
+- `--exit-with-parent` watches stdin for EOF (the parent closing its end of
+  an inherited pipe, or dying outright) and then shuts down cleanly through
+  the same path `SIGTERM` already takes.
+- `--no-peering` skips constructing the mDNS/ZeroMQ peering component
+  entirely — not "start then immediately stop." The relay pool and
+  `/names` listener are unaffected; disable those separately with
+  `--no-relay-pool` if the spawned instance shouldn't advertise
+  `_mbrelay._tcp` either. A `--peer` given alongside `--no-peering` is a
+  no-op, noted to stderr only.
 
 ### Clients
 
@@ -679,6 +784,14 @@ New-NetFirewallRule -DisplayName "mbregistry mDNS" -Direction Inbound -Protocol 
 ## 11. Upgrading
 
 Upgrades keep the database. The schema migrates itself on start.
+
+**Upgrade note (sprint 007):** `mbregistry list`'s `no-firmware` `STATE`
+now means only "confirmed blank after a flash-triggered re-probe" — a
+board that simply never announced (no flash involved) now shows a
+separate `no-answer` state instead of also being labeled `no-firmware`.
+An existing `devices.db` row already sitting at `no-firmware` from before
+this change relabels itself on its next real probe/attach event; there is
+no backfill on upgrade.
 
 ```sh
 # Linux, /opt venv

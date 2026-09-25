@@ -116,8 +116,9 @@ unmodified; only a client that wants to show "locked by loki" instead of
   {"uid": "...", "short_uid": "...", "port": "...", "vid_pid": "...",
    "role": "...", "common_name": "...", "device_name": "...",
    "serial_payload": "...", "raw_announcement": "...",
-   "state": "attached_unprobed|connected|connected_no_firmware|disconnected",
+   "state": "attached_unprobed|connected|attached_no_announce|connected_no_firmware|disconnected",
    "error_note": "...", "flash_count": 0,
+   "chip_identity_name": "...", "chip_identity_serial": 0,
    "first_seen": 0.0, "last_seen": 0.0, "last_probe": 0.0,
    "lock_kind": "serial|relay|flash|debug|null", "lock_pid": 1234}
 ]}
@@ -128,6 +129,38 @@ Every field on the device dict is `store.DeviceRecord`'s own columns
 (`lock_kind`/`lock_pid`, both `null` when unlocked, from `locks.status`) so a
 client building a STATE column (ticket 009) never needs a second round-trip
 per device.
+
+**`state` (sprint 007, ticket 001)**: `connected_no_firmware` narrowed to
+mean only "confirmed blank" — a board a flash-triggered re-probe
+positively could not get an announcement from after a mass erase/reflash
+(`Store.apply_known_blank`). A board that simply never announced (no
+flash involved, or a flash whose give-up path hasn't fired) is
+`attached_no_announce` instead — a new state, not present before this
+sprint. `render.py`'s STATE column renders `attached_no_announce` as
+`no-answer` (FIRMWARE cell: `unknown`) and `connected_no_firmware` as
+`no-firmware` (FIRMWARE cell: `no firmware`). A pre-sprint-007
+`devices.db` row already sitting at `connected_no_firmware` under the old,
+broader meaning is not retroactively relabeled — it corrects itself on
+its next real probe/attach event, per `docs/service.md`'s own upgrade
+note (section 11).
+
+**`chip_identity_name`/`chip_identity_serial`** (sprint 007, ticket 001,
+both nullable): a board's identity read directly over SWD (`FICR
+DEVICEID1`, via pyOCD, attach-only — see `registry.identity
+.read_chip_identity`) when its serial `HELLO` announcement never arrives.
+Written at most once per uid (`Store.set_chip_identity` is a no-op on an
+already-cached uid) and persists independently of `device_name`, which
+can go blank again on a later reflash to non-announcing firmware.
+`render_table`'s `NAME` column falls back to `chip_identity_name` when
+`device_name` is blank. Not carried over the peering wire (event/snapshot
+payloads) as of this sprint — a peer-owned row's `NAME` column shows no
+chip-identity fallback, only a locally-probed row's does; flagged as a
+known limitation below.
+
+`render_table`'s output no longer appends a free-text line after the
+table for a device's `error_note` (sprint 007, ticket 001) — that detail
+is only available through this `--json`/`list` response's own
+`error_note` field now, not printed after the table.
 
 ### `get` / `find`
 
@@ -341,6 +374,44 @@ mechanism to send one (sprint.md's Migration Concerns), matching legacy
 `mbrelay`'s own no-auth posture for this exact surface. See
 `registry.console_compat.names_api`'s own module docstring for the full
 per-request contract.
+
+## Cross-instance board claim (sprint 007, ticket 002)
+
+A third, distinct kind of exclusivity, alongside the per-connection
+`lock`/`unlock` API below and `device.remote_lock_kind`'s cross-peer
+replicated lock cache above: a same-host, same-process-lifetime claim
+that decides *whether an instance may treat a USB-attached board uid as
+its own at all* — not part of the wire protocol (no request/response
+shape of its own), so it is documented here only for completeness, since
+its presence changes what `list` can show.
+
+- **What it gates.** Before `run_once` upserts a newly-seen uid as
+  attached (and before any probe/SWD-read opens its port), the daemon
+  asks `registry.claims.try_claim(uid)`. An instance that loses the race
+  never upserts that uid — the board simply does not appear in that
+  instance's own `list` response at all, retried on a later poll cycle,
+  not surfaced as an error or a special `state`.
+- **Mechanism.** Unix: a non-blocking `flock` on
+  `<claims_dir>/<uid>.lock` (`registry.paths.claims_dir_path()` —
+  `<tempfile.gettempdir()>/mbtools/claims`, mode `0o1777`, one shared
+  location regardless of `--user`/`--system` scope), plus best-effort
+  `TIOCEXCL` on the opened serial fd (`registry.identity.probe`).
+  Windows: a no-op that always succeeds — COM-port exclusivity is already
+  OS-native there. Released explicitly on detach, or automatically by the
+  OS when the holding process exits.
+- **Not `LockManager`.** `registry.locks.LockManager` (below) is a
+  cross-*peer*, per-*connection* lock a client explicitly takes/releases
+  over the API, replicated to peers, and visible in `list`'s
+  `lock_kind`/`lock_pid`. The claim is neither requested by a client nor
+  visible in the wire protocol at all — it is a same-host guard against
+  two `mbregistry` *processes* physically opening the same probe, fully
+  orthogonal to whether the board is locked. A board can be claimed and
+  lock-free, or claimed and locked, exactly as with a single instance.
+- **`--only-uid`/`--exclude-uid`** (`mbregistry run`, `docs/service.md`
+  section 5) filter which uids an instance will even attempt to claim,
+  for deliberate multi-instance partitioning; an excluded/not-included
+  uid is treated as never-claimable by that instance and never reaches
+  `try_claim` at all.
 
 ## Locking and connection lifetime
 
@@ -876,3 +947,19 @@ listed above, for the same one-place reason.
   "never probe a locked device" check (`LockManager.status`) still sees it
   as locked throughout, so this does not reopen the race the flash-kind
   lock exists to prevent.
+- **Peering payloads don't carry chip identity (sprint 007).** A peer's
+  own `chip_identity_name`/`chip_identity_serial` (see "`list`" above) are
+  not included in `registry.peering`'s snapshot or event payloads — a
+  remote-owned row's `NAME` column never falls back to a chip-identity
+  reading, only a locally-probed row's does. Flagged for a future ticket
+  if cross-peer SWD-identity display is wanted; not attempted this
+  sprint.
+- **`mbregistry`/robot-console integration status (sprint 007).**
+  `docs/design/robot-console-integration.md` section 5 lists nine changes
+  "several instances on one machine" needs, in priority order. This
+  sprint completed items 1 (configurable pool/names ports, advertise what's
+  bound), 4 (`--instance`/`--pipe`), 5 (the cross-instance claim,
+  `--only-uid`/`--exclude-uid`), and 6 (`--ready-json`/
+  `--exit-with-parent`/`--no-peering`). Items 2 (`watch` op), 3 (lock
+  `label`), 7 (understandable stale-lock breaking), and 8 (`stream` on the
+  local socket) remain open, planned for sprint 008 per that document.

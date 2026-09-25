@@ -28,9 +28,13 @@ Every cycle, a flash-pending uid is probed as soon as it is seen attached
 again — regardless of what :meth:`Store.needs_probe` says, since a flash
 can leave the DAPLink interface enumerated throughout (no detach/reattach
 cycle to trip the store's own "reattach resets last_probe" rule) — and if
-it never reappears before its deadline, it is marked
-``connected_no_firmware`` (the store's existing "blank-equivalent" state,
-reused here rather than inventing a new one) instead of waiting forever.
+it never reappears before its deadline, it is marked known-blank via
+:meth:`Store.apply_known_blank` (sprint 007, ticket 003) instead of
+waiting forever, since a flash-triggered re-probe that still gets
+nothing after the device never re-enumerated is a case this daemon can
+actually *assert* is blank, unlike an ordinary silent probe (see
+:meth:`_maybe_probe`'s own docstring for the same distinction on its own
+give-up path).
 
 **Detach handling**: a uid that drops out of a scan has any lock it holds
 force-released (a detach is not a graceful release — UC-002's
@@ -74,6 +78,46 @@ lock" reasoning the module docstring's "Concurrency" note already applies
 to probing itself, extended to cover a callback that will end up doing a
 network send.
 
+**Cross-instance claim (sprint 007, ticket 002)**: before
+:meth:`Store.upsert_attached` is ever called for a newly-seen uid,
+:meth:`run_once` calls :attr:`_claim_fn`. A denied claim (``None``) skips
+the uid entirely for this cycle -- no upsert, so it never appears in this
+instance's own :meth:`Store.list_devices` (SUC-005's postcondition) -- and
+needs no separate retry bookkeeping: a uid that was never upserted is
+never in ``previously_attached`` either, so the very next cycle's
+"newly-seen" branch tries the claim again on its own. A granted claim's
+:class:`~mbtools.registry.claims.ClaimHandle` is kept in
+:attr:`_claims`, keyed by uid, and released (:meth:`ClaimHandle.release`)
+in the same branch that already handles a detach
+(:meth:`Store.mark_disconnected`) -- a claim's lifetime is tied to "this
+uid is currently attached to this instance", the same shape either
+release-on-detach or release-on-process-exit would give it (see
+``registry.claims``'s own module docstring for why either is a valid
+choice; this class picks explicit release-on-detach for symmetry with its
+own attach/detach bookkeeping).
+
+:attr:`_claim_fn` defaults, when the constructor omits it, to a
+filesystem-free, always-succeeding no-op -- *not*
+:func:`mbtools.registry.claims.try_claim` -- so every pre-ticket-002
+direct ``Daemon(...)`` construction (every test in this module before
+this ticket) is completely unaffected: no dependency on a real,
+host-shared claims directory existing or being writable, and no risk of
+one test's held claim leaking into another test that happens to reuse
+the same uid within the same process. Real, cross-instance enforcement is
+opt-in, wired explicitly by
+:func:`mbtools.registry.cli.assemble_daemon_and_api` (forwarded from
+:func:`mbtools.registry.cli._run_registry`, which always builds a real
+:func:`mbtools.registry.claims.build_claim_fn` for production use) or by
+any test that wants to exercise real claim contention (passing its own
+``claim_fn``, e.g. ``functools.partial(claims.try_claim,
+claims_dir=tmp_path)``, exactly the "test-only escape hatch" shape
+``serial_factory``/``probe_timeout_s`` already have). This is a
+deliberate difference from ``serial_factory``'s own default (which *does*
+reach for real hardware when unset) -- a missing ``serial_factory`` fails
+loudly (no port to open); a missing, silently-real ``claim_fn`` would
+instead succeed silently against a real shared directory, which is a far
+worse default for test isolation.
+
 **Concurrency (ticket 009's assembly)**: this class's own thread (the
 poll loop calling :meth:`run_once`) and the API's per-connection threads
 (ticket 008) both touch the same ``store``/``locks`` instances with no
@@ -93,6 +137,15 @@ duration of every probe, which is worse than the race the lock exists to
 close. A caller that constructs a bare :class:`Daemon` without ``lock=``
 (every test in this module, and any future single-threaded use) gets a
 private ``RLock`` of its own — harmless, since nothing else shares it.
+
+:attr:`_claim_fn` (sprint 007, ticket 002) is called from *inside*
+:attr:`_lock` in :meth:`run_once`, unlike :func:`identity.probe` above —
+deliberately: on Unix, a claim attempt is a single non-blocking
+(``LOCK_NB``) ``flock`` syscall against a local file, not a port open,
+so it never risks the multi-second stall :func:`identity.probe` is kept
+outside the lock to avoid. The Windows no-op path does no I/O at all.
+Should a future ``claim_fn`` ever need to do slower I/O, it would need
+the same outside-the-lock treatment ``identity.probe`` already gets.
 """
 
 from __future__ import annotations
@@ -125,6 +178,25 @@ DEFAULT_FLASH_REPROBE_TIMEOUT_S = 10.0
 
 #: Default poll interval for :meth:`Daemon.run`.
 DEFAULT_INTERVAL_S = 2.0
+
+
+class _NoOpClaim:
+    """:class:`Daemon`'s bare ``claim_fn`` default's return value -- a
+    claim that always "succeeds" and releases nothing real. See the
+    module docstring's "Cross-instance claim" note for why this, and not
+    :func:`mbtools.registry.claims.try_claim`, is the default when no
+    ``claim_fn`` is given at all.
+    """
+
+    def release(self) -> None:
+        return None
+
+
+_NO_OP_CLAIM = _NoOpClaim()
+
+
+def _default_claim_fn(uid: str) -> _NoOpClaim:
+    return _NO_OP_CLAIM
 
 
 class Daemon:
@@ -172,6 +244,25 @@ class Daemon:
     published onto the peering event bus (sprint.md Decision 3's
     replicated lock-display cache). Defaults to ``None`` (no-op), so
     every pre-ticket-009 caller/test is unaffected.
+
+    ``claim_fn`` (sprint 007, ticket 002) is the cross-instance claim
+    check described in the module docstring's "Cross-instance claim"
+    note — a ``uid -> ClaimHandle | None`` callable, called once per
+    newly-seen uid before it is ever upserted. Defaults to ``None``,
+    which resolves to a filesystem-free no-op that always grants the
+    claim — see that same docstring note for why this, not
+    :func:`mbtools.registry.claims.try_claim`, is the bare default.
+
+    ``chip_identity_session_factory`` (sprint 007, ticket 003) is
+    forwarded verbatim to :func:`mbtools.registry.identity
+    .read_chip_identity`'s own ``session_factory`` parameter on every SWD
+    read this daemon makes — the same test-only escape hatch
+    ``serial_factory``/``settle_s`` already are for
+    :func:`~mbtools.registry.identity.probe` (a test passes a callable
+    matching ``ConnectHelper.session_with_chosen_probe``'s shape instead
+    of ever touching a real pyOCD session). Defaults to ``None``, meaning
+    "use pyOCD for real" — see ``identity.read_chip_identity``'s own
+    docstring.
     """
 
     def __init__(
@@ -188,6 +279,8 @@ class Daemon:
         event_callback: Callable[[str, DeviceRecord], None] | None = None,
         lock_display_callback: Callable[[str, str | None, str | None], None]
         | None = None,
+        claim_fn: Callable[[str], Any] | None = None,
+        chip_identity_session_factory: Callable[..., Any] | None = None,
     ) -> None:
         self._usbwatch = usbwatch
         self._store = store
@@ -198,6 +291,16 @@ class Daemon:
         self._now = now_fn
         self._lock = lock if lock is not None else threading.RLock()
         self._event_callback = event_callback
+        self._claim_fn = claim_fn if claim_fn is not None else _default_claim_fn
+        self._chip_identity_session_factory = chip_identity_session_factory
+
+        #: uid -> the ClaimHandle-shaped object (anything with a
+        #: no-argument ``.release()``) returned by :attr:`_claim_fn` for
+        #: every uid currently claimed by this instance. Ephemeral,
+        #: in-memory only, mirroring :attr:`_flash_pending`'s own
+        #: "lost on restart is fine" reasoning — a fresh instance simply
+        #: re-attempts the claim for every uid its own next scan sees.
+        self._claims: dict[str, Any] = {}
 
         #: uid -> deadline (per ``now_fn``) by which a flash-triggered
         #: re-probe must see the device re-enumerate, or it gives up.
@@ -253,13 +356,19 @@ class Daemon:
         """Perform exactly one scan-diff-probe cycle.
 
         1. Snapshot currently-attached devices via ``usbwatch.scan()``.
-        2. For each attached uid: ``store.upsert_attached`` if it wasn't
-           already known as attached, then probe it if eligible (see
-           :meth:`_maybe_probe`).
+        2. For each newly-attached uid: attempt :attr:`_claim_fn` first
+           (sprint 007, ticket 002 — see the module docstring's
+           "Cross-instance claim" note); a denied claim skips
+           ``store.upsert_attached`` entirely for this uid this cycle. A
+           granted claim's handle is kept in :attr:`_claims`, then
+           ``store.upsert_attached`` runs and the uid is probed if
+           eligible (see :meth:`_maybe_probe`).
         3. For each uid that was attached last cycle but is gone now:
-           force-release any lock it holds, then ``store.mark_disconnected``.
+           force-release any lock it holds, release its claim handle (if
+           any), then ``store.mark_disconnected``.
         4. For each flash-pending uid that is still absent and past its
-           deadline: give up and mark it ``connected_no_firmware``.
+           deadline: give up and mark it ``attached_no_announce`` (see
+           :meth:`Store.apply_probe_result`'s ``None`` branch).
 
         "Attached last cycle" is read from ``store`` (any *locally-owned*
         record -- ``host is None`` -- whose ``state`` isn't
@@ -317,18 +426,44 @@ class Daemon:
                 for record in self._store.list_devices()
                 if record.host is None and record.state != STATE_DISCONNECTED
             }
+            # Every uid this instance may call _maybe_probe on below: a
+            # uid already locally owned and still attached, plus whatever
+            # is newly claimed this cycle (built up as the attach loop
+            # runs). A uid whose claim was denied this cycle is never
+            # added here -- see the module docstring's "Cross-instance
+            # claim" note: this is what stops this instance from ever
+            # opening a port (identity.probe) for a uid it doesn't
+            # actually hold, not just from upserting it.
+            locally_owned_now = previously_attached & current.keys()
 
             for uid, info in current.items():
                 if uid not in previously_attached:
+                    handle = self._claim_fn(uid)
+                    if handle is None:
+                        # Another mbregistry instance already holds this
+                        # uid (or it's excluded by --only-uid/
+                        # --exclude-uid) — never upsert it, so it never
+                        # appears in this instance's own list_devices().
+                        # No bookkeeping needed to retry: this uid stays
+                        # out of previously_attached next cycle too, so
+                        # this same branch tries the claim again on its
+                        # own (see the module docstring's "Cross-instance
+                        # claim" note).
+                        continue
+                    self._claims[uid] = handle
                     record = self._store.upsert_attached(
                         uid, info.port, format_vid_pid(info.vid, info.pid)
                     )
                     attached.append(record)
+                    locally_owned_now.add(uid)
 
             for uid in previously_attached - current.keys():
                 status = self.locks.status(uid)
                 if status is not None:
                     self.locks.release(uid, status.holder)
+                claim = self._claims.pop(uid, None)
+                if claim is not None:
+                    claim.release()
                 record = self._store.mark_disconnected(uid)
                 detached.append(record)
 
@@ -336,10 +471,19 @@ class Daemon:
                 if uid not in current and now >= deadline:
                     logger.warning(
                         "daemon: %s never re-enumerated after flash within timeout; "
-                        "marking no-firmware",
+                        "marking known-blank",
                         uid,
                     )
-                    record = self._store.apply_probe_result(uid, None)
+                    # Sprint 007, ticket 003: this give-up path genuinely
+                    # knows the board is blank (a flash-triggered re-probe
+                    # that never even re-enumerated before its deadline),
+                    # so it lands on Store.apply_known_blank
+                    # (STATE_CONNECTED_NO_FIRMWARE) rather than the plain
+                    # didn't-announce Store.apply_probe_result(uid, None)
+                    # (STATE_ATTACHED_NO_ANNOUNCE) every other silent probe
+                    # uses -- see the module docstring's "Flash-triggered
+                    # re-probe" note.
+                    record = self._store.apply_known_blank(uid)
                     timed_out.append(record)
                     del self._flash_pending[uid]
 
@@ -347,8 +491,8 @@ class Daemon:
         self._fire_events("detach", detached)
         self._fire_events("identity", timed_out)
 
-        for uid, info in current.items():
-            self._maybe_probe(uid, info)
+        for uid in locally_owned_now:
+            self._maybe_probe(uid, current[uid])
 
     def _maybe_probe(self, uid: str, info: PortInfo) -> None:
         """Probe ``uid`` on ``info.port`` if, and only if, it is eligible.
@@ -387,6 +531,42 @@ class Daemon:
         Keying the reset on the stored role is not enough, because a new
         or wiped registry has no stored role. Probes only run on attach,
         reattach and after a flash, when resetting the board is expected.
+
+        **SWD chip-identity fallback (sprint 007, ticket 003)**: when the
+        serial probe comes back with nothing usable -- an outright timeout
+        (``result is None``) or a malformed announcement (a line arrived
+        but ``result.device_name`` is blank) -- and this uid has no
+        cached chip identity yet (:attr:`~mbtools.registry.store
+        .DeviceRecord.chip_identity_name` is ``None``), this method also
+        calls :func:`mbtools.registry.identity.read_chip_identity`,
+        outside :attr:`_lock` for the same reason ``identity.probe`` is:
+        it opens a real debug-probe session and can block. A successful
+        read is persisted via :meth:`Store.set_chip_identity`, which is
+        itself write-once (see that method's own docstring) -- so even a
+        retried read racing an already-successful one from a concurrent
+        caller can never clobber the cached value, and this uid is never
+        SWD-read again once cached (:attr:`~mbtools.registry.store
+        .DeviceRecord.chip_identity_name` is checked *before* the SWD
+        read is even attempted). A failed SWD read (``None``) is not an
+        error -- `NAME` simply stays ``-`` for this cycle, retried
+        whenever this uid is next probe-eligible, same as an ordinary
+        silent probe.
+
+        **Flash-triggered known-blank (sprint 007, ticket 003)**: when
+        the serial probe returns nothing (``result is None``) *and* this
+        uid is awaiting its flash-triggered re-probe (``uid in
+        self._flash_pending``, checked again here rather than reusing the
+        eligibility check above, since :attr:`_flash_pending` is only
+        popped after this outcome is decided), the outcome is applied via
+        :meth:`Store.apply_known_blank` instead of the plain
+        :meth:`Store.apply_probe_result` every other silent probe uses --
+        this is the one call site that can actually *assert* the board is
+        blank (it just went through a flash and still isn't answering),
+        as opposed to an ordinary silent probe, which merely didn't hear
+        anything and lands on the didn't-announce state instead. A
+        successful probe (``result is not None``) during a flash-pending
+        re-probe is unaffected -- it always goes through
+        :meth:`Store.apply_probe_result` like any other successful probe.
         """
         with self._lock:
             eligible = self._store.needs_probe(uid) or uid in self._flash_pending
@@ -403,9 +583,25 @@ class Daemon:
             reset_first=reset_first,
         )
 
+        chip_identity: tuple[str, int] | None = None
+        if result is None or not result.device_name:
+            with self._lock:
+                existing = self._store.get(uid)
+                needs_swd = existing is not None and existing.chip_identity_name is None
+            if needs_swd:
+                chip_identity = identity.read_chip_identity(
+                    uid, session_factory=self._chip_identity_session_factory
+                )
+
         with self._lock:
-            record = self._store.apply_probe_result(uid, result)
+            if result is None and uid in self._flash_pending:
+                record = self._store.apply_known_blank(uid)
+            else:
+                record = self._store.apply_probe_result(uid, result)
             self._flash_pending.pop(uid, None)
+            if chip_identity is not None:
+                name, serial = chip_identity
+                record = self._store.set_chip_identity(uid, name, serial)
 
         self._fire_events("identity", [record])
 

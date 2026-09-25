@@ -13,7 +13,11 @@ import pytest
 
 from mbtools.common import DAPLINK_VID_PID as COMMON_VID_PID
 from mbtools.registry import identity
-from mbtools.testing.fakes import FakeSerial
+from mbtools.testing.fakes import (
+    FakeSerial,
+    fake_chip_identity_session_factory,
+    unavailable_chip_identity_session_factory,
+)
 
 
 def _factory(**fake_kwargs):
@@ -484,3 +488,154 @@ def test_is_micro_bit_port_matches_daplink_vid_pid():
 
 def test_is_micro_bit_port_rejects_other_vid_pid():
     assert identity.is_micro_bit_port(0x1234, 0x5678) is False
+
+
+# ---------------------------------------------------------------------------
+# friendly_name() -- CODAL's five-letter codebook (sprint 007, ticket 003).
+# Fixtures ported verbatim from mbdeploy's own TestFriendlyName (tests/
+# test_devices.py), including its "read over SWD from three micro:bit V2
+# boards" ground-truth values.
+# ---------------------------------------------------------------------------
+
+
+def test_friendly_name_known_board():
+    """Ground truth from a real board: DEVICEID[1] 2314287040 -> 'tovez'."""
+    assert identity.friendly_name(2314287040) == "tovez"
+
+
+def test_friendly_name_more_known_boards():
+    assert identity.friendly_name(2175407711) == "gopiv"
+    assert identity.friendly_name(1784514240) == "getez"
+    assert identity.friendly_name(1198504156) == "vevov"
+
+
+def test_friendly_name_is_always_five_letters():
+    for device_id in (0, 1, 0xFFFFFFFF, 123456789):
+        name = identity.friendly_name(device_id)
+        assert len(name) == 5
+        assert name.isalpha()
+
+
+def test_friendly_name_zero_is_the_lowest_name():
+    assert identity.friendly_name(0) == "zuzuz"
+
+
+def test_ficr_deviceid1_matches_mbdeploys_reference_address():
+    assert identity.FICR_DEVICEID1 == 0x10000064
+
+
+# ---------------------------------------------------------------------------
+# read_device_id() / read_chip_identity() -- SWD, over a faked
+# ConnectHelper.session_with_chosen_probe-shaped session_factory. Never a
+# real probe, per this ticket's own acceptance criteria and CLAUDE.md's
+# standing "no micro:bits on the development Mac" rule.
+# ---------------------------------------------------------------------------
+
+_UID = "9900" + "0000" + "11112222" + "3333444455556666" + "77778888" + "6e052820"
+
+
+def test_read_device_id_succeeds_on_first_attempt():
+    factory = fake_chip_identity_session_factory(2314287040)
+    assert identity.read_device_id(_UID, session_factory=factory) == 2314287040
+
+
+def test_read_device_id_passes_target_mcu_then_none_on_retry():
+    """The connect_mode/auto_unlock/blocking kwargs and the two-attempt
+    target_override sequence (target_mcu, then None for auto-detect) --
+    proven against a factory that records every call's kwargs."""
+    seen: list[dict] = []
+
+    def factory(**kwargs):
+        seen.append(kwargs)
+        raise RuntimeError("scripted failure -- always retry")
+
+    identity.read_device_id(_UID, "nrf52833", session_factory=factory)
+
+    assert len(seen) == 2
+    assert seen[0]["target_override"] == "nrf52833"
+    assert seen[1]["target_override"] is None
+    for call in seen:
+        assert call["unique_id"] == _UID
+        assert call["connect_mode"] == "attach"
+        assert call["blocking"] is False
+        assert call["auto_unlock"] is False
+
+
+def test_read_device_id_retries_with_none_after_first_override_fails():
+    """A locked-part/attach-refused failure on the first (target_mcu)
+    attempt is retried once with target_override=None (auto-detect) --
+    e.g. a V1 micro:bit (nRF51) the caller's target_mcu guess doesn't fit."""
+    factory = fake_chip_identity_session_factory(1198504156, fail_first_n=1)
+    assert identity.read_device_id(_UID, session_factory=factory) == 1198504156
+
+
+def test_read_device_id_returns_none_when_both_attempts_fail():
+    assert (
+        identity.read_device_id(_UID, session_factory=unavailable_chip_identity_session_factory)
+        is None
+    )
+
+
+def test_read_device_id_returns_none_when_pyocd_unavailable(monkeypatch):
+    """No session_factory given and pyocd isn't installed/importable --
+    returns None rather than raising, never touching a real session."""
+    monkeypatch.setattr(identity, "_ConnectHelper", None)
+    assert identity.read_device_id(_UID) is None
+
+
+def test_read_chip_identity_returns_name_and_device_id():
+    factory = fake_chip_identity_session_factory(2314287040)
+    assert identity.read_chip_identity(_UID, session_factory=factory) == (
+        "tovez",
+        2314287040,
+    )
+
+
+def test_read_chip_identity_returns_none_when_device_id_unreadable():
+    assert (
+        identity.read_chip_identity(
+            _UID, session_factory=unavailable_chip_identity_session_factory
+        )
+        is None
+    )
+
+
+# ---------------------------------------------------------------------------
+# TIOCEXCL wiring (sprint 007, ticket 002/003) -- probe() best-effort
+# applies claims.protect_fd() to the opened port's fd; never raises when
+# the port (a FakeSerial, every other test in this module) has no real
+# fileno() at all.
+# ---------------------------------------------------------------------------
+
+
+def test_probe_applies_tiocexcl_to_the_opened_fd(monkeypatch):
+    calls: list[int] = []
+    monkeypatch.setattr(
+        "mbtools.registry.claims.protect_fd", lambda fd: calls.append(fd) or True
+    )
+
+    class _FilenoSerial(FakeSerial):
+        def fileno(self) -> int:
+            return 42
+
+    def factory(**kwargs):
+        return _FilenoSerial(
+            announcement="device NEZHA2 robot vevov 1198504156", **kwargs
+        )
+
+    identity.probe("/dev/ttyACM0", timeout_s=0.05, serial_factory=factory, settle_s=0)
+
+    assert calls == [42]
+
+
+def test_probe_without_a_real_fileno_does_not_raise():
+    # Every other test in this module already proves this implicitly
+    # (FakeSerial has no fileno()) -- this test makes the "best-effort,
+    # never raises" contract explicit.
+    result = identity.probe(
+        "/dev/ttyACM0",
+        timeout_s=0.05,
+        serial_factory=_factory(announcement="device NEZHA2 robot vevov 1198504156"),
+        settle_s=0,
+    )
+    assert result is not None

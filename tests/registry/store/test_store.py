@@ -9,6 +9,7 @@ no mock database layer, since SQLite itself is the thing being tested.
 from __future__ import annotations
 
 import itertools
+import sqlite3
 import sys
 
 import pytest
@@ -16,6 +17,7 @@ import pytest
 from mbtools.registry import store as store_mod
 from mbtools.registry.identity import ProbeResult, short_uid
 from mbtools.registry.store import (
+    STATE_ATTACHED_NO_ANNOUNCE,
     STATE_ATTACHED_UNPROBED,
     STATE_CONNECTED,
     STATE_CONNECTED_NO_FIRMWARE,
@@ -183,7 +185,12 @@ def test_apply_probe_result_success_updates_announcement_fields(store):
     assert record.last_probe != 0.0
 
 
-def test_apply_probe_result_none_marks_no_firmware_and_preserves_fields(store):
+def test_apply_probe_result_none_marks_no_announce_and_preserves_fields(store):
+    """Sprint 007, ticket 001: a plain silent probe (``result=None``) now
+    lands on ``STATE_ATTACHED_NO_ANNOUNCE`` ("we asked and got nothing
+    back"), not ``STATE_CONNECTED_NO_FIRMWARE`` -- that constant is
+    reserved from this ticket forward for a case the store can actually
+    assert is blank (see :meth:`Store.apply_known_blank` below)."""
     store.upsert_attached(UID, "/dev/ttyACM0", VID_PID)
     store.apply_probe_result(
         UID,
@@ -196,7 +203,7 @@ def test_apply_probe_result_none_marks_no_firmware_and_preserves_fields(store):
 
     record = store.apply_probe_result(UID, None)
 
-    assert record.state == STATE_CONNECTED_NO_FIRMWARE
+    assert record.state == STATE_ATTACHED_NO_ANNOUNCE
     assert record.error_note
     # Previously-known announcement fields are untouched -- this is the
     # "preserve existing announcement fields unchanged" rule this module
@@ -214,7 +221,7 @@ def test_apply_probe_result_none_on_never_probed_device(store):
 
     record = store.apply_probe_result(UID, None)
 
-    assert record.state == STATE_CONNECTED_NO_FIRMWARE
+    assert record.state == STATE_ATTACHED_NO_ANNOUNCE
     assert record.role is None
     assert record.device_name is None
     assert record.last_probe != 0.0
@@ -223,6 +230,179 @@ def test_apply_probe_result_none_on_never_probed_device(store):
 def test_apply_probe_result_unknown_uid_raises_key_error(store):
     with pytest.raises(KeyError):
         store.apply_probe_result(UID, None)
+
+
+# ---------------------------------------------------------------------------
+# apply_known_blank (sprint 007, ticket 001) -- the genuinely-known-blank
+# sibling of apply_probe_result(uid, None)
+# ---------------------------------------------------------------------------
+
+
+def test_apply_known_blank_marks_connected_no_firmware_and_preserves_fields(store):
+    store.upsert_attached(UID, "/dev/ttyACM0", VID_PID)
+    store.apply_probe_result(
+        UID,
+        ProbeResult(
+            role="JOYSTICK", common_name="joystick", device_name="togov",
+            serial="123", raw="DEVICE:JOYSTICK:joystick:togov:123",
+        ),
+    )
+    before = store.get(UID)
+
+    record = store.apply_known_blank(UID)
+
+    assert record.state == STATE_CONNECTED_NO_FIRMWARE
+    assert record.error_note
+    # Same "preserve existing announcement fields" rule as
+    # apply_probe_result(uid, None) -- a known-blank re-probe (e.g. after a
+    # failed mass-erase reflash) must not silently keep showing the old
+    # JOYSTICK/joystick firmware fields as if they were still live, but it
+    # also must not erase the history of what was last seen there.
+    assert record.role == before.role
+    assert record.common_name == before.common_name
+    assert record.device_name == before.device_name
+    assert record.last_probe > before.last_probe
+
+
+def test_apply_known_blank_distinct_error_note_from_plain_no_announce(store):
+    store.upsert_attached(UID, "/dev/ttyACM0", VID_PID)
+    store.upsert_attached(UID2, "/dev/ttyACM1", VID_PID)
+
+    no_announce = store.apply_probe_result(UID, None)
+    known_blank = store.apply_known_blank(UID2)
+
+    assert no_announce.state == STATE_ATTACHED_NO_ANNOUNCE
+    assert known_blank.state == STATE_CONNECTED_NO_FIRMWARE
+    assert no_announce.error_note != known_blank.error_note
+
+
+def test_apply_known_blank_unknown_uid_raises_key_error(store):
+    with pytest.raises(KeyError):
+        store.apply_known_blank(UID)
+
+
+# ---------------------------------------------------------------------------
+# chip-identity cache (sprint 007, ticket 001)
+# ---------------------------------------------------------------------------
+
+
+def test_set_chip_identity_persists_name_and_serial(store):
+    store.upsert_attached(UID, "/dev/ttyACM0", VID_PID)
+
+    record = store.set_chip_identity(UID, "tovez", 2314287040)
+
+    assert record.chip_identity_name == "tovez"
+    assert record.chip_identity_serial == 2314287040
+    # Read-back via a fresh get() -- not just the returned record.
+    assert store.get(UID).chip_identity_name == "tovez"
+    assert store.get(UID).chip_identity_serial == 2314287040
+
+
+def test_set_chip_identity_is_write_once(store):
+    """Once a chip identity is cached for a uid, a second call must not
+    overwrite it -- sprint.md SUC-001's "cached forever ... never
+    re-read" postcondition, enforced here as the store's own second line
+    of defense (the primary "don't call SWD twice" gate is
+    ``registry.daemon``'s job, ticket 003)."""
+    store.upsert_attached(UID, "/dev/ttyACM0", VID_PID)
+    store.set_chip_identity(UID, "tovez", 2314287040)
+
+    record = store.set_chip_identity(UID, "zavaz", 999)
+
+    assert record.chip_identity_name == "tovez"
+    assert record.chip_identity_serial == 2314287040
+
+
+def test_set_chip_identity_unaffected_by_later_announcement_only_update(store):
+    """apply_probe_result with a real ProbeResult must not clear (or
+    touch) the chip-identity cache columns -- they are independent of the
+    announcement-derived fields."""
+    store.upsert_attached(UID, "/dev/ttyACM0", VID_PID)
+    store.set_chip_identity(UID, "tovez", 2314287040)
+
+    record = store.apply_probe_result(
+        UID,
+        ProbeResult(
+            role="NEZHA2", common_name="robot", device_name="vevov",
+            serial="123", raw="device NEZHA2 robot vevov 123",
+        ),
+    )
+
+    assert record.chip_identity_name == "tovez"
+    assert record.chip_identity_serial == 2314287040
+    assert record.device_name == "vevov"  # announcement field still applied
+
+
+def test_set_chip_identity_unknown_uid_raises_key_error(store):
+    with pytest.raises(KeyError):
+        store.set_chip_identity(UID, "tovez", 2314287040)
+
+
+def test_new_device_row_has_no_chip_identity_yet(store):
+    record = store.upsert_attached(UID, "/dev/ttyACM0", VID_PID)
+    assert record.chip_identity_name is None
+    assert record.chip_identity_serial is None
+
+
+# ---------------------------------------------------------------------------
+# chip-identity columns migrate cleanly onto a pre-existing devices.db
+# ---------------------------------------------------------------------------
+
+
+def test_chip_identity_columns_migrate_onto_pre_sprint_007_database(tmp_path):
+    """A devices.db created before this ticket (missing the
+    chip_identity_name/chip_identity_serial columns) opens and migrates
+    cleanly -- mirrors the existing sprint-003 _NEW_DEVICE_COLUMNS
+    migration test pattern: create a table shaped like the pre-ticket
+    schema by hand, then open it through Store and confirm the new
+    columns exist and a row (inserted before the migration) reads back
+    with the new fields defaulting to None."""
+    db_path = tmp_path / "pre-existing.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        """
+        CREATE TABLE device (
+            uid TEXT PRIMARY KEY,
+            short_uid TEXT NOT NULL,
+            port TEXT,
+            vid_pid TEXT,
+            role TEXT,
+            common_name TEXT,
+            device_name TEXT,
+            serial_payload TEXT,
+            raw_announcement TEXT,
+            state TEXT NOT NULL,
+            error_note TEXT,
+            flash_count INTEGER NOT NULL DEFAULT 0,
+            first_seen REAL NOT NULL,
+            last_seen REAL NOT NULL,
+            last_probe REAL NOT NULL DEFAULT 0.0,
+            host TEXT,
+            remote_lock_kind TEXT,
+            remote_lock_display TEXT
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO device (uid, short_uid, port, vid_pid, state, flash_count, "
+        "first_seen, last_seen, last_probe) VALUES (?, ?, ?, ?, ?, 0, 0.0, 0.0, 0.0)",
+        (UID, short_uid(UID), "/dev/ttyACM0", VID_PID, STATE_ATTACHED_UNPROBED),
+    )
+    conn.commit()
+    conn.close()
+
+    store = Store(db_path)
+    try:
+        record = store.get(UID)
+        assert record is not None
+        assert record.chip_identity_name is None
+        assert record.chip_identity_serial is None
+
+        # And the new columns are fully usable going forward.
+        updated = store.set_chip_identity(UID, "tovez", 2314287040)
+        assert updated.chip_identity_name == "tovez"
+    finally:
+        store.close()
 
 
 # ---------------------------------------------------------------------------

@@ -2,8 +2,10 @@
 id: '001'
 title: 'Store/render state-model foundation: chip-identity cache, didn''t-announce
   vs known-blank, clean table output, --json field'
-status: open
-use-cases: [SUC-002, SUC-003]
+status: done
+use-cases:
+- SUC-002
+- SUC-003
 depends-on: []
 github-issue: ''
 issue: name-silent-boards-over-swd-and-keep-list-table-clean.md
@@ -55,35 +57,35 @@ two files and the same tests:
 
 ## Acceptance Criteria
 
-- [ ] `device` table has new persisted column(s) for the chip-identity
+- [x] `device` table has new persisted column(s) for the chip-identity
       cache (name + decimal serial), added via the same in-place
       migration pattern as `_NEW_DEVICE_COLUMNS`; a pre-existing
       `devices.db` from before this ticket opens and migrates cleanly.
-- [ ] A new `STATE` constant exists for "didn't announce";
+- [x] A new `STATE` constant exists for "didn't announce";
       `STATE_CONNECTED_NO_FIRMWARE` is documented (docstring) as meaning
       only "known blank" from this point forward.
-- [ ] `apply_probe_result(uid, None)` sets the new didn't-announce
+- [x] `apply_probe_result(uid, None)` sets the new didn't-announce
       state (not `STATE_CONNECTED_NO_FIRMWARE`).
-- [ ] A new store method (or an added parameter) lets a caller record a
+- [x] A new store method (or an added parameter) lets a caller record a
       known-blank outcome explicitly, distinct from
       `apply_probe_result`'s didn't-announce default.
-- [ ] Every existing test asserting `STATE_CONNECTED_NO_FIRMWARE` for a
+- [x] Every existing test asserting `STATE_CONNECTED_NO_FIRMWARE` for a
       plain silent-probe case is updated to assert the new
       didn't-announce state instead — a full-repo grep for
       `STATE_CONNECTED_NO_FIRMWARE` turns up only genuinely-known-blank
       call sites and tests once this ticket is done.
-- [ ] `render.render_table`'s `NAME` column reads the chip-identity
+- [x] `render.render_table`'s `NAME` column reads the chip-identity
       cache when `device_name` is blank and the cache is set.
-- [ ] `render._state_cell`/`_firmware_cell` produce distinct text for
+- [x] `render._state_cell`/`_firmware_cell` produce distinct text for
       all three states (announced, didn't-announce, known-blank),
       exercised directly in `tests/registry/render/`.
-- [ ] `render_table`'s output never contains a line after the table,
+- [x] `render_table`'s output never contains a line after the table,
       even for a device with a non-empty `error_note`/structured detail
       field — verified with a test asserting the returned string's line
       count equals `2 + len(devices)` (header + rule + one row each).
-- [ ] `render_json`'s structured form carries the same detail a removed
+- [x] `render_json`'s structured form carries the same detail a removed
       `error_note` line used to convey, as a field on the device dict.
-- [ ] `mbdeploy list` (which imports `registry.render` unchanged) is
+- [x] `mbdeploy list` (which imports `registry.render` unchanged) is
       covered by at least one test confirming it renders the same
       table shape with no code change on the `mbdeploy` side.
 
@@ -142,3 +144,52 @@ conceptual change (the state-model split) viewed from two layers.
 `docs/service.md`/`docs/design/registry-api.md` for the whole sprint,
 once the final state-constant name (Open Question 1) and JSON field
 shape are settled by this ticket and ticket 003.
+
+## Implementation Notes
+
+- **Open Question 1 resolved**: the new `STATE` constant is
+  `STATE_ATTACHED_NO_ANNOUNCE = "attached_no_announce"`, matching
+  sprint.md's own suggested-default shape. Rendered as `no-answer` in
+  the `STATE` column and `unknown` in `FIRMWARE`.
+- **New store columns**: `device.chip_identity_name` (TEXT),
+  `device.chip_identity_serial` (INTEGER), added via a new
+  `_CHIP_IDENTITY_COLUMNS` list (kept separate from `_NEW_DEVICE_COLUMNS`,
+  which is documented as specifically "the three sprint-003 columns") but
+  migrated through the same `_migrate_schema` loop/`ALTER TABLE ADD
+  COLUMN` pattern. `Store.set_chip_identity(uid, name, serial)` is
+  write-once per uid (a second call on an already-cached uid is a no-op,
+  returning the existing record unchanged) — the store's own second line
+  of defense behind ticket 003's daemon-side "don't call SWD twice" gate.
+- **New sibling method**: `Store.apply_known_blank(uid)` — sets
+  `STATE_CONNECTED_NO_FIRMWARE` with a distinct `error_note`
+  ("board confirmed blank (no firmware) after re-probe"), preserving
+  announcement fields exactly like `apply_probe_result(uid, None)` does.
+  Not yet wired into `daemon.py`'s flash-reprobe-timeout give-up path —
+  per this ticket's own Implementation Plan, that wiring is ticket 003's
+  job. `daemon.py`'s existing `apply_probe_result(uid, None)` call there
+  now lands on `STATE_ATTACHED_NO_ANNOUNCE` (updated in
+  `tests/registry/daemon/test_daemon.py`); flagged here explicitly so
+  ticket 003 knows to route that specific call site to
+  `apply_known_blank` instead.
+- **Full-repo grep verified**: every remaining
+  `STATE_CONNECTED_NO_FIRMWARE`/`connected_no_firmware` occurrence after
+  this ticket is either (a) the constant's own definition/docs, (b) a
+  genuinely-known-blank call site/test (`apply_known_blank` and its
+  tests, the render test built directly on that state), or (c)
+  `registry.peering`'s existing wire-value branch match, which sprint.md's
+  Architecture explicitly leaves unmodified this sprint — its own test
+  (`test_apply_event_identity_no_firmware`) was updated to assert the
+  correct *resulting* local state (`attached_no_announce`) while still
+  feeding in the old wire value that triggers that unmodified branch.
+- **render.py**: `render_table` no longer appends any line after the
+  table (the per-device trailing `error_note` loop was removed
+  entirely); `NAME` falls back to `chip_identity_name` when
+  `device_name` is blank; `_state_cell`/`_firmware_cell` handle the new
+  three-way state. `render_json` required no code change — `error_note`
+  (and the new chip-identity fields) already flow through via
+  `asdict(record)`; new tests confirm this explicitly per the ticket's
+  acceptance criterion.
+- Full test suite (`uv run pytest tests/ -q`, 1018 passed / 3 skipped)
+  run as an extra verification pass beyond the ticket-scoped run, given
+  how many files across the repo call `apply_probe_result`; no
+  regressions found outside the files listed below.
