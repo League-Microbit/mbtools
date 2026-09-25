@@ -1,7 +1,7 @@
 ---
 id: '006'
 title: mbregistry service install/uninstall (user/system, macOS + Linux)
-status: executing
+status: done
 branch: sprint/006-mbregistry-service-install-uninstall-user-system-macos-linux
 use-cases:
 - SUC-001
