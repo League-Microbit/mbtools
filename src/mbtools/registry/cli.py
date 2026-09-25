@@ -154,6 +154,19 @@ _PEER_PUB_PORT_ENV_VAR = "MBREGISTRY_PEER_PUB_PORT"
 _PEER_SNAPSHOT_PORT_ENV_VAR = "MBREGISTRY_PEER_SNAPSHOT_PORT"
 _TOKEN_ENV_VAR = "MBREGISTRY_TOKEN"
 
+#: Sprint 007, ticket 004's own three env vars: the console-compat relay
+#: pool/names-API ports (following the exact same flag > env var >
+#: default precedent as the three above -- ``_resolve_int``) and this
+#: instance's mDNS/peer identity override (``_resolve_token`` -- same
+#: precedent as ``_TOKEN_ENV_VAR`` above, "unset" being a real, meaningful
+#: default here too: it lets ``PeerDiscovery``/``RelayPool`` fall back to
+#: their own short-hostname default rather than this module re-deriving
+#: it). There is no ``--pipe`` env var -- the ticket's own Description
+#: only asks for a flag form for that one.
+_POOL_PORT_ENV_VAR = "MBREGISTRY_POOL_PORT"
+_NAMES_PORT_ENV_VAR = "MBREGISTRY_NAMES_PORT"
+_INSTANCE_ENV_VAR = "MBREGISTRY_INSTANCE"
+
 
 # ---------------------------------------------------------------------------
 # path/value resolution -- flag > env var > module default (ticket 009's own
@@ -330,6 +343,7 @@ def assemble_daemon_and_api(
     name_clear_callback: Any = None,
     claim_fn: Any = None,
     chip_identity_session_factory: Any = None,
+    pipe_name: str | None = None,
 ) -> tuple[Daemon, RegistryAPIServer | WindowsPipeAPIServer]:
     """Build one :class:`Daemon` and one local-API server that share a
     single ``threading.RLock`` -- ticket 009's fix for the cross-module
@@ -410,6 +424,20 @@ def assemble_daemon_and_api(
     -- see that class's own docstring. Left ``None`` here (this function's
     own default, same as every other test-only escape hatch above), a
     bare call gets :class:`Daemon`'s own default of "use pyOCD for real".
+
+    ``pipe_name`` (sprint 007, ticket 004) is the Windows named-pipe
+    transport's own name override, forwarded verbatim to
+    :class:`WindowsPipeAPIServer`'s ``pipe_name`` -- distinct from
+    ``socket_path``, which (unchanged, for backward compatibility with
+    every caller/test that predates this parameter) is still what gets
+    used as the pipe name when ``pipe_name`` is left ``None`` here. A
+    caller that wants ``--pipe``'s own precedent (flag override, else
+    ``DEFAULT_PIPE_NAME``, independent of whatever ``--socket``
+    resolved to) passes this parameter explicitly rather than folding it
+    into ``socket_path`` -- see :func:`_run_registry`, the only
+    production caller that does. Every pre-ticket-004 caller/test that
+    omits it is unaffected: :class:`WindowsPipeAPIServer` is still built
+    with ``pipe_name=str(socket_path)``, byte for byte as before.
     """
     shared_lock = lock if lock is not None else threading.RLock()
     daemon = Daemon(
@@ -427,7 +455,7 @@ def assemble_daemon_and_api(
     api: RegistryAPIServer | WindowsPipeAPIServer
     if sys.platform == "win32":
         api = WindowsPipeAPIServer(
-            pipe_name=str(socket_path),
+            pipe_name=pipe_name if pipe_name is not None else str(socket_path),
             store=store,
             locks=daemon.locks,
             peer_pid_fn=peer_pid_fn,
@@ -472,6 +500,7 @@ def assemble_registry(
     stream_serial_factory: Any = None,
     lock: threading.RLock | None = None,
     claim_fn: Any = None,
+    pipe_name: str | None = None,
 ) -> tuple[Daemon, RegistryAPIServer | WindowsPipeAPIServer, RemoteAPIServer, PeerDiscovery]:
     """Ticket 009's real assembly: everything :func:`assemble_daemon_and_api`
     already builds, *plus* a :class:`~mbtools.registry.remote_api.RemoteAPIServer`
@@ -545,6 +574,11 @@ def assemble_registry(
     other/earlier caller/test that omits it gets :class:`Daemon`'s own
     no-op default, unaffected.
 
+    ``pipe_name`` (sprint 007, ticket 004) is forwarded verbatim to
+    :func:`assemble_daemon_and_api` -- see that function's own
+    ``pipe_name`` docstring note. Left ``None`` here (this function's
+    own default), unaffected for every pre-ticket-004 caller/test.
+
     Callers do not start or stop any of the four returned objects --
     that stays their own responsibility, matching
     :func:`assemble_daemon_and_api`'s own convention. Shutdown order
@@ -584,6 +618,7 @@ def assemble_registry(
         name_set_callback=peer_discovery.publish_name_set,
         name_clear_callback=peer_discovery.publish_name_clear,
         claim_fn=claim_fn,
+        pipe_name=pipe_name,
     )
     remote_api = RemoteAPIServer(
         host=remote_host,
@@ -781,6 +816,18 @@ def _run_registry(args: argparse.Namespace, stop_event: threading.Event) -> int:
         args.peer_snapshot_port, _PEER_SNAPSHOT_PORT_ENV_VAR, DEFAULT_SNAPSHOT_PORT
     )
     auth_token = _resolve_token(args.auth_token, _TOKEN_ENV_VAR)
+    # Sprint 007, ticket 004: --pool-port/--names-port follow the exact
+    # same flag > env var > default precedence as --remote-port/etc.
+    # above. --instance uses _resolve_token, not _resolve_int -- its
+    # "default" is None (let PeerDiscovery/RelayPool fall back to their
+    # own _short_hostname() default), the same "unset is a real,
+    # meaningful default" shape --auth-token already uses, rather than
+    # this module re-deriving the hostname itself. --pipe has no env var
+    # (the ticket's own Description only asks for a flag), so it is used
+    # directly as `args.pipe` (None when omitted) below.
+    pool_port = _resolve_int(args.pool_port, _POOL_PORT_ENV_VAR, DEFAULT_POOL_PORT)
+    names_port = _resolve_int(args.names_port, _NAMES_PORT_ENV_VAR, DEFAULT_NAMES_API_PORT)
+    instance = _resolve_token(args.instance, _INSTANCE_ENV_VAR)
 
     try:
         peer_specs = [_parse_peer_spec(spec) for spec in (args.peer or [])]
@@ -807,35 +854,33 @@ def _run_registry(args: argparse.Namespace, stop_event: threading.Event) -> int:
         auth_token=auth_token,
         lock=shared_lock,
         claim_fn=claim_fn,
+        # Sprint 007, ticket 004: this instance's own mDNS/peer identity
+        # (default None -> PeerDiscovery's own _short_hostname()
+        # fallback, unchanged from before this ticket).
+        peering_host=instance,
+        # Sprint 007, ticket 004: the Windows named-pipe transport's own
+        # name override (default None -> assemble_daemon_and_api's own
+        # "fall back to socket_path" behavior, unchanged from before
+        # this ticket); meaningless off Windows.
+        pipe_name=args.pipe,
     )
 
-    # Sprint 004 ticket 006: the robot-console-compatibility pool port,
-    # alongside daemon/api/remote_api/peering above, sharing the same
-    # shared_lock -- see assemble_relay_pool's own docstring. --no-relay-
-    # pool is this ticket's own "disable it if no local relay hardware is
-    # expected on a host" escape hatch (the ticket's own Files-to-modify
-    # note); every other host still gets it by default, matching
-    # peering's own "always started, never opt-in" precedent above.
-    relay_pool: RelayPool | None = None
-    if not args.no_relay_pool:
-        relay_pool = assemble_relay_pool(
-            store=store,
-            locks=daemon.locks,
-            lock=shared_lock,
-        )
-
     # Sprint 004 ticket 007: the robot-console-compatibility /names HTTP
-    # listener, sharing relay_pool's own DEFAULT_NAMES_API_PORT (the port
-    # relay_pool already advertises in its TXT registry= key, whether or
-    # not relay_pool itself is running on this host) and the same
-    # shared_lock every other component here uses. Unlike relay_pool,
-    # this listener has no local-hardware dependency to opt out of -- it
-    # only ever touches store -- so it is always started, matching
-    # peering's own "always started, never opt-in" precedent rather than
-    # relay_pool's own --no-relay-pool escape hatch.
+    # listener. Constructed and *started* before the relay pool below
+    # (sprint 007, ticket 004's own reordering) so the pool's own mDNS
+    # TXT `registry=` key can read this listener's real *bound* port
+    # (`names_api.bound_port`) rather than the configured value --
+    # this matters specifically when `--names-port 0` (ephemeral) is
+    # given, where "configured" and "bound" differ by construction.
+    # Shares the same shared_lock every other component here uses. Has
+    # no local-hardware dependency to opt out of -- it only ever touches
+    # store -- so it is always started, matching peering's own "always
+    # started, never opt-in" precedent rather than relay_pool's own
+    # --no-relay-pool escape hatch.
     names_api = assemble_names_api(
         store=store,
         lock=shared_lock,
+        port=names_port,
         name_set_callback=peering.publish_name_set,
         name_clear_callback=peering.publish_name_clear,
     )
@@ -843,9 +888,30 @@ def _run_registry(args: argparse.Namespace, stop_event: threading.Event) -> int:
     api.start()
     remote_api.start()
     peering.start()
-    if relay_pool is not None:
-        relay_pool.start()
     names_api.start()
+
+    # Sprint 004 ticket 006: the robot-console-compatibility pool port,
+    # alongside daemon/api/remote_api/peering/names_api above, sharing
+    # the same shared_lock -- see assemble_relay_pool's own docstring.
+    # --no-relay-pool is this ticket's own "disable it if no local relay
+    # hardware is expected on a host" escape hatch (the ticket's own
+    # Files-to-modify note); every other host still gets it by default,
+    # matching peering's own "always started, never opt-in" precedent
+    # above. Constructed *after* names_api.start() (sprint 007, ticket
+    # 004's own reordering -- see names_api's own comment above) so
+    # `names_api.bound_port` is already known when building this pool's
+    # own TXT record.
+    relay_pool: RelayPool | None = None
+    if not args.no_relay_pool:
+        relay_pool = assemble_relay_pool(
+            store=store,
+            locks=daemon.locks,
+            lock=shared_lock,
+            port=pool_port,
+            names_api_port=names_api.bound_port,
+            instance_host=instance,
+        )
+        relay_pool.start()
 
     # --peer HOST[:PORT] (repeatable): explicit peers on top of whatever
     # mDNS finds on its own. This host's own resolved
@@ -1166,6 +1232,39 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "shared secret required of remote-api/peering connections "
             f"(default unset -- no auth, or ${_TOKEN_ENV_VAR})"
+        ),
+    )
+    run_p.add_argument(
+        "--pool-port",
+        type=int,
+        help=(
+            "console-compat relay pool (_mbrelay._tcp) TCP port "
+            f"(default {DEFAULT_POOL_PORT}, or ${_POOL_PORT_ENV_VAR})"
+        ),
+    )
+    run_p.add_argument(
+        "--names-port",
+        type=int,
+        help=(
+            "console-compat /names HTTP port "
+            f"(default {DEFAULT_NAMES_API_PORT}, or ${_NAMES_PORT_ENV_VAR})"
+        ),
+    )
+    run_p.add_argument(
+        "--instance",
+        help=(
+            "this instance's mDNS/peer identity, advertised as the "
+            "_mbregistry._tcp/_mbrelay._tcp instance name and recorded "
+            "as peer.host/device.host (default: short hostname, or "
+            f"${_INSTANCE_ENV_VAR})"
+        ),
+    )
+    run_p.add_argument(
+        "--pipe",
+        help=(
+            "Windows named-pipe transport name (default: "
+            "registry.paths.default_pipe_name()); ignored on non-Windows "
+            "platforms"
         ),
     )
     run_p.add_argument(

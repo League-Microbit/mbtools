@@ -1,9 +1,12 @@
 ---
 id: '004'
-title: 'Configurable ports and instance identity (--pool-port, --names-port, --instance,
-  --pipe)'
-status: open
-use-cases: [SUC-004, SUC-006, SUC-008]
+title: Configurable ports and instance identity (--pool-port, --names-port, --instance,
+  --pipe)
+status: done
+use-cases:
+- SUC-004
+- SUC-006
+- SUC-008
 depends-on: []
 github-issue: ''
 issue: robot-console-on-mbregistry-multi-instance-and-spawn-support.md
@@ -59,27 +62,27 @@ fallback when `--pipe` is omitted.
 
 ## Acceptance Criteria
 
-- [ ] `--pool-port 0`/`--names-port 0` each bind an ephemeral port; the
+- [x] `--pool-port 0`/`--names-port 0` each bind an ephemeral port; the
       `_mbrelay._tcp` SRV port and `registry=` TXT value reflect the
       real bound port, not `0`.
-- [ ] An explicit non-zero `--pool-port`/`--names-port` value is bound
+- [x] An explicit non-zero `--pool-port`/`--names-port` value is bound
       and advertised as given.
-- [ ] `$MBREGISTRY_POOL_PORT`/`$MBREGISTRY_NAMES_PORT` behave
+- [x] `$MBREGISTRY_POOL_PORT`/`$MBREGISTRY_NAMES_PORT` behave
       identically to their flag counterparts; the flag wins if both are
       given (matching `--remote-port`'s existing precedent — verify
       against `_resolve_int`'s actual precedence rule rather than
       assuming).
-- [ ] `--instance NAME` changes the `_mbregistry._tcp`/`_mbrelay._tcp`
+- [x] `--instance NAME` changes the `_mbregistry._tcp`/`_mbrelay._tcp`
       mDNS instance name and `peer.host`/`device.host`, verified with a
       mocked-zeroconf unit test asserting the `ServiceInfo` name/server
       fields use the given instance name.
-- [ ] Omitting `--instance` preserves today's short-hostname default
+- [x] Omitting `--instance` preserves today's short-hostname default
       exactly (a regression test against the pre-ticket behavior).
-- [ ] `--pipe NAME` (Windows) overrides the named-pipe transport's name;
+- [x] `--pipe NAME` (Windows) overrides the named-pipe transport's name;
       covered by a unit test exercising `api_windows`'s pipe-name
       resolution without real Windows hardware (matching that module's
       existing test conventions).
-- [ ] Omitting `--pipe` preserves `DEFAULT_PIPE_NAME`'s current fixed
+- [x] Omitting `--pipe` preserves `DEFAULT_PIPE_NAME`'s current fixed
       value.
 
 ## Implementation Plan
