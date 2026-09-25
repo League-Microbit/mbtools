@@ -15,15 +15,23 @@ down here since it becomes sprint 002's de facto contract; see also
 ``docs/design/registry-api.md``): newline-delimited JSON over the Unix
 socket, one connection per client session. Each request line is a JSON
 object with an ``"op"`` field (``list``/``get``/``find``/``lock``/
-``unlock``/``flash``/``mark_flashed``/``names_get``/``names_set``/
-``names_clear``/``names_list``/``watch`` -- the middle four, sprint 004
-ticket 005, are ``BaseAPIServer``'s name-registry ops, not scoped to a
-device at all; ``watch``, sprint 008 ticket 001, is the other one this
-class doesn't own the mechanics of -- see ``_api_base.BaseAPIServer
-._op_watch``/``_handle_watch``); each non-streaming op writes exactly one
-JSON response line, except ``watch`` (an ``ok`` acknowledgement followed
-by one JSON line per subsequent event, for as long as the connection
-stays open -- never a "final" line). ``flash`` is the one streaming op: zero or more
+``unlock``/``force_unlock``/``flash``/``mark_flashed``/``names_get``/
+``names_set``/``names_clear``/``names_list``/``watch``/``stream`` --
+the four ``names_*`` ops, sprint 004 ticket 005, are ``BaseAPIServer``'s
+name-registry ops, not scoped to a device at all; ``force_unlock``,
+sprint 008 ticket 003, is local-socket only, this class's own (never
+shared into ``_api_base.py``); ``watch`` (sprint 008 ticket 001) and
+``stream`` (sprint 003 ticket 007, relocated to this transport too by
+sprint 008 ticket 004) are the two this class doesn't own the mechanics
+of -- see ``_api_base.BaseAPIServer._op_watch``/``_handle_watch`` and
+``._op_stream_precheck``/``_handle_stream`` respectively); each
+non-streaming op writes exactly one JSON response line, except ``watch``
+(an ``ok`` acknowledgement followed by one JSON line per subsequent
+event, for as long as the connection stays open -- never a "final"
+line) and ``stream`` (an ``ok`` acknowledgement, after which the
+connection permanently leaves this newline-JSON framing for the binary
+frame sub-protocol -- see ``_api_base.py``'s own docstring). ``flash``
+is the one streaming-JSON-response op: zero or more
 ``{"type": "log", "line": ...}`` lines (relayed from
 :meth:`~mbtools.registry.flash.FlashOp.flash_hex`'s log callback as they
 arrive, not buffered) followed by exactly one
@@ -113,12 +121,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 from mbtools.common import CODE_INVALID_REQUEST, CODE_NOT_FOUND, CODE_NOT_LOCKED
-from mbtools.registry._api_base import BaseAPIServer, _error, _holder_wire_dict
+from mbtools.registry._api_base import _WATCH, BaseAPIServer, _error, _holder_wire_dict
 from mbtools.registry.eventbus import EventBus
 from mbtools.registry.flash import FlashOp, HexValidationError
 from mbtools.registry.locks import KIND_FLASH, HolderRef, LockManager
 from mbtools.registry.paths import default_socket_path
-from mbtools.registry.store import Entry, Store
+from mbtools.registry.store import DeviceRecord, Entry, Store
 
 __all__ = [
     "RegistryAPIServer",
@@ -295,6 +303,25 @@ class RegistryAPIServer(BaseAPIServer):
     ``RLock`` of this instance's own when omitted, matching this class's
     pre-ticket-009 behavior for every test that constructs a server on
     its own.
+
+    ``stream`` (sprint 008, ticket 004) dispatches into
+    :meth:`~mbtools.registry._api_base.BaseAPIServer._op_stream_precheck`/
+    :meth:`~mbtools.registry._api_base.BaseAPIServer._handle_stream`, the
+    same shared, relocated implementation ``remote_api.RemoteAPIServer``
+    already used -- identical framing and precondition checks, no
+    behavior change for that existing remote caller. ``serial_factory``/
+    ``stream_baud``/``stream_settle_s``/``break_duration_s`` are the same
+    test-only escape hatches ``remote_api.RemoteAPIServer`` already
+    exposes for exactly the same reason (a test passes a callable
+    returning ``mbtools.testing.fakes.FakeSerial`` and
+    ``stream_settle_s=0``); production code leaves all four at their
+    defaults (real pyserial, ``serial.connect.BAUD_RATE``/
+    ``OPEN_SETTLE``/``BREAK_DURATION``). This class's own per-uid
+    ``{uid: connection}`` map (:attr:`_uid_connections`, ticket 003) needs
+    no change for this: it is populated at ``lock`` time and covers a
+    connection regardless of whether it is later switched into ``stream``
+    mode, so ``force_unlock`` against a live streaming holder already
+    works -- see :meth:`_op_force_unlock`'s own docstring.
     """
 
     def __init__(
@@ -311,6 +338,10 @@ class RegistryAPIServer(BaseAPIServer):
         name_set_callback: Callable[[Entry], None] | None = None,
         name_clear_callback: Callable[[str], None] | None = None,
         eventbus: EventBus | None = None,
+        serial_factory: Callable[..., Any] | None = None,
+        stream_baud: int | None = None,
+        stream_settle_s: float | None = None,
+        break_duration_s: float | None = None,
     ) -> None:
         self.socket_path = Path(socket_path)
         self._store = store
@@ -337,6 +368,24 @@ class RegistryAPIServer(BaseAPIServer):
         # instance of its own, mirroring ``lock``'s own default-when-
         # omitted convention just below.
         self._eventbus = eventbus if eventbus is not None else EventBus()
+
+        # Sprint 008 ticket 004: the (relocated) stream sub-protocol's own
+        # configuration knobs -- see ``_api_base.BaseAPIServer``'s own
+        # docstring/class-attribute comments for why the real defaults
+        # (``serial.connect.BAUD_RATE``/``OPEN_SETTLE``/``BREAK_DURATION``)
+        # are resolved here, via a function-local import, rather than at
+        # this module's own top level: ``mbtools.serial.connect`` imports
+        # ``registry.client``, which imports *this* module (for
+        # ``DEFAULT_SOCKET_PATH``) -- a module-level import here would be
+        # a real circular import.
+        from mbtools.serial.connect import BAUD_RATE, BREAK_DURATION, OPEN_SETTLE
+
+        self._serial_factory = serial_factory
+        self._stream_baud = stream_baud if stream_baud is not None else BAUD_RATE
+        self._stream_settle = OPEN_SETTLE if stream_settle_s is None else stream_settle_s
+        self._break_duration = (
+            break_duration_s if break_duration_s is not None else BREAK_DURATION
+        )
 
         self._lock = lock if lock is not None else threading.RLock()
         self._stop_event = threading.Event()
@@ -546,25 +595,45 @@ class RegistryAPIServer(BaseAPIServer):
         rfile = conn.makefile("r", encoding="utf-8", newline="\n")
         wfile = conn.makefile("w", encoding="utf-8", newline="\n")
         try:
+            stream_record: DeviceRecord | None = None
+            watch_requested = False
             for raw_line in rfile:
                 line = raw_line.strip()
                 if not line:
                     continue
-                if self._dispatch_line(line, pid, holder, acquired_uids, wfile, conn):
+                result = self._dispatch_line(line, pid, holder, acquired_uids, wfile, conn)
+                if result is _WATCH:
                     # Sprint 008 ticket 001: ``watch`` was accepted --
                     # this connection leaves ordinary request/response
                     # dispatch for the rest of its life (mirrors
-                    # remote_api.RemoteAPIServer's own "stream" handoff);
-                    # nothing here goes back to reading JSON request
-                    # lines from `rfile` after this.
-                    self._handle_watch(wfile)
+                    # remote_api.RemoteAPIServer's own "stream"/"watch"
+                    # handoff).
+                    watch_requested = True
                     break
+                if result is not None:
+                    stream_record = result
+                    # Sprint 008 ticket 004: ``stream`` was accepted --
+                    # the connection leaves newline-JSON framing for the
+                    # rest of its life (see ``_api_base.BaseAPIServer
+                    # ._handle_stream``'s own docstring); nothing here
+                    # goes back to reading JSON request lines from
+                    # `rfile` after this, ever, on any exit path.
+                    break
+            if watch_requested:
+                self._handle_watch(wfile)
+            elif stream_record is not None:
+                self._handle_stream(conn, holder, acquired_uids, stream_record)
         except (ConnectionError, OSError):
             pass
         finally:
-            # Connection closed (cleanly or abruptly): release exactly
-            # the locks this connection acquired, never a blanket sweep
-            # -- see the module docstring.
+            # Connection closed (cleanly or abruptly), or a stream
+            # session just concluded (_handle_stream already released
+            # its own uid's lock and dropped it from `acquired_uids` on
+            # every one of its own exit paths, so this is a no-op for
+            # that uid -- mirrors remote_api.RemoteAPIServer's identical
+            # finally-block note): release exactly the locks this
+            # connection acquired, never a blanket sweep -- see the
+            # module docstring.
             with self._lock:
                 for uid in list(acquired_uids):
                     self._locks.release(uid, holder)
@@ -587,16 +656,20 @@ class RegistryAPIServer(BaseAPIServer):
         acquired_uids: set[str],
         wfile: Any,
         conn: socket.socket,
-    ) -> bool:
+    ) -> DeviceRecord | object | None:
         """Dispatch one JSON request line and write its response.
 
-        Returns ``True`` only for a successfully-accepted ``watch``
-        (sprint 008 ticket 001) -- the caller (:meth:`_handle_connection`)
-        uses that to know it must stop reading further JSON request
-        lines and hand the connection to :meth:`_handle_watch` instead,
-        mirroring how ``remote_api.RemoteAPIServer._dispatch_line``'s own
-        non-``None`` return signals the same handoff for ``stream``.
-        Every other op returns ``False``.
+        Returns ``None`` for every ordinary op; a successfully-accepted
+        ``stream`` (sprint 008 ticket 004) returns the resolved
+        :class:`~mbtools.registry.store.DeviceRecord` to stream; a
+        successfully-accepted ``watch`` (sprint 008 ticket 001) returns
+        the shared :data:`~mbtools.registry._api_base._WATCH` sentinel.
+        Either non-``None`` return tells the caller
+        (:meth:`_handle_connection`) to stop reading further JSON lines
+        and hand the connection to :meth:`_handle_stream`/
+        :meth:`_handle_watch` respectively -- mirrors
+        ``remote_api.RemoteAPIServer._dispatch_line``'s own tri-state
+        return exactly.
 
         ``conn`` (sprint 008 ticket 003) is this connection's raw socket
         -- recorded in :attr:`_uid_connections` for every uid a ``lock``
@@ -604,18 +677,19 @@ class RegistryAPIServer(BaseAPIServer):
         an ``unlock`` op on this line actually releases (diffed against
         ``acquired_uids`` before/after each call, so both branches stay
         exactly as thin as before this ticket). This is the *same*
-        connection object a later ``stream`` op (ticket 004) would switch
+        connection object a later ``stream`` op (ticket 004) switches
         into framed-binary mode -- no separate bookkeeping needed for a
-        streaming holder.
+        streaming holder (see :attr:`_uid_connections`'s own docstring
+        note, and :meth:`RegistryAPIServer.__init__`'s class docstring).
         """
         try:
             req = json.loads(line)
         except json.JSONDecodeError:
             self._write(wfile, _error(CODE_INVALID_REQUEST, "malformed JSON request"))
-            return False
+            return None
         if not isinstance(req, dict):
             self._write(wfile, _error(CODE_INVALID_REQUEST, "request must be a JSON object"))
-            return False
+            return None
 
         op = req.get("op")
         if op == "list":
@@ -652,14 +726,18 @@ class RegistryAPIServer(BaseAPIServer):
             resp = self._op_names_clear(req)
         elif op == "names_list":
             resp = self._op_names_list(req)
+        elif op == "stream":
+            resp, record = self._op_stream_precheck(req, holder)
+            self._write(wfile, resp)
+            return record
         elif op == "watch":
             resp = self._op_watch()
             self._write(wfile, resp)
-            return True
+            return _WATCH
         else:
             resp = _error(CODE_INVALID_REQUEST, f"unknown op {op!r}")
         self._write(wfile, resp)
-        return False
+        return None
 
     # -- ops --------------------------------------------------------------
     #
