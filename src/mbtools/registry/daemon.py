@@ -277,7 +277,9 @@ class Daemon:
         now_fn: Callable[[], float] = time.monotonic,
         lock: threading.RLock | None = None,
         event_callback: Callable[[str, DeviceRecord], None] | None = None,
-        lock_display_callback: Callable[[str, str | None, str | None], None]
+        lock_display_callback: Callable[
+            [str, str | None, str | None, str | None, float | None], None
+        ]
         | None = None,
         claim_fn: Callable[[str], Any] | None = None,
         chip_identity_session_factory: Callable[..., Any] | None = None,

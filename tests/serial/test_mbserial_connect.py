@@ -244,7 +244,10 @@ def test_already_locked_fails_fast_and_never_opens_the_port(server, store, locks
     with pytest.raises(DeviceLockedError) as excinfo:
         connect_mod.connect(client, "tovez", serial_factory=_spy_factory, settle_s=0)
 
-    assert excinfo.value.holder == {"kind": "flash", "pid": 4242}
+    assert excinfo.value.holder["kind"] == "flash"
+    assert excinfo.value.holder["pid"] == 4242
+    assert excinfo.value.holder["label"] is None
+    assert isinstance(excinfo.value.holder["since"], float)
     assert opened == []  # the port was never touched
 
 

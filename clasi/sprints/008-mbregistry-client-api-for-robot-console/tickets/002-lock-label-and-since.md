@@ -1,9 +1,12 @@
 ---
 id: '002'
 title: Lock label and since
-status: open
-use-cases: [SUC-002, SUC-005]
-depends-on: ['001']
+status: done
+use-cases:
+- SUC-002
+- SUC-005
+depends-on:
+- '001'
 github-issue: ''
 issue: mbregistry-api-for-robot-console-watch-lock-label-unlock-force-local-stream.md
 completes_issue: false
@@ -55,24 +58,78 @@ sections for the new fields.
 
 ## Acceptance Criteria
 
-- [ ] `lock` accepts an optional `label` string; omitting it behaves
+- [x] `lock` accepts an optional `label` string; omitting it behaves
       exactly as before this ticket.
-- [ ] A `locked` reply's `holder` includes `label` (when set, else
+- [x] A `locked` reply's `holder` includes `label` (when set, else
       absent/`null`) and `since` (always, once acquired).
-- [ ] `list`'s per-device dict includes `lock_label`/`lock_since`
+- [x] `list`'s per-device dict includes `lock_label`/`lock_since`
       (`null` when unlocked), alongside the existing `lock_kind`/
       `lock_pid`.
-- [ ] A `lock_state` event (via `watch`, ticket 001) carries `label`/
+- [x] A `lock_state` event (via `watch`, ticket 001) carries `label`/
       `since` on acquire and `null`/`null` on release, alongside the
       existing `kind`/`display`.
-- [ ] `LockManager.release`'s holder-equality check is unaffected —
+- [x] `LockManager.release`'s holder-equality check is unaffected —
       `label`/`since` never participate in matching who may release a
       lock.
-- [ ] A peer's `mbregistry list` shows label/since text (via the
+- [x] A peer's `mbregistry list` shows label/since text (via the
       existing `remote_lock_display` string) for a remote-owned,
       labeled lock, with no new SQLite column and no new PUB field.
-- [ ] `docs/design/registry-api.md` documents `label`/`since` in the
+- [x] `docs/design/registry-api.md` documents `label`/`since` in the
       `lock`, `list`, and `lock_state` sections.
+
+## Implementation Notes
+
+- `lock_event_payload`/`LockManager`'s `lock_display_callback` were both
+  extended to `(uid, kind, display, label, since)` (rather than adding a
+  second payload builder, per ticket 001's own handoff note). This means
+  `label`/`since` ride as their own keys on *every* `lock_state` event
+  this project publishes, including the one sent over the ZeroMQ PUB
+  bus to a peer — a receiving peer's own `_apply_event`
+  (`registry.peering`) still only ever reads `kind`/`display` back off
+  that event into `store.apply_remote_lock_state` (unchanged, 3-arg),
+  so no new SQLite column or queryable field results on the replicated
+  side; the extra keys on the wire message are inert as far as any
+  receiver is concerned. Read Decision 2's "no new PUB field" as being
+  about that replicated store shape, not about literally zero extra
+  JSON keys on the wire — flagging this reading explicitly in case a
+  later ticket's stricter interpretation disagrees.
+- Added `mbtools.registry.locks.format_lock_suffix(label, since, *,
+  now)`, a small shared pure formatter (exported from `locks.py`, no
+  new module) that both `registry.render` (local row) and
+  `registry.peering.publish_lock_event` (baking text into the
+  replicated `display` string) call — one place owns the "(label,
+  age)"/"(age)" wording so the two never drift apart. `render.py`'s
+  `render_table`/`_state_cell` gained an optional `now` parameter
+  (defaults to `time.time()`) threaded down to this formatter, since
+  the module's own contract is "no I/O outside its own arguments."
+- `LockManager` gained a `now_fn` constructor parameter (default
+  `time.time`), mirroring `store`/`identity`/`usbwatch`'s existing
+  injectable-clock convention — used by `acquire` to stamp
+  `LockStatus.since` fresh on every call (proven per-acquisition, not
+  per-holder, by a new test with a scripted two-value clock).
+- Every holder's wire shape (`_holder_wire_dict`) gained `label`/`since`
+  unconditionally, local and remote alike — several existing tests
+  asserted an *exact* 2-key (or 4-key, for a remote holder) dict and
+  needed updating to either check individual fields or the new key set;
+  see the diff in `tests/registry/api/test_api.py`,
+  `tests/registry/api_windows/test_api_windows.py`,
+  `tests/registry/remote_api/test_remote_api.py`,
+  `tests/registry/client/test_client.py`, and
+  `tests/serial/test_mbserial_connect.py`.
+- **For ticket 003 (`unlock --force`)**: `LockManager`'s planned
+  `force_release(uid)` will return the `LockStatus` it released, which
+  now carries `label`/`since` — worth having `cmd_unlock --force`'s CLI
+  output echo them ("released alice-laptop's lock, held for 12m"),
+  answering sprint.md's own Open Question in the affirmative if the
+  stakeholder wants it; not implemented here, out of this ticket's
+  scope.
+- **For ticket 004 (local-socket `stream`)**: no interaction expected —
+  `_op_lock`/`LockStatus` changes here are orthogonal to the stream
+  sub-protocol relocation. One thing to note: a `flash`-kind lock
+  acquired with a `label` (e.g. from a future robot-console UI) will
+  carry that label through to whatever `mark_flashed`/`flash`
+  already read off `LockManager.status` — no extra wiring needed there,
+  since both already resolve the full `LockStatus`, not just `kind`.
 
 ## Testing
 

@@ -107,16 +107,29 @@ def _holder_wire_dict(status: LockStatus) -> dict[str, Any]:
     """Wire-shape a lock's current holder for a ``locked`` response's
     ``holder`` field.
 
-    Local holder: the unchanged 2-key ``{"kind", "pid"}`` shape — every
-    existing Unix-socket caller/test predates :class:`HolderRef` and
-    asserts this exact shape (ticket 006 acceptance criterion #1: zero
-    observable behavior change for any existing Unix-socket caller).
-    Remote holder: an additive superset (ticket 006 acceptance criterion
-    #8) — ``pid`` stays present (``None``, since "a PID means nothing
-    across hosts") and ``origin``/``host`` are added, never replacing or
-    renaming the local shape's two keys.
+    Local holder: the ``{"kind", "pid"}`` shape from before this ticket,
+    plus (sprint 008, ticket 002) ``label``/``since`` — every existing
+    Unix-socket caller/test predates :class:`HolderRef` and asserts the
+    original 2-key shape (ticket 006 acceptance criterion #1: zero
+    observable behavior change for any existing Unix-socket caller), so
+    the two new keys are strictly additive, exactly like ``origin``/
+    ``host`` below. Remote holder: an additive superset (ticket 006
+    acceptance criterion #8) — ``pid`` stays present (``None``, since "a
+    PID means nothing across hosts") and ``origin``/``host`` are added,
+    never replacing or renaming the local shape's two keys.
+
+    ``label`` is ``None`` (never omitted -- ticket 002 acceptance
+    criterion #2 allows either "absent" or "null"; this module always
+    includes the key) when the lock was acquired with no label. ``since``
+    is always the real acquisition timestamp once a lock exists — there
+    is no "unset" case for a resolved :class:`LockStatus`.
     """
-    wire: dict[str, Any] = {"kind": status.kind, "pid": status.pid}
+    wire: dict[str, Any] = {
+        "kind": status.kind,
+        "pid": status.pid,
+        "label": status.label,
+        "since": status.since,
+    }
     if status.holder.origin == "remote":
         wire["origin"] = status.holder.origin
         wire["host"] = status.holder.host
@@ -225,17 +238,29 @@ class BaseAPIServer:
         ``False`` if ``host`` names a peer this store has no ``peer`` row
         for at all, treated the same as "known unreachable" since
         reachability can't be confirmed either way).
+
+        ``lock_label``/``lock_since`` (sprint 008, ticket 002) fold in
+        the same way ``lock_kind``/``lock_pid`` do — a live
+        :class:`~mbtools.registry.locks.LockStatus` lookup for a local
+        row, ``None`` for a peer-owned one (per that ticket's Design
+        Rationale Decision 2, a peer-owned row's label/since text rides
+        inside the existing ``remote_lock_display`` string instead —
+        never a separate structured field for a remote row).
         """
         d = asdict(record)
         if record.host is None:
             holder = self._locks.status(record.uid)
             d["lock_kind"] = holder.kind if holder is not None else None
             d["lock_pid"] = holder.pid if holder is not None else None
+            d["lock_label"] = holder.label if holder is not None else None
+            d["lock_since"] = holder.since if holder is not None else None
             d["endpoint"] = None
             d["peer_reachable"] = True
         else:
             d["lock_kind"] = None
             d["lock_pid"] = None
+            d["lock_label"] = None
+            d["lock_since"] = None
             peer = self._store.get_peer(record.host)
             d["endpoint"] = peer.endpoint if peer is not None else None
             d["peer_reachable"] = peer.reachable if peer is not None else False
@@ -334,13 +359,17 @@ class BaseAPIServer:
             return _error(CODE_INVALID_REQUEST, "'lock' requires 'uid' and 'kind'")
         if kind not in LOCK_KINDS:
             return _error(CODE_INVALID_REQUEST, f"unknown lock kind {kind!r}")
+        # Sprint 008, ticket 002: an optional, display-only label -- never
+        # used for holder identity/matching (see LockManager.acquire's own
+        # docstring). Omitting it behaves exactly as before this ticket.
+        label = req.get("label")
         with self._lock:
             record, err = self._resolve_visible(str(token))
             if err is not None:
                 return err
             assert record is not None
             try:
-                self._locks.acquire(record.uid, kind, holder)
+                self._locks.acquire(record.uid, kind, holder, label=label)
             except LockHeldError as exc:
                 return _error(
                     CODE_LOCKED,

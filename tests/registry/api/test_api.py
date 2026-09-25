@@ -294,8 +294,12 @@ def test_list_includes_every_device_with_lock_status_folded_in(make_server, lock
     assert set(by_uid) == {UID, UID2}
     assert by_uid[UID]["lock_kind"] == KIND_SERIAL
     assert by_uid[UID]["lock_pid"] == PID_A
+    assert by_uid[UID]["lock_label"] is None
+    assert isinstance(by_uid[UID]["lock_since"], float)
     assert by_uid[UID2]["lock_kind"] is None
     assert by_uid[UID2]["lock_pid"] is None
+    assert by_uid[UID2]["lock_label"] is None
+    assert by_uid[UID2]["lock_since"] is None
     client.close()
 
 
@@ -467,7 +471,10 @@ def test_lock_already_locked_returns_holder_kind_and_pid(make_server):
 
     assert resp["ok"] is False
     assert resp["code"] == CODE_LOCKED
-    assert resp["holder"] == {"kind": KIND_FLASH, "pid": PID_A}
+    assert resp["holder"]["kind"] == KIND_FLASH
+    assert resp["holder"]["pid"] == PID_A
+    assert resp["holder"]["label"] is None
+    assert isinstance(resp["holder"]["since"], float)
     holder.close()
     contender.close()
 
@@ -494,6 +501,55 @@ def test_lock_unknown_kind_is_invalid_request(make_server):
     assert resp["ok"] is False
     assert resp["code"] == CODE_INVALID_REQUEST
     client.close()
+
+
+# ---------------------------------------------------------------------------
+# lock label/since (sprint 008, ticket 002)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.requires_af_unix
+def test_lock_without_label_behaves_exactly_as_before(make_server, locks):
+    """AC: omitting 'label' behaves exactly as before this ticket."""
+    srv = make_server(peer_pid_fn=_sequential_peer_pid_fn([PID_A]))
+    client = _Client(srv.socket_path)
+
+    resp = client.request({"op": "lock", "uid": UID, "kind": KIND_SERIAL})
+
+    assert resp == {"ok": True}
+    status = locks.status(UID)
+    assert status.label is None
+    assert isinstance(status.since, float)
+    client.close()
+
+
+@pytest.mark.requires_af_unix
+def test_label_since_round_trips_through_lock_list_and_locked(make_server, locks):
+    """AC: label/since round-trip through lock -> list -> locked."""
+    srv = make_server(peer_pid_fn=_sequential_peer_pid_fn([PID_A, PID_B]))
+    holder = _Client(srv.socket_path)
+
+    resp = holder.request(
+        {"op": "lock", "uid": UID, "kind": KIND_FLASH, "label": "alice-laptop"}
+    )
+    assert resp == {"ok": True}
+
+    # list's per-device dict
+    contender = _Client(srv.socket_path)
+    list_resp = contender.request({"op": "list"})
+    by_uid = {d["uid"]: d for d in list_resp["devices"]}
+    assert by_uid[UID]["lock_label"] == "alice-laptop"
+    assert isinstance(by_uid[UID]["lock_since"], float)
+
+    # locked's holder shape, seen by a contender
+    lock_resp = contender.request({"op": "lock", "uid": UID, "kind": KIND_SERIAL})
+    assert lock_resp["ok"] is False
+    assert lock_resp["code"] == CODE_LOCKED
+    assert lock_resp["holder"]["label"] == "alice-laptop"
+    assert lock_resp["holder"]["since"] == locks.status(UID).since
+
+    holder.close()
+    contender.close()
 
 
 @pytest.mark.requires_af_unix

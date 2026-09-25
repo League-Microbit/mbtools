@@ -202,6 +202,8 @@ def test_lock_display_callback_publishes_to_bus_only_when_no_peering(tmp_path, s
             "uid": uid,
             "kind": KIND_SERIAL,
             "display": event["display"],
+            "label": None,
+            "since": event["since"],
         }
     finally:
         store.close()

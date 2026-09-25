@@ -226,6 +226,7 @@ import json
 import logging
 import socket as _socket
 import threading
+import time
 from typing import Any, Callable
 
 import zeroconf as _real_zeroconf
@@ -233,6 +234,7 @@ import zmq as _real_zmq
 from zmq.utils.monitor import recv_monitor_message
 
 from mbtools.registry.eventbus import EventBus
+from mbtools.registry.locks import format_lock_suffix
 from mbtools.registry.netaddr import local_ip
 from mbtools.registry.identity import ProbeResult
 from mbtools.registry.store import (
@@ -1209,10 +1211,30 @@ def daemon_event_payload(event_type: str, record: DeviceRecord) -> dict[str, Any
     }
 
 
-def lock_event_payload(uid: str, kind: str | None, display: str | None) -> dict[str, Any]:
+def lock_event_payload(
+    uid: str,
+    kind: str | None,
+    display: str | None,
+    label: str | None = None,
+    since: float | None = None,
+) -> dict[str, Any]:
     """The wire payload for :class:`~mbtools.registry.locks.LockManager`'s
-    ``lock_display_callback(uid, kind, display)`` calls."""
-    return {"uid": uid, "kind": kind, "display": display}
+    ``lock_display_callback(uid, kind, display, label, since)`` calls.
+
+    Sprint 008, ticket 002 extended this signature (rather than adding a
+    second payload builder, per ticket 001's own implementation note) to
+    carry ``label``/``since`` as their own keys, ``null`` on release just
+    like ``kind``/``display`` -- what a local ``watch`` client (this same
+    dict, published on the event bus) reads structured fields off of. A
+    receiving peer's own ``_apply_event`` (this module, below) never
+    reads these two keys back out of an incoming ``lock_state`` event --
+    it forwards only ``kind``/``display`` into
+    ``store.apply_remote_lock_state``, so no new SQLite column or
+    queryable field is added on the receiving side (Design Rationale
+    Decision 2's "no new PUB field" is about that replicated store shape,
+    not about these two harmless extra keys on the wire message itself).
+    """
+    return {"uid": uid, "kind": kind, "display": display, "label": label, "since": since}
 
 
 def name_set_payload(entry: Entry) -> dict[str, Any]:
@@ -1740,13 +1762,39 @@ class PeerDiscovery:
             return
         self.publish_event(event_type, payload)
 
-    def publish_lock_event(self, uid: str, kind: str | None, display: str | None) -> None:
+    def publish_lock_event(
+        self,
+        uid: str,
+        kind: str | None,
+        display: str | None,
+        label: str | None = None,
+        since: float | None = None,
+    ) -> None:
         """Adapter matching :class:`~mbtools.registry.locks.LockManager`'s
         ``lock_display_callback`` signature exactly -- ticket 009's
         assembly wires this in directly (``LockManager(...,
         lock_display_callback=peering.publish_lock_event)``).
+
+        Sprint 008, ticket 002 (Design Rationale Decision 2): ``display``
+        gains ``label``/``since`` text baked in inline (e.g. ``"pid 4821
+        (alice-laptop, 12m)"``) before being sent, via the shared
+        :func:`~mbtools.registry.locks.format_lock_suffix` formatter --
+        so a peer's replicated ``remote_lock_display`` cache picks it up
+        automatically, with no new SQLite column or PUB-replicated field
+        on the receiving side (``store.apply_remote_lock_state`` keeps
+        its original three-argument shape; see :func:`_apply_event`'s
+        ``EVENT_LOCK_STATE`` branch below). ``label``/``since`` also ride
+        along as their own keys on the published payload (via
+        :func:`lock_event_payload`, extended together with this method's
+        signature per ticket 001's own note) for a ``watch`` client
+        reusing this identical event shape -- harmless extra keys a peer
+        receiver never reads back out.
         """
-        self.publish_event(EVENT_LOCK_STATE, lock_event_payload(uid, kind, display))
+        suffix = format_lock_suffix(label, since, now=time.time())
+        wire_display = f"{display}{suffix}" if display is not None else display
+        self.publish_event(
+            EVENT_LOCK_STATE, lock_event_payload(uid, kind, wire_display, label, since)
+        )
 
     def publish_name_set(self, entry: Entry) -> None:
         """Publish a ``name_registry`` ``set`` event for ``entry`` (ticket

@@ -28,9 +28,13 @@ from mbtools.registry.store import (
 def _device(**overrides) -> dict:
     """A minimal device dict in the shape ``registry.client.list()``
     returns (``api._device_dict``'s ``asdict(record)`` plus
-    ``lock_kind``/``lock_pid``/``endpoint``/``peer_reachable``) -- every
-    field a real response carries, with test-friendly defaults an
-    individual test overrides.
+    ``lock_kind``/``lock_pid``/``lock_label``/``lock_since``/``endpoint``/
+    ``peer_reachable``) -- every field a real response carries, with
+    test-friendly defaults an individual test overrides.
+
+    ``lock_label``/``lock_since`` (sprint 008, ticket 002) default to
+    ``None`` -- a test exercising the label/since-annotated lock cell
+    overrides both alongside ``lock_kind``/``lock_pid``.
 
     ``host``/``remote_lock_kind``/``remote_lock_display``/``endpoint``
     default to ``None`` and ``peer_reachable`` defaults to ``True`` --
@@ -63,6 +67,8 @@ def _device(**overrides) -> dict:
         "last_seen": 0.0,
         "lock_kind": None,
         "lock_pid": None,
+        "lock_label": None,
+        "lock_since": None,
         "host": None,
         "remote_lock_kind": None,
         "remote_lock_display": None,
@@ -115,6 +121,74 @@ def test_locked_device_shows_locked_by_kind_pid_regardless_of_underlying_state()
     out = render_table([d])
     data_line = out.splitlines()[2]
     assert "locked by serial pid 4821" in data_line
+
+
+def test_locked_device_with_no_label_or_since_shows_no_suffix():
+    """``lock_since`` unset (this fixture's default -- a test predating
+    sprint 008 ticket 002, or the value ``list`` returns for a device
+    this connection never locked, which never happens for a device
+    that's actually locked in production, but is the shape a hand-built
+    fixture without it exercises) means no suffix at all -- the exact
+    pre-ticket-002 cell text."""
+    d = _device(
+        short_uid="ccccccc1",
+        state=STATE_CONNECTED,
+        lock_kind="serial",
+        lock_pid=4821,
+    )
+    out = render_table([d])
+    data_line = out.splitlines()[2]
+    assert "locked by serial pid 4821" in data_line
+    assert "(" not in data_line
+
+
+def test_locked_device_with_since_but_no_label_shows_age_only():
+    now = 2_000_000_000.0
+    d = _device(
+        short_uid="ccccccc2",
+        state=STATE_CONNECTED,
+        lock_kind="serial",
+        lock_pid=4821,
+        lock_since=now - 725,  # 12m5s ago
+    )
+    out = render_table([d], now=now)
+    data_line = out.splitlines()[2]
+    assert "locked by serial pid 4821 (12m)" in data_line
+
+
+def test_locked_device_with_label_and_since_shows_both():
+    now = 2_000_000_000.0
+    d = _device(
+        short_uid="ccccccc3",
+        state=STATE_CONNECTED,
+        lock_kind="flash",
+        lock_pid=99,
+        lock_label="alice-laptop",
+        lock_since=now - 725,
+    )
+    out = render_table([d], now=now)
+    data_line = out.splitlines()[2]
+    assert "locked by flash pid 99 (alice-laptop, 12m)" in data_line
+
+
+def test_peer_owned_locked_row_shows_baked_in_remote_display_unmodified():
+    """Design Rationale Decision 2: a peer-owned row's label/since text
+    already rides inside ``remote_lock_display`` (baked in by
+    ``registry.peering.publish_lock_event`` before this store ever sees
+    it) -- ``render.py`` must not try to reformat or double-append
+    anything for that branch, just show the cached string verbatim, same
+    as before this ticket."""
+    d = _device(
+        short_uid="ccccccc4",
+        state=STATE_CONNECTED,
+        host="loki",
+        peer_reachable=True,
+        remote_lock_kind="flash",
+        remote_lock_display="pid 4821 (alice-laptop, 12m)",
+    )
+    out = render_table([d])
+    data_line = out.splitlines()[2]
+    assert "locked by flash pid 4821 (alice-laptop, 12m)" in data_line
 
 
 def test_locked_device_takes_precedence_over_no_firmware_state():

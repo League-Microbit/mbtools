@@ -757,16 +757,22 @@ def assemble_registry(
         if peer_discovery is not None:
             peer_discovery.publish_daemon_event(event_type, record)
 
-    def _lock_display_callback(uid: str, kind: str | None, display: str | None) -> None:
+    def _lock_display_callback(
+        uid: str,
+        kind: str | None,
+        display: str | None,
+        label: str | None = None,
+        since: float | None = None,
+    ) -> None:
         eventbus.publish(
             {
                 "type": EVENT_LOCK_STATE,
                 "host": host_name,
-                **lock_event_payload(uid, kind, display),
+                **lock_event_payload(uid, kind, display, label, since),
             }
         )
         if peer_discovery is not None:
-            peer_discovery.publish_lock_event(uid, kind, display)
+            peer_discovery.publish_lock_event(uid, kind, display, label, since)
 
     def _name_set_callback(entry: Any) -> None:
         eventbus.publish(

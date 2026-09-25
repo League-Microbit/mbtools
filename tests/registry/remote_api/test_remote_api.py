@@ -318,15 +318,18 @@ def test_two_remote_sessions_conflict_and_holder_is_session_shaped(remote_server
 
 
 @pytest.mark.requires_af_unix
-def test_local_holder_beats_remote_contender_with_unchanged_2_key_shape(
+def test_local_holder_beats_remote_contender_with_no_origin_or_host_added(
     remote_server, local_server
 ):
     """A local Unix-socket client and a remote TCP client contend for the
     same uid through the one shared LockManager table (ticket 002,
     Decision 2) -- proving lock/unlock genuinely share state, not just
     the same code, and that the local holder's wire shape in a `locked`
-    response is unaffected by a remote contender existing at all (ticket
-    006 acceptance criteria #1/#8)."""
+    response gains no `origin`/`host` from a remote contender existing at
+    all (ticket 006 acceptance criteria #1/#8; sprint 008 ticket 002 adds
+    `label`/`since` to every holder's shape regardless of origin, so this
+    test no longer asserts an unchanged 2-key shape, only that `origin`/
+    `host` specifically stay absent for a local holder)."""
     shared_lock = threading.RLock()
     unix_srv = local_server(lock=shared_lock)
     tcp_srv = remote_server(lock=shared_lock)
@@ -349,11 +352,13 @@ def test_local_holder_beats_remote_contender_with_unchanged_2_key_shape(
 
     assert resp["ok"] is False
     assert resp["code"] == CODE_LOCKED
-    # The local holder's wire shape is unchanged -- exactly 2 keys, no
-    # origin/host added, even though the contender was remote.
+    # The local holder's wire shape has no origin/host added, even though
+    # the contender was remote -- unchanged since ticket 006. Sprint 008
+    # ticket 002 adds label/since (additive, on every holder regardless
+    # of origin), so the shape is 4 keys now, not the original 2.
     assert resp["holder"]["kind"] == KIND_SERIAL
     assert isinstance(resp["holder"]["pid"], int)
-    assert set(resp["holder"].keys()) == {"kind", "pid"}
+    assert set(resp["holder"].keys()) == {"kind", "pid", "label", "since"}
 
     remote_client.close()
     for f in (unix_rfile, unix_wfile):

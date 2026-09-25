@@ -188,6 +188,8 @@ def test_lock_event_payload():
         "uid": "uid-1",
         "kind": "serial",
         "display": "locked by pid 42",
+        "label": None,
+        "since": None,
     }
 
 
@@ -196,6 +198,21 @@ def test_lock_event_payload_release_shape():
         "uid": "uid-1",
         "kind": None,
         "display": None,
+        "label": None,
+        "since": None,
+    }
+
+
+def test_lock_event_payload_carries_label_and_since():
+    """Sprint 008, ticket 002: label/since ride along as their own keys
+    on the lock_state payload -- what a `watch` client (ticket 001) reads
+    structured fields off of, alongside the existing kind/display."""
+    assert lock_event_payload("uid-1", "serial", "locked by pid 42", "alice-laptop", 1000.0) == {
+        "uid": "uid-1",
+        "kind": "serial",
+        "display": "locked by pid 42",
+        "label": "alice-laptop",
+        "since": 1000.0,
     }
 
 

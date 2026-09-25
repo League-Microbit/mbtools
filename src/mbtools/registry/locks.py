@@ -65,6 +65,7 @@ knows about ``peering``/ZeroMQ.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Callable
 
@@ -78,6 +79,7 @@ __all__ = [
     "KIND_FLASH",
     "KIND_DEBUG",
     "LOCK_KINDS",
+    "format_lock_suffix",
 ]
 
 # Lock kinds, per sprint.md's brief §3.5/spec §3.6, cross-cutting §3.
@@ -133,10 +135,22 @@ class LockStatus:
     about a bare pid -- ``daemon.py``, ``api.py``'s wire-protocol dict,
     and every pre-ticket-002 test -- don't all need to learn about
     :class:`HolderRef` just to read it back out.
+
+    ``label``/``since`` (sprint 008, ticket 002) are per-*acquisition*,
+    display-only metadata -- not part of :class:`HolderRef`, which is
+    frozen, equality-matched by :meth:`LockManager.release`, and reused
+    across every lock one connection acquires (see this module's
+    docstring and sprint.md's Design Rationale, Decision 1, for why they
+    live here instead). ``label`` is the caller-supplied string from
+    ``lock``'s optional ``label`` field (``None`` if omitted); ``since``
+    is always set, from :class:`LockManager`'s injected ``now_fn``, at
+    the moment :meth:`LockManager.acquire` grants the lock.
     """
 
     kind: str
     holder: HolderRef
+    label: str | None = None
+    since: float = 0.0
 
     @property
     def pid(self) -> int | None:
@@ -183,6 +197,52 @@ def _describe_holder(holder: HolderRef) -> str:
     return f"session {holder.ref} on {holder.host}"
 
 
+def _format_age(seconds: float) -> str:
+    """A short, human-scale elapsed-time string -- seconds under a
+    minute, minutes under an hour, hours beyond that. Not a general
+    duration formatter (no days -- a stale lock this old is already
+    ``mbregistry unlock --force`` (ticket 003) territory, not a display
+    nicety), just enough resolution for an operator glancing at
+    ``mbregistry list`` or a peer's replicated display string.
+    """
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    return f"{hours}h"
+
+
+def format_lock_suffix(label: str | None, since: float | None, *, now: float) -> str:
+    """The optional ``" (<label>, <age>)"``/``" (<age>)"`` suffix sprint
+    008 ticket 002's Design Rationale (Decision 2) describes for both a
+    local lock cell (``registry.render``'s ``_state_cell``) and a peer's
+    replicated ``remote_lock_display`` string
+    (``registry.peering.publish_lock_event``, which bakes it into
+    ``display`` before publishing) -- one shared, pure formatter so the
+    two never drift on wording.
+
+    ``now`` is injected rather than read internally (``time.time()``),
+    keeping this function pure and independently testable -- each caller
+    supplies its own idea of "now" (``render``'s caller-supplied
+    timestamp; ``peering``'s own clock at publish time).
+
+    Returns ``""`` (no suffix at all) when ``since`` is ``None`` -- an
+    unlocked device, or a caller (a pre-ticket-002 device dict/test
+    fixture) that never set it. Once a real acquisition timestamp is
+    present, the elapsed age is always shown (e.g. ``" (12m)"``), with
+    ``label`` prepended when set (``" (alice-laptop, 12m)"``).
+    """
+    if since is None:
+        return ""
+    age = _format_age(now - since)
+    if label:
+        return f" ({label}, {age})"
+    return f" ({age})"
+
+
 class LockManager:
     """The exclusive per-device lock table -- in-memory only, never
     persisted (see module docstring).
@@ -193,24 +253,43 @@ class LockManager:
     ``daemon``'s (ticket 006) flash-triggered re-probe hook attaches.
 
     ``lock_display_callback``, if given, is called with ``(uid, kind,
-    display)`` on every successful :meth:`acquire` and every actual
+    display, label, since)`` (sprint 008, ticket 002 extended the
+    original ``(uid, kind, display)`` signature to carry the new
+    per-acquisition fields alongside it, rather than adding a second
+    callback) on every successful :meth:`acquire` and every actual
     release (any kind, via either :meth:`release` or :meth:`sweep`) --
-    see the module docstring's "Lock-display hook" note. Defaults to
-    ``None`` (no-op) so every pre-ticket-005 caller/test is unaffected.
+    see the module docstring's "Lock-display hook" note. ``label``/
+    ``since`` are ``None`` both on a release and on an acquire that
+    supplied no ``label``/whose ``since`` isn't yet known -- in practice
+    ``since`` is always a real timestamp on a successful acquire, never
+    ``None`` there. Defaults to ``None`` (no-op) so every pre-ticket-005
+    caller/test is unaffected.
+
+    ``now_fn`` (sprint 008, ticket 002) mirrors ``store``/``identity``/
+    ``usbwatch``'s existing injectable-clock convention -- called once
+    per :meth:`acquire` to stamp that acquisition's ``LockStatus.since``,
+    so a test can inject a scripted clock instead of real wall-clock
+    time. Defaults to :func:`time.time`.
     """
 
     def __init__(
         self,
         *,
         flash_release_callback: Callable[[str], None] | None = None,
-        lock_display_callback: Callable[[str, str | None, str | None], None]
+        lock_display_callback: Callable[
+            [str, str | None, str | None, str | None, float | None], None
+        ]
         | None = None,
+        now_fn: Callable[[], float] = time.time,
     ) -> None:
         self._locks: dict[str, LockStatus] = {}
         self._flash_release_callback = flash_release_callback
         self._lock_display_callback = lock_display_callback
+        self._now_fn = now_fn
 
-    def acquire(self, uid: str, kind: str, holder: HolderRef) -> bool:
+    def acquire(
+        self, uid: str, kind: str, holder: HolderRef, *, label: str | None = None
+    ) -> bool:
         """Grant an exclusive lock of ``kind`` on ``uid`` to ``holder``.
 
         Returns ``True`` if ``uid`` was unlocked and the lock is now
@@ -222,16 +301,25 @@ class LockManager:
         request mutually exclusive on the same uid). State is left
         untouched on failure: the existing holder keeps its lock.
 
-        Fires ``lock_display_callback(uid, kind, display)`` (see the
-        module docstring's "Lock-display hook" note) on success, never on
-        a :class:`LockHeldError` failure.
+        ``label`` (sprint 008, ticket 002), if given, is stored on the
+        new :class:`LockStatus` verbatim -- display-only, never used for
+        holder identity or the :meth:`release` equality check. ``since``
+        is stamped fresh from :attr:`_now_fn` on every call, per
+        *acquisition* -- not cached on ``holder``, so two locks acquired
+        by the same connection (same ``HolderRef``) get their own,
+        independent ``since``.
+
+        Fires ``lock_display_callback(uid, kind, display, label, since)``
+        (see the module docstring's "Lock-display hook" note) on
+        success, never on a :class:`LockHeldError` failure.
         """
         current = self._locks.get(uid)
         if current is not None:
             raise LockHeldError(uid, current)
-        self._locks[uid] = LockStatus(kind=kind, holder=holder)
+        since = self._now_fn()
+        self._locks[uid] = LockStatus(kind=kind, holder=holder, label=label, since=since)
         if self._lock_display_callback is not None:
-            self._lock_display_callback(uid, kind, _describe_holder(holder))
+            self._lock_display_callback(uid, kind, _describe_holder(holder), label, since)
         return True
 
     def release(self, uid: str, holder: HolderRef) -> bool:
@@ -289,8 +377,11 @@ class LockManager:
     def _release(self, uid: str, holder: LockStatus) -> None:
         """Shared release mechanics: drop the table entry, then fire the
         flash-release callback if ``holder`` was flash-kind, then fire
-        the lock-display callback (any kind) with ``(uid, None, None)``
-        -- "no longer locked".
+        the lock-display callback (any kind) with
+        ``(uid, None, None, None, None)`` -- "no longer locked" (sprint
+        008 ticket 002 widened the trailing pair from ``(None, None)`` to
+        ``(None, None, None, None)`` to match :meth:`acquire`'s five-arg
+        call).
 
         Both public release paths (:meth:`release`, :meth:`sweep`) funnel
         through here so neither callback can be fired from one path and
@@ -300,4 +391,4 @@ class LockManager:
         if holder.kind == KIND_FLASH and self._flash_release_callback is not None:
             self._flash_release_callback(uid)
         if self._lock_display_callback is not None:
-            self._lock_display_callback(uid, None, None)
+            self._lock_display_callback(uid, None, None, None, None)

@@ -91,23 +91,37 @@ Every non-streaming response is one of:
 ### Lock holder wire shape
 
 ```jsonc
-// a local holder (unchanged since sprint 001):
-"holder": {"kind": "flash", "pid": 4821}
+// a local holder, unlabeled (kind/pid unchanged since sprint 001; label/
+// since added sprint 008, ticket 002):
+"holder": {"kind": "flash", "pid": 4821, "label": null, "since": 1732400000.0}
+// a local holder with an operator-supplied label:
+"holder": {"kind": "flash", "pid": 4821, "label": "alice-laptop", "since": 1732400000.0}
 // a remote (session-tied) holder (sprint 003, ticket 006) -- an additive
 // superset, never a breaking change to the local shape above:
-"holder": {"kind": "flash", "pid": null, "origin": "remote", "host": "loki"}
+"holder": {"kind": "flash", "pid": null, "label": null, "since": 1732400000.0,
+           "origin": "remote", "host": "loki"}
 ```
 
 Since sprint 003 (ticket 002), a device's lock can be held by either a
 local (PID-tied) or a remote (session-tied) client — the local Unix API
 and the remote TCP API share one `LockManager` table (Decision 2), so a
 `locked` response on *either* API can name a holder of *either* origin.
-A local holder's wire shape is exactly the 2-key form shown above,
-unchanged since before this sprint. A remote holder adds `origin`/`host`
-and reports `pid: null` ("a PID means nothing across hosts") — a client
-that only ever checked `holder.kind`/`holder.pid` keeps working
-unmodified; only a client that wants to show "locked by loki" instead of
-"locked by pid 4821" needs to look at the new keys.
+A remote holder adds `origin`/`host` and reports `pid: null` ("a PID
+means nothing across hosts") — a client that only ever checked
+`holder.kind`/`holder.pid` keeps working unmodified; only a client that
+wants to show "locked by loki" instead of "locked by pid 4821" needs to
+look at the new keys.
+
+**`label`/`since`** (sprint 008, ticket 002): an optional, display-only
+label supplied on `lock` (see below), and the timestamp that acquisition
+happened, both added to *every* holder's wire shape regardless of
+origin — additive to whatever shape existed before this ticket (the
+local holder's shape grew from 2 keys to 4; the remote holder's from 4
+to 6). `label` is `null` when the caller omitted it on `lock`; `since`
+is always a real timestamp once a lock exists — there is no "unset"
+case for a resolved holder. Neither field ever participates in
+`unlock`'s holder-matching check — that's still `HolderRef`
+(`origin`/`ref`/`pid`/`host`) equality only, untouched by this ticket.
 
 ### `list`
 
@@ -121,15 +135,21 @@ unmodified; only a client that wants to show "locked by loki" instead of
    "error_note": "...", "flash_count": 0,
    "chip_identity_name": "...", "chip_identity_serial": 0,
    "first_seen": 0.0, "last_seen": 0.0, "last_probe": 0.0,
-   "lock_kind": "serial|relay|flash|debug|null", "lock_pid": 1234}
+   "lock_kind": "serial|relay|flash|debug|null", "lock_pid": 1234,
+   "lock_label": "alice-laptop|null", "lock_since": 1732400000.0}
 ]}
 ```
 
 Every field on the device dict is `store.DeviceRecord`'s own columns
-(`dataclasses.asdict`), plus two folded-in lock-status fields
-(`lock_kind`/`lock_pid`, both `null` when unlocked, from `locks.status`) so a
-client building a STATE column (ticket 009) never needs a second round-trip
-per device.
+(`dataclasses.asdict`), plus four folded-in lock-status fields
+(`lock_kind`/`lock_pid`/`lock_label`/`lock_since`, all `null` when
+unlocked, from `locks.status`) so a client building a STATE column
+(ticket 009) never needs a second round-trip per device.
+`lock_label`/`lock_since` (sprint 008, ticket 002) are `null` for a
+peer-owned row too (`host` set) — a remote device's label/since text
+rides inside its `remote_lock_display` string instead (Design Rationale
+Decision 2), never as its own structured field for a row this registry
+doesn't own.
 
 **`state` (sprint 007, ticket 001)**: `connected_no_firmware` narrowed to
 mean only "confirmed blank" — a board a flash-triggered re-probe
@@ -177,13 +197,13 @@ is only available through this `--json`/`list` response's own
 ### `lock`
 
 ```jsonc
-// request
-{"op": "lock", "uid": "...", "kind": "serial"}
+// request, label optional (sprint 008, ticket 002):
+{"op": "lock", "uid": "...", "kind": "serial", "label": "alice-laptop"}
 // response
 {"ok": true}
 // or, already locked by someone else:
 {"ok": false, "code": "locked", "error": "...",
- "holder": {"kind": "flash", "pid": 4821}}
+ "holder": {"kind": "flash", "pid": 4821, "label": "alice-laptop", "since": 1732400000.0}}
 // or, bad kind / missing fields:
 {"ok": false, "code": "invalid_request", "error": "..."}
 // or:
@@ -193,6 +213,16 @@ is only available through this `--json`/`list` response's own
 The PID recorded as the holder is **never** taken from the request — it is
 read from the connection's own kernel-verified peer credentials (see below),
 so a client cannot lock, or unlock, on another process's behalf.
+
+`label` (sprint 008, ticket 002) is an optional, free-text, **display-only**
+string — omitting it behaves exactly as before this ticket (`label: null` in
+every holder shape). It is never used for authorization or holder identity:
+`unlock`'s holder-matching check is still `HolderRef` equality only, and a
+`label` value is never compared against anything. `since` (always present
+once a lock exists, no request-side equivalent — it is stamped server-side
+at the moment `lock` succeeds) is the acquisition timestamp; both fields
+also appear in `list`'s per-device dict and in a `lock_state` `watch` event
+(see below) for the same lock.
 
 ### `unlock`
 
@@ -272,7 +302,7 @@ regardless of what ran before it) is what does that, unaffected by this op.
 // for as long as the connection stays open -- no "final" line, ever.
 {"ok": true}
 {"type": "attach", "host": "...", "uid": "...", "port": "...", "vid_pid": "..."}
-{"type": "lock_state", "host": "...", "uid": "...", "kind": "serial", "display": "..."}
+{"type": "lock_state", "host": "...", "uid": "...", "kind": "serial", "display": "...", "label": "alice-laptop", "since": 1732400000.0}
 {"type": "detach", "host": "...", "uid": "..."}
 // ...
 ```
@@ -306,7 +336,7 @@ emits, plus two new ones this ticket adds:
 | `attach` | `uid`, `port`, `vid_pid` | `Daemon`'s own attach detection |
 | `detach` | `uid` | `Daemon`'s own detach detection |
 | `identity` | `uid`, `state`, `role`, `common_name`, `device_name`, `serial_payload`, `raw_announcement` | `Daemon`'s own probe/identify step |
-| `lock_state` | `uid`, `kind`, `display` (`kind`/`display` both `null` on release) | `LockManager.acquire`/`release`/`sweep` |
+| `lock_state` | `uid`, `kind`, `display`, `label`, `since` (sprint 008 ticket 002; all four `null` on release) | `LockManager.acquire`/`release`/`sweep` |
 | `name_set` | `name`, `channel`, `group`, `source`, `updated` | `Store.set`/`Store.resolve` (via `names_set`) |
 | `name_clear` | `name` | `Store.clear` (via `names_clear`) |
 | `peer_up` | `host` (the peer that became reachable) | `registry.peering`'s own reachability tracking (new this ticket) |
@@ -543,7 +573,13 @@ for existing (Open Question #1).
   replicated over the event bus (Decision 3) — never consulted for a
   local row, which always reads live `LockManager` state instead. Set
   only by `Store.apply_remote_lock_state`, never by anything that
-  touches `LockManager`.
+  touches `LockManager`. **Sprint 008, ticket 002**: a labeled lock's
+  `remote_lock_display` carries label/since text baked in as plain
+  prose (e.g. `"pid 4821 (alice-laptop, 12m)"`, via
+  `registry.peering.publish_lock_event`/`format_lock_suffix`) —
+  `Store.apply_remote_lock_state`'s own signature is unchanged (still
+  `(uid, kind, display)`), and no `remote_lock_label`/`remote_lock_since`
+  column was added, per that ticket's Design Rationale Decision 2.
 - **`peer` table** (new): one row per discovered registry —
   `host` (`TEXT PRIMARY KEY`), `endpoint` (`TEXT`, `host:port` of that
   peer's own `remote_api` listener), `last_seen` (`REAL`), `reachable`
