@@ -1,9 +1,11 @@
 ---
 id: '005'
-title: 'Spawn support (--ready-json, --exit-with-parent, --no-peering)'
-status: open
-use-cases: [SUC-007]
-depends-on: ['004']
+title: Spawn support (--ready-json, --exit-with-parent, --no-peering)
+status: done
+use-cases:
+- SUC-007
+depends-on:
+- '004'
 github-issue: ''
 issue: robot-console-on-mbregistry-multi-instance-and-spawn-support.md
 completes_issue: true
@@ -53,29 +55,87 @@ check its actual signature/behavior at implementation time).
 
 ## Acceptance Criteria
 
-- [ ] `--ready-json` prints exactly one valid JSON line, after every
+- [x] `--ready-json` prints exactly one valid JSON line, after every
       requested listener is bound, before the daemon's poll loop starts;
       the line's `ports` reflect actually-bound values (consistent with
       ticket 004's "advertise what's bound" fix).
-  - [ ] No other stdout output occurs under `--ready-json` (diagnostic
+  - [x] No other stdout output occurs under `--ready-json` (diagnostic
         text stays on stderr).
-- [ ] `--exit-with-parent` causes the process to exit within the test's
+- [x] `--exit-with-parent` causes the process to exit within the test's
       timeout when the parent's end of stdin is closed, via the same
       clean-shutdown path `SIGTERM` already takes (verified by asserting
       the same `stop_event`/shutdown sequence runs, not a separate
       `os._exit`-style hard kill).
-- [ ] `--no-peering` results in `PeerDiscovery` never being constructed
+- [x] `--no-peering` results in `PeerDiscovery` never being constructed
       — a test asserts the peering-construction call is never made
       (not merely that `start()`/`stop()` become no-ops), and that no
       mDNS registration or ZeroMQ socket bind occurs.
-- [ ] `--no-peering` combined with `assemble_names_api`'s
+- [x] `--no-peering` combined with `assemble_names_api`'s
       `name_set_callback`/`name_clear_callback` does not raise (handles
       the missing `peering` object gracefully).
-- [ ] All three flags compose correctly together (the combination in
+- [x] All three flags compose correctly together (the combination in
       `docs/design/robot-console-integration.md` §4 item 4's own spawn
       recipe: `--ready-json --exit-with-parent --no-peering` alongside
       `--pool-port 0 --names-port 0 --remote-port 0 --peer-pub-port 0
       --peer-snapshot-port 0`), exercised as one integration-style test.
+
+## Implementation Notes
+
+Implemented entirely in `src/mbtools/registry/cli.py`:
+
+- `assemble_registry` gained a `no_peering: bool = False` keyword-only
+  parameter. When `True`, the `PeerDiscovery(...)` construction call is
+  skipped entirely (not called, not started-then-stopped), the
+  function's own fourth return value is `None`, and
+  `assemble_daemon_and_api`'s `event_callback`/`lock_display_callback`/
+  `name_set_callback`/`name_clear_callback` are all passed `None`
+  instead of a bound method off a nonexistent `peer_discovery`. Every
+  pre-ticket-005 caller/test that omits `no_peering` is unaffected
+  (defaults to `False`, unchanged behavior).
+- `_run_registry` threads `args.no_peering` into `assemble_registry`,
+  and is `None`-safe everywhere it touches the resulting `peering`
+  local: `peering.start()`/`.stop()`/`.connect_peer(...)` and the
+  `assemble_names_api` callback wiring are all guarded with
+  `if peering is not None`. A `--peer` given alongside `--no-peering`
+  is a no-op (nothing to connect through), noted to stderr only.
+- `--ready-json` builds a `ports` dict from each listener's own
+  `bound_port` (`remote_api`, `relay_pool` if not `--no-relay-pool`,
+  `names_api`) plus the *resolved* `peer_pub_port`/`peer_snapshot_port`
+  when peering is enabled (`PeerDiscovery` exposes no bound-port
+  equivalent for its own ZeroMQ sockets to read back from -- it is
+  "existing, unmodified" this sprint per sprint.md Step 3 -- so those
+  two report the requested value, matching the pre-existing stderr
+  diagnostic line's own behavior). The resolved `--instance` is reported
+  directly when given, else via a new small `_short_hostname()` helper
+  (a third copy of `registry.peering`'s own private helper of the same
+  name, following that module's own "duplicate a small per-module
+  helper rather than cross-import a private name" precedent). Printed
+  once, to stdout only, immediately before `daemon.run(...)`.
+- `--exit-with-parent` starts a new daemon thread
+  (`_watch_stdin_for_parent_exit`) that blocks reading `stdin` until EOF,
+  then sets the exact same `stop_event` `cmd_run`'s own `SIGTERM`/
+  `SIGINT` handlers already set -- shutdown always goes through the one
+  path `daemon.run`'s own `stop` callback checks in `_run_registry`'s
+  `finally` block.
+- **Test seam added** (per this ticket's own handoff note that one was
+  needed): `_run_registry` gained one new keyword-only parameter,
+  `stdin: Any = None` (defaults to `sys.stdin` when omitted/`None` --
+  production/`cmd_run` never passes it), used only so a test can hand
+  `--exit-with-parent`'s watcher a fake/pipe file object. No other new
+  seam was needed: `--no-peering`'s "construction never called" proof
+  and `assemble_names_api`'s None-callback safety are exercised directly
+  against `assemble_registry`/`assemble_names_api` (mirroring
+  `test_cli_run_peering.py`/`test_cli_ports_instance_pipe.py`'s own
+  precedent of testing this module's assembly functions rather than
+  `_run_registry`); `--ready-json`'s shape, `--exit-with-parent`'s
+  wiring, and the three-flag composition test are all exercised against
+  a fully mocked `assemble_registry`/`assemble_relay_pool`/
+  `assemble_names_api` (no real sockets/ports), per this ticket's own
+  Testing plan.
+
+New test file: `tests/registry/cli/test_cli_spawn.py` (15 tests, all
+passing; `uv run pytest tests/registry/cli/ -q` -- 103 passed, no
+regressions in the rest of that directory).
 
 ## Implementation Plan
 

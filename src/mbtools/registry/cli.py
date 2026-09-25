@@ -58,6 +58,7 @@ import argparse
 import json
 import os
 import signal
+import socket
 import sys
 import threading
 from pathlib import Path
@@ -245,6 +246,53 @@ def _resolve_token(flag_value: str | None, env_var: str) -> str | None:
     if flag_value:
         return flag_value
     return os.environ.get(env_var) or None
+
+
+def _short_hostname() -> str:
+    """This host's bare hostname, with any domain suffix stripped -- a
+    third copy of :func:`mbtools.registry.peering._short_hostname` (also
+    duplicated in :mod:`mbtools.registry.console_compat.relay_pool`),
+    following that function's own "platform dispatch/small helper
+    duplicated per module rather than cross-imported" precedent.
+
+    Sprint 007, ticket 005: used only by ``--ready-json`` to report the
+    resolved ``--instance`` value when ``instance`` (this module's own
+    ``--instance``/``$MBREGISTRY_INSTANCE`` resolution) is ``None`` --
+    including under ``--no-peering``, where there is no live
+    ``PeerDiscovery``/``RelayPool`` object left to read an
+    already-resolved hostname off of.
+    """
+    return socket.gethostname().split(".")[0]
+
+
+def _watch_stdin_for_parent_exit(stdin: Any, stop_event: threading.Event) -> None:
+    """``--exit-with-parent``'s background watcher (sprint 007, ticket
+    005): blocks reading ``stdin`` until EOF -- the parent process
+    closing its end of an inherited pipe, or the parent dying outright,
+    both surface as EOF the same way on that pipe -- then sets
+    ``stop_event``, the exact same ``threading.Event`` ``cmd_run``'s own
+    POSIX-signal handlers already set on ``SIGTERM``/``SIGINT``.
+    Shutdown therefore always goes through the one clean-stop path
+    ``daemon.run``'s own ``stop`` callback checks (see ``_run_registry``'s
+    ``finally`` block), never a separate ``os._exit``-style hard kill.
+
+    Run on a daemon thread by its only caller, ``_run_registry`` -- so it
+    never itself blocks process exit if shutdown happens some other way
+    first (e.g. a real ``SIGTERM``) while this thread is still parked in
+    a blocking read with nothing more ever arriving on ``stdin``.
+    """
+    try:
+        while True:
+            line = stdin.readline()
+            if not line:
+                break
+    except (OSError, ValueError):
+        # stdin closed/invalidated out from under this thread -- treat
+        # that the same as EOF rather than letting the thread die
+        # silently without ever setting stop_event.
+        pass
+    finally:
+        stop_event.set()
 
 
 def _parse_peer_spec(spec: str) -> tuple[str, int]:
@@ -501,7 +549,10 @@ def assemble_registry(
     lock: threading.RLock | None = None,
     claim_fn: Any = None,
     pipe_name: str | None = None,
-) -> tuple[Daemon, RegistryAPIServer | WindowsPipeAPIServer, RemoteAPIServer, PeerDiscovery]:
+    no_peering: bool = False,
+) -> tuple[
+    Daemon, RegistryAPIServer | WindowsPipeAPIServer, RemoteAPIServer, PeerDiscovery | None
+]:
     """Ticket 009's real assembly: everything :func:`assemble_daemon_and_api`
     already builds, *plus* a :class:`~mbtools.registry.remote_api.RemoteAPIServer`
     and a :class:`~mbtools.registry.peering.PeerDiscovery`, all four
@@ -579,6 +630,27 @@ def assemble_registry(
     ``pipe_name`` docstring note. Left ``None`` here (this function's
     own default), unaffected for every pre-ticket-004 caller/test.
 
+    ``no_peering`` (sprint 007, ticket 005) is this function's own
+    "skip constructing :class:`PeerDiscovery` entirely" switch -- not
+    "construct then never start," and not "start then immediately
+    stop." When ``True``, ``PeerDiscovery(...)`` below is never called
+    at all (a test asserts this directly by monkeypatching the
+    ``PeerDiscovery`` name and checking it was never invoked -- checking
+    only that ``.start()``/``.stop()`` become no-ops would not prove
+    this), this function's own fourth return value is ``None`` instead
+    of a real :class:`PeerDiscovery`, and
+    :func:`assemble_daemon_and_api`'s ``event_callback``/
+    ``lock_display_callback``/``name_set_callback``/``name_clear_callback``
+    are all passed ``None`` (that function's own no-op default) rather
+    than a bound method off an object that no longer exists. Every
+    caller/test that omits it (every one that predates this ticket) is
+    unaffected -- ``no_peering`` defaults to ``False``, a real
+    :class:`PeerDiscovery` is still built exactly as before.
+    :func:`_run_registry` forwards ``--no-peering`` here verbatim, and
+    is itself ``None``-safe everywhere it touches its own ``peering``
+    local (``peering.start()``/``.stop()``/``.connect_peer(...)`` are
+    all skipped when it is ``None``).
+
     Callers do not start or stop any of the four returned objects --
     that stays their own responsibility, matching
     :func:`assemble_daemon_and_api`'s own convention. Shutdown order
@@ -591,18 +663,22 @@ def assemble_registry(
     """
     shared_lock = lock if lock is not None else threading.RLock()
 
-    peer_discovery = PeerDiscovery(
-        store=store,
-        host=peering_host,
-        advertise_address=advertise_address,
-        remote_port=remote_port,
-        pub_port=peer_pub_port,
-        snapshot_port=peer_snapshot_port,
-        auth_token=auth_token,
-        lock=shared_lock,
-        zeroconf=zeroconf,
-        zmq=zmq,
-    )
+    # Sprint 007, ticket 005: --no-peering skips this construction
+    # entirely -- see this function's own no_peering docstring note.
+    peer_discovery: PeerDiscovery | None = None
+    if not no_peering:
+        peer_discovery = PeerDiscovery(
+            store=store,
+            host=peering_host,
+            advertise_address=advertise_address,
+            remote_port=remote_port,
+            pub_port=peer_pub_port,
+            snapshot_port=peer_snapshot_port,
+            auth_token=auth_token,
+            lock=shared_lock,
+            zeroconf=zeroconf,
+            zmq=zmq,
+        )
     daemon, api = assemble_daemon_and_api(
         store=store,
         usbwatch=usbwatch,
@@ -613,10 +689,18 @@ def assemble_registry(
         peer_pid_fn=peer_pid_fn,
         flash_runner=flash_runner,
         lock=shared_lock,
-        event_callback=peer_discovery.publish_daemon_event,
-        lock_display_callback=peer_discovery.publish_lock_event,
-        name_set_callback=peer_discovery.publish_name_set,
-        name_clear_callback=peer_discovery.publish_name_clear,
+        event_callback=(
+            peer_discovery.publish_daemon_event if peer_discovery is not None else None
+        ),
+        lock_display_callback=(
+            peer_discovery.publish_lock_event if peer_discovery is not None else None
+        ),
+        name_set_callback=(
+            peer_discovery.publish_name_set if peer_discovery is not None else None
+        ),
+        name_clear_callback=(
+            peer_discovery.publish_name_clear if peer_discovery is not None else None
+        ),
         claim_fn=claim_fn,
         pipe_name=pipe_name,
     )
@@ -784,29 +868,51 @@ def cmd_run(args: argparse.Namespace) -> int:
     return _run_registry(args, stop_event)
 
 
-def _run_registry(args: argparse.Namespace, stop_event: threading.Event) -> int:
+def _run_registry(
+    args: argparse.Namespace,
+    stop_event: threading.Event,
+    *,
+    stdin: Any = None,
+) -> int:
     """The real production pipeline behind ``mbregistry run``: constructs
     (:class:`~mbtools.registry.usbwatch.PollingPortWatcher`, a real
     :class:`Store`) via :func:`assemble_registry`, starts the local api
     (a Unix socket, or a named pipe on ``sys.platform == "win32"`` --
     see :func:`assemble_daemon_and_api`'s own docstring), the TCP remote
-    api, and mDNS/ZeroMQ peering (ticket 009), connects any explicit
-    ``--peer`` targets, and runs the daemon's poll loop until
-    ``stop_event`` is set. This is what a systemd ``ExecStart=`` invokes
-    (see :func:`render_systemd_unit`), what a developer runs directly on
-    macOS (module docstring, "macOS foreground dev use"), and (sprint
-    005 ticket 005) what
+    api, and mDNS/ZeroMQ peering (ticket 009, unless ``--no-peering`` --
+    ticket 005 below), connects any explicit ``--peer`` targets, and
+    runs the daemon's poll loop until ``stop_event`` is set. This is
+    what a systemd ``ExecStart=`` invokes (see :func:`render_systemd_unit`),
+    what a developer runs directly on macOS (module docstring, "macOS
+    foreground dev use"), and (sprint 005 ticket 005) what
     :func:`~mbtools.registry.service_windows.run_as_windows_service`
     calls as its own ``main`` on Windows -- peering/remote_api need no
     elevated privilege beyond what ``--socket``/``--db`` already
     require, since every new port (7440/7442/7443 by default) is a
     plain unprivileged TCP/UDP port.
 
-    Split out of :func:`cmd_run` itself by this ticket so that function
+    Split out of :func:`cmd_run` itself by ticket 009 so that function
     can call this same pipeline either directly (the POSIX-signal-driven
-    foreground path, unchanged from before this ticket) or wrapped in
+    foreground path, unchanged from before that ticket) or wrapped in
     :func:`run_as_windows_service` -- ``stop_event`` is owned by
     whichever of those two callers constructs it, not by this function.
+
+    **Sprint 007, ticket 005 (spawn support)**: this function grew one
+    new keyword-only test seam, ``stdin`` -- defaulting to ``None``,
+    meaning "use the real ``sys.stdin``" (production/``cmd_run`` never
+    passes it). It exists only so a test can hand ``--exit-with-parent``'s
+    watcher (:func:`_watch_stdin_for_parent_exit`) a fake/pipe file
+    object instead of the process's real standard input -- every other
+    piece of this ticket's own work (``--ready-json``, ``--no-peering``)
+    needed no new seam here, since it is exercised either at the
+    :func:`assemble_registry` level directly (mirroring
+    ``tests/registry/cli/test_cli_run_peering.py``'s/``test_cli_ports_
+    instance_pipe.py``'s own precedent of testing assembly functions
+    rather than this one, per ``test_cli_claims.py``'s "``_run_registry``
+    itself has no seam to inject a fake ``zeroconf``" note) or against a
+    fully mocked ``assemble_registry``/``assemble_relay_pool``/
+    ``assemble_names_api`` (this ticket's own testing plan, "no real
+    sockets/ports").
     """
     socket_path = _resolve_local_api_address(args.socket, _SOCKET_ENV_VAR)
     db_path = _resolve_path(args.db, _DB_ENV_VAR, DEFAULT_DB_PATH)
@@ -834,6 +940,21 @@ def _run_registry(args: argparse.Namespace, stop_event: threading.Event) -> int:
     except ValueError as exc:
         print(f"mbregistry: {exc}", file=sys.stderr)
         return EXIT_ERROR
+
+    # Sprint 007, ticket 005: --exit-with-parent's background watcher.
+    # Wired to the exact same stop_event cmd_run's own SIGTERM/SIGINT
+    # handlers set (see _watch_stdin_for_parent_exit's own docstring for
+    # why that makes shutdown go through one clean-stop path rather than
+    # two). Started early -- before Store/assembly below -- so an EOF
+    # that arrives during setup is never missed. A daemon thread: never
+    # itself blocks process exit.
+    if args.exit_with_parent:
+        threading.Thread(
+            target=_watch_stdin_for_parent_exit,
+            args=(stdin if stdin is not None else sys.stdin, stop_event),
+            name="mbregistry-exit-with-parent",
+            daemon=True,
+        ).start()
 
     store = Store(db_path)
     shared_lock = threading.RLock()
@@ -863,6 +984,11 @@ def _run_registry(args: argparse.Namespace, stop_event: threading.Event) -> int:
         # "fall back to socket_path" behavior, unchanged from before
         # this ticket); meaningless off Windows.
         pipe_name=args.pipe,
+        # Sprint 007, ticket 005: --no-peering. When True, `peering`
+        # below is None for the rest of this function -- every use of it
+        # from here on is None-safe (see assemble_registry's own
+        # no_peering docstring note).
+        no_peering=args.no_peering,
     )
 
     # Sprint 004 ticket 007: the robot-console-compatibility /names HTTP
@@ -881,13 +1007,19 @@ def _run_registry(args: argparse.Namespace, stop_event: threading.Event) -> int:
         store=store,
         lock=shared_lock,
         port=names_port,
-        name_set_callback=peering.publish_name_set,
-        name_clear_callback=peering.publish_name_clear,
+        # Sprint 007, ticket 005: peering is None under --no-peering --
+        # both callbacks fall back to assemble_names_api's own None
+        # (no-op) default (NamesAPI.handle_put/_get/_delete's own
+        # `if self._name_set_callback is not None` guards) rather than
+        # reaching a nonexistent peering object.
+        name_set_callback=peering.publish_name_set if peering is not None else None,
+        name_clear_callback=peering.publish_name_clear if peering is not None else None,
     )
 
     api.start()
     remote_api.start()
-    peering.start()
+    if peering is not None:
+        peering.start()
     names_api.start()
 
     # Sprint 004 ticket 006: the robot-console-compatibility pool port,
@@ -925,37 +1057,98 @@ def _run_registry(args: argparse.Namespace, stop_event: threading.Event) -> int:
     # limitation, not solved here -- sprint.md leaves the exact mechanism
     # an implementer's choice ("defaults, or query the peer's remote
     # API/TXT-equivalent over TCP").
-    for host, port in peer_specs:
-        peering.connect_peer(host, host, peer_pub_port, peer_snapshot_port, remote_port=port)
+    # Sprint 007, ticket 005: --no-peering means there is no live
+    # PeerDiscovery to connect an explicit --peer through -- skip the
+    # loop entirely rather than crash on None.connect_peer(...). A
+    # --peer given alongside --no-peering is a no-op, noted to stderr
+    # (still never stdout -- see --ready-json's own "only thing printed
+    # to stdout" contract below).
+    if peering is not None:
+        for host, port in peer_specs:
+            peering.connect_peer(
+                host, host, peer_pub_port, peer_snapshot_port, remote_port=port
+            )
+    elif peer_specs:
+        print(
+            "mbregistry: --peer ignored -- peering is disabled (--no-peering)",
+            file=sys.stderr,
+        )
 
-    peer_note = f", {len(peer_specs)} explicit peer(s)" if peer_specs else ""
     pool_note = (
         f", relay pool on {relay_pool.bound_port}" if relay_pool is not None else ""
     )
     names_api_note = f", names API on {names_api.bound_port}"
+    if peering is not None:
+        peer_note = f", {len(peer_specs)} explicit peer(s)" if peer_specs else ""
+        peering_note = (
+            f", peering active (pub {peer_pub_port}, snapshot {peer_snapshot_port}"
+            f"{peer_note})"
+        )
+    else:
+        peering_note = ", peering disabled (--no-peering)"
     print(
         f"mbregistry: listening on {socket_path} (local api), "
-        f"{remote_api.bound_port} (remote api), store at {db_path}, "
-        f"peering active (pub {peer_pub_port}, snapshot {peer_snapshot_port}"
-        f"{peer_note}){pool_note}{names_api_note}",
+        f"{remote_api.bound_port} (remote api), store at {db_path}"
+        f"{peering_note}{pool_note}{names_api_note}",
         file=sys.stderr,
     )
+
+    # Sprint 007, ticket 005: --ready-json. Printed only once every
+    # listener requested above is actually started/bound (this point,
+    # after peering.start()/relay_pool.start()/names_api.start() and the
+    # explicit --peer connects above, immediately before the poll loop
+    # starts), and only to stdout -- every other diagnostic this
+    # function prints goes to stderr (the line above), so --ready-json's
+    # stdout stays parseable by a spawning parent
+    # (docs/design/robot-console-integration.md Sec.4 item 4/Sec.5 item
+    # 6). `ports` carries only the ports actually applicable: `peer_pub`/
+    # `peer_snapshot` are omitted under --no-peering, `pool` is omitted
+    # under --no-relay-pool. Every value here is the port actually
+    # bound, not merely the one requested -- the same "advertise what's
+    # bound" contract ticket 004 established for `pool`/`names`
+    # specifically (`relay_pool.bound_port`/`names_api.bound_port`,
+    # already real-bound-aware for `--pool-port 0`/`--names-port 0`);
+    # `remote` uses RemoteAPIServer's own `bound_port` property, same
+    # reasoning. `peer_pub`/`peer_snapshot` are the one exception --
+    # they report the resolved *requested* values, matching the
+    # diagnostic stderr line above, because `PeerDiscovery` (sprint.md
+    # Step 3: "existing, unmodified" this sprint) exposes no bound-port
+    # equivalent for its own ZeroMQ sockets to read back from.
+    if args.ready_json:
+        ports: dict[str, int] = {"remote": remote_api.bound_port}
+        if peering is not None:
+            ports["peer_pub"] = peer_pub_port
+            ports["peer_snapshot"] = peer_snapshot_port
+        if relay_pool is not None:
+            ports["pool"] = relay_pool.bound_port
+        ports["names"] = names_api.bound_port
+        ready_payload = {
+            "ready": True,
+            "instance": instance if instance is not None else _short_hostname(),
+            "socket": str(socket_path),
+            "ports": ports,
+        }
+        print(json.dumps(ready_payload))
+
     try:
         daemon.run(interval_s=args.interval, stop=stop_event.is_set)
     finally:
-        # Stop order matters (this ticket's own acceptance criterion):
+        # Stop order matters (ticket 009's own acceptance criterion):
         # peering, remote_api, the relay pool, and the names API can each
         # still touch store/locks up until they're stopped, so all four
         # must be stopped -- and every thread they own joined -- before
         # api.stop() and, last of all, store.close(). api.stop() already
-        # joins its own handler threads (unchanged from before this
-        # ticket); peering.stop()/remote_api.stop()/relay_pool.stop()/
+        # joins its own handler threads (unchanged from before ticket
+        # 009); peering.stop()/remote_api.stop()/relay_pool.stop()/
         # names_api.stop() do the same for their own threads (see each
         # class's own "stoppable, every thread joined" docstring note).
+        # Sprint 007, ticket 005: peering may be None (--no-peering) --
+        # skip stopping what was never started.
         names_api.stop()
         if relay_pool is not None:
             relay_pool.stop()
-        peering.stop()
+        if peering is not None:
+            peering.stop()
         remote_api.stop()
         api.stop()
         store.close()
@@ -1300,6 +1493,35 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         metavar="UID",
         help="never claim/probe this uid (repeatable)",
+    )
+    run_p.add_argument(
+        "--ready-json",
+        action="store_true",
+        help=(
+            'print one JSON line (\'{"ready": true, "instance": ..., '
+            "\"socket\": ..., \"ports\": {...}}') to stdout once every "
+            "requested listener is bound, for a parent process spawning "
+            "this as a child (docs/design/robot-console-integration.md "
+            "Sec.4 item 4); no other stdout output occurs under this flag"
+        ),
+    )
+    run_p.add_argument(
+        "--exit-with-parent",
+        action="store_true",
+        help=(
+            "exit cleanly (the same shutdown path SIGTERM already takes) "
+            "when stdin reaches EOF -- for a parent process that wants "
+            "this instance's lifetime tied to its own"
+        ),
+    )
+    run_p.add_argument(
+        "--no-peering",
+        action="store_true",
+        help=(
+            "skip mDNS advertising/browsing and the ZeroMQ peering event "
+            "bus entirely -- for a short-lived, single-user instance "
+            "that should not join the fleet"
+        ),
     )
     run_p.set_defaults(func=cmd_run)
 
