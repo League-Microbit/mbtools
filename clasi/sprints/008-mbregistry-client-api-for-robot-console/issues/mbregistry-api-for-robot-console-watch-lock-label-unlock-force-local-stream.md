@@ -1,7 +1,13 @@
 ---
-status: pending
+status: in-progress
 split_from: robot-console-on-mbregistry-multi-instance-and-spawn-support.md
 sprint: 008
+tickets:
+- 008-001
+- 008-002
+- 008-003
+- 008-004
+- 008-005
 ---
 
 # mbregistry client API for robot-console: watch, lock label and since, unlock --force, stream on the local socket
