@@ -1,9 +1,21 @@
 ---
 id: '006'
 title: 'Documentation: docs/service.md and docs/design/registry-api.md'
-status: open
-use-cases: [SUC-002, SUC-003, SUC-004, SUC-005, SUC-006, SUC-007, SUC-008]
-depends-on: ['001', '002', '003', '004', '005']
+status: done
+use-cases:
+- SUC-002
+- SUC-003
+- SUC-004
+- SUC-005
+- SUC-006
+- SUC-007
+- SUC-008
+depends-on:
+- '001'
+- '002'
+- '003'
+- '004'
+- '005'
 github-issue: ''
 issue:
 - name-silent-boards-over-swd-and-keep-list-table-clean.md
@@ -64,31 +76,31 @@ longer matches the three-way state model.
 
 ## Acceptance Criteria
 
-- [ ] `docs/service.md` §1's "run exactly one per host" framing
+- [x] `docs/service.md` §1's "run exactly one per host" framing
       accurately reflects when multiple instances are and aren't
       supported.
-- [ ] `docs/service.md` §4's port table includes `--pool-port`/
+- [x] `docs/service.md` §4's port table includes `--pool-port`/
       `--names-port` with correct default/override columns.
-- [ ] `docs/service.md` §5's flags table includes every new flag from
+- [x] `docs/service.md` §5's flags table includes every new flag from
       this sprint, each with its correct env var and default.
-- [ ] `docs/service.md` documents the `--ready-json`/
+- [x] `docs/service.md` documents the `--ready-json`/
       `--exit-with-parent`/`--no-peering` spawn recipe with a working
       example command.
-- [ ] `docs/service.md` has a one-line upgrade note for the `STATE`
+- [x] `docs/service.md` has a one-line upgrade note for the `STATE`
       meaning change.
-- [ ] `docs/design/registry-api.md` documents the new `STATE` value,
+- [x] `docs/design/registry-api.md` documents the new `STATE` value,
       chip-identity fields, and `--json` structured field, matching
       what tickets 001/003 actually implemented (verify against the
       merged code, not against sprint.md's own draft names — sprint.md
       Open Question 1 left the exact constant name to the implementing
       ticket).
-- [ ] `docs/design/registry-api.md` cross-references
+- [x] `docs/design/registry-api.md` cross-references
       `docs/design/robot-console-integration.md` §5 for completed vs.
       pending items.
-- [ ] No example `mbregistry list`/`mbdeploy list` table anywhere in
+- [x] No example `mbregistry list`/`mbdeploy list` table anywhere in
       `docs/` still shows the old two-way `no-firmware` state as the
       only "no announcement" case.
-- [ ] Every path/port/flag/env-var claim in the edited sections is
+- [x] Every path/port/flag/env-var claim in the edited sections is
       re-checked against the actual merged source and `--help` output
       (per `docs/service.md`'s own stated editorial standard), not
       copied from sprint.md's draft text verbatim.
@@ -117,3 +129,91 @@ list against what's documented.
 
 **Documentation updates**: this ticket *is* the documentation update for
 the whole sprint — see Description above for the full list.
+
+## Implementation Notes
+
+Read the actual merged code (`cli.py`, `claims.py`, `store.py`,
+`render.py`, `identity.py`, `paths.py`, `console_compat/relay_pool.py`)
+and every done ticket's own Implementation Notes before writing any doc
+text, per this ticket's own Approach — no flag name, default, or state
+constant was copied from sprint.md's draft text. Cross-checked against
+real `mbregistry run --help`/`mbregistry --help` output, and against a
+real `mbregistry run --ready-json --exit-with-parent --no-peering`
+invocation (ephemeral ports, a short-path tmp socket/db) to confirm the
+`--ready-json` payload shape and the `peer_pub`/`peer_snapshot`-omitted-
+under-`--no-peering` behavior documented below actually matches (caught
+and fixed one self-inconsistency in the docs' own spawn-recipe example
+this way: an earlier draft's sample `--ready-json` output still showed
+`peer_pub`/`peer_snapshot` despite the sample command using
+`--no-peering`).
+
+**`docs/service.md`**:
+- §1 rewritten: "exactly one per host" is now conditional — lists what
+  must be distinct across instances (ports, `--socket`, `--instance`)
+  and the cross-instance claim that arbitrates board access, while
+  keeping "exactly one, unless you have a concrete reason" as the
+  default mental model. Two instances left at colliding default ports
+  still fail to bind, unchanged.
+- §4: `--pool-port`/`$MBREGISTRY_POOL_PORT` and
+  `--names-port`/`$MBREGISTRY_NAMES_PORT` added to the port table
+  (values confirmed against `console_compat/relay_pool.py`'s
+  `DEFAULT_POOL_PORT = 7444`/`DEFAULT_NAMES_API_PORT = 7445`); the mDNS
+  table's "Instance name" column now says `--instance`/
+  `$MBREGISTRY_INSTANCE`, else host name, for both service types.
+- §5: all nine new `run` flags added to the flags table (confirmed
+  verbatim against `build_parser`'s `add_argument` calls and a live
+  `--help` run); a new "Cross-instance board claim" subsection (the
+  ticket's own note that `registry-api.md` should get this content led
+  to giving `service.md` the operator-facing version too, since it's an
+  operational concept an operator configuring `--only-uid`/
+  `--exclude-uid` needs, not just a wire-protocol detail); a new "Spawn
+  recipe" subsection with the three-flag example command, verified by
+  actually running it (see above) rather than hand-typing the expected
+  output.
+- §11: one-line upgrade note on the `STATE_CONNECTED_NO_FIRMWARE`
+  meaning narrowing, "relabels on next real event, no backfill" per
+  sprint.md's Migration Concerns/Open Question 3 (documented as the
+  chosen behavior, not flagged as still-open — no stakeholder objection
+  surfaced during tickets 001-005).
+
+**`docs/design/registry-api.md`**:
+- `list`'s response JSON example gained `attached_no_announce` in the
+  `state` enum and the two `chip_identity_*` fields, plus prose
+  explaining the `connected_no_firmware` meaning narrowing, the
+  STATE/FIRMWARE cell rendering for both states, the `NAME`-fallback
+  behavior, and the "no more free-text line after the table" change.
+- New "Cross-instance board claim" section (top-level `##`, placed
+  before "Locking and connection lifetime" since it's a third kind of
+  exclusivity alongside that section and the peer-replicated lock
+  cache) — this doc had no prior claim/exclusivity write-up to extend,
+  confirmed by grepping for "claim"/"exclusiv" before writing it, so a
+  new section was added per the ticket's own contingency instruction.
+- "Known limitations" gained two new bullets: the peering-payload
+  chip-identity gap (already flagged in ticket 003's Implementation
+  Notes as not this sprint's scope) and a cross-reference to
+  `docs/design/robot-console-integration.md` §5 naming items 1/4/5/6 as
+  completed this sprint and 2/3/7/8 as pending (sprint 008).
+
+**Stale-example sweep**: grepped `docs/` and `README.md` for
+`STATE`/`no-firmware`/`no firmware`. Two design docs
+(`docs/design/usecases.md` UC-001/UC-002/UC-004,
+`docs/design/specification.md` §3.8) still describe the old two-state
+model in prose, but neither has an actual example `list`/`mbdeploy list`
+*table* (the acceptance criterion's own scope) — they're the original
+project-initiation brief/use-case documents, never updated for any
+later sprint's table changes either (e.g. sprint 003's HOST column is
+also absent from UC-004's prose), so leaving them as a historical
+initial-brief snapshot follows existing precedent rather than scope
+creep. Two files under `docs/acceptance/` (`002-hardware.md`,
+`004-hardware.md`) contain real captured `list` table output from past
+hardware sessions; left untouched as immutable session records (one
+shows `STATE=gone`, unaffected by this sprint's split; neither shows a
+`no-firmware` row being used to represent "didn't announce"). No
+example table anywhere in `docs/`/`README.md` shows the old two-way
+model.
+
+**Testing**: no automated test changes (documentation-only ticket, per
+the ticket's own Testing plan). Verified `mbregistry --help`/
+`mbregistry run --help` output against every documented flag/default.
+Ran `uv run pytest tests/registry/cli -q` (103 passed) as a sanity check
+that this session's doc-only edits didn't touch any source file.
