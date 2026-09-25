@@ -31,17 +31,23 @@ Install from GitHub: `pip install "git+https://github.com/League-Microbit/mbtool
 [`uv`](https://docs.astral.sh/uv/) (`uv sync` in a checkout, see
 [Development](#development) below).
 
-On Linux, run `mbregistry install-service` once, as root, before running
-`mbregistry` as a real daemon — it writes the systemd unit and a udev rule
-(so a non-root user in the `plugdev` group can access the boards) and
-prints the `systemctl`/`udevadm`/`usermod` follow-up commands; see
-`mbregistry install-service --help`. On macOS, `install-service` is not
-supported; run it under launchd with the plists in
-[docs/service.md](docs/service.md#7-macos-launchd), or in the foreground.
-On Windows, `mbregistry install-service` prints the `sc.exe` commands that
-register it with the Service Control Manager (`mbregistry run
---windows-service` is what that service invokes); Windows support has not
-been verified on real hardware.
+On Linux and macOS, run `mbregistry service install (--user | --system)`
+once to install *and start* the daemon at whichever scope you want
+(`--system` needs root/sudo and starts at boot; `--user` starts at login,
+no root). `service uninstall (--user | --system) [--purge]` stops and
+removes it; `service status` reports both scopes; `--dry-run` on
+`install`/`uninstall` previews without touching anything. See
+[docs/service.md](docs/service.md#6-linux-systemd-service-and-udev-rule)
+(Linux) and
+[docs/service.md](docs/service.md#7-macos-launchd) (macOS) for the full
+per-platform mechanics, including the Linux `--user` `plugdev`/udev
+prerequisite. `mbregistry install-service` (Linux/macOS) is deprecated —
+a hidden alias for `service install --system`, kept for one release.
+On Windows, `mbregistry service ...` is not supported;
+`mbregistry install-service` remains the only install path there — it
+prints the `sc.exe` commands that register it with the Service Control
+Manager (`mbregistry run --windows-service` is what that service
+invokes); Windows support has not been verified on real hardware.
 
 `mbregistry run` needs no flags. It keeps its database and local API socket
 in the right place for the platform and the user running it:

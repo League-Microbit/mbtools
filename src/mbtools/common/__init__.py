@@ -52,6 +52,13 @@ EXIT_NO_DAEMON = 3  # api socket not present/unreachable -- UC-004's error flow
 EXIT_NO_DEVICE = 4  # CODE_NOT_FOUND -- "no such device"
 EXIT_LOCKED = 5  # CODE_LOCKED -- device already locked by someone else
 EXIT_HARDWARE = 6  # a flash op ran and failed
+#: sprint 006's own new failure category -- ``mbregistry service install
+#: --user`` (Linux) refused because the operating user isn't (yet) in
+#: ``plugdev`` and/or the system-scope udev rule doesn't exist yet (see
+#: ``registry.service.LinuxUserPreflightError``). A distinct code, not a
+#: reuse of ``EXIT_ERROR``, so scripts/Ansible can tell "refused, here are
+#: the exact sudo commands to run" apart from a generic failure.
+EXIT_LINUX_USER_PREFLIGHT = 7
 
 #: Protocol-level error codes carried on every ``{"ok": false, "code":
 #: ..., "error": ...}`` response from :mod:`mbtools.registry.api`. A

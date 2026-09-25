@@ -14,8 +14,6 @@ import pytest
 
 import mbtools.registry.paths as paths_module
 from mbtools.registry.paths import (
-    LINUX_SYSTEM_UNIT_PATH,
-    LINUX_UDEV_RULE_PATH,
     client_socket_candidates,
     default_db_path,
     default_pipe_name,
@@ -234,24 +232,13 @@ def test_linux_user_unit_path(as_platform):
     )
 
 
-def test_linux_system_unit_path_matches_cli_default_unit_path():
-    """Not a new value -- LINUX_SYSTEM_UNIT_PATH must equal
-    registry.cli's own DEFAULT_UNIT_PATH (ticket 008) exactly, so the
-    two never silently drift apart before ticket 006-004 unifies them
-    into a single definition (see paths.py's "service artifacts"
-    module comment)."""
-    from mbtools.registry.cli import DEFAULT_UNIT_PATH
-
-    assert LINUX_SYSTEM_UNIT_PATH == DEFAULT_UNIT_PATH == Path(
-        "/etc/systemd/system/mbregistry.service"
-    )
-
-
-def test_linux_udev_rule_path_matches_cli_default_udev_rule_path():
-    """Same guarantee as test_linux_system_unit_path_matches_cli_default_unit_path,
-    for the udev rule path."""
-    from mbtools.registry.cli import DEFAULT_UDEV_RULE_PATH
-
-    assert LINUX_UDEV_RULE_PATH == DEFAULT_UDEV_RULE_PATH == Path(
-        "/etc/udev/rules.d/99-mbregistry-cmsis-dap.rules"
-    )
+#: Ticket 006-004 note: this file used to carry
+#: test_linux_system_unit_path_matches_cli_default_unit_path/
+#: test_linux_udev_rule_path_matches_cli_default_udev_rule_path, a pair of
+#: cross-check tests guarding against LINUX_SYSTEM_UNIT_PATH/
+#: LINUX_UDEV_RULE_PATH (this module) silently drifting from
+#: registry.cli's own DEFAULT_UNIT_PATH/DEFAULT_UDEV_RULE_PATH. Ticket
+#: 006-004 unified them -- registry.cli's two constants are now plain
+#: aliases onto this module's values (``DEFAULT_UNIT_PATH =
+#: LINUX_SYSTEM_UNIT_PATH``, see cli.py) -- so drift is no longer
+#: possible and the cross-check tests were deleted rather than kept.

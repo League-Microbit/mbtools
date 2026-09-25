@@ -231,12 +231,37 @@ and interfaces whose names start with `docker`, `br-`, `veth`, `virbr`,
 `mbdeploy deploy --repo` caches downloaded hex files in
 `~/.cache/mbtools/hex/<owner>/<repo>/<tag>/`.
 
-### `mbregistry install-service`
+### `mbregistry service install` / `uninstall` / `status`
+
+```text
+mbregistry service install   (--user | --system) [--dry-run]
+mbregistry service uninstall (--user | --system) [--purge] [--dry-run]
+mbregistry service status
+```
+
+`--user`/`--system` is required and mutually exclusive on `install`/`uninstall` —
+there is no default scope.
+
+| Subcommand | Flag | Meaning |
+|---|---|---|
+| `install` | `--user` \| `--system` | Required, mutually exclusive. `--system` needs root/sudo. |
+| `install` | `--dry-run` | Print what would be written and run; touch nothing. |
+| `uninstall` | `--user` \| `--system` | Required, mutually exclusive. |
+| `uninstall` | `--purge` | Also remove `devices.db` (kept by default). |
+| `uninstall` | `--dry-run` | Print what would be stopped and removed; touch nothing. |
+| `status` | (none) | Reports both scopes' installed/running state and paths. |
+
+Not supported on Windows: every `service` subcommand exits nonzero with
+`mbregistry: service ... is not supported on Windows` (section 8).
+
+### `mbregistry install-service` (deprecated)
+
+Hidden from `--help`. Kept for one release as an alias for
+`mbregistry service install --system` — see section 11 ("Upgrading") for the
+removal window.
 
 | Flag | Default |
 |---|---|
-| `--output PATH` | `/etc/systemd/system/mbregistry.service` |
-| `--udev-output PATH` | `/etc/udev/rules.d/99-mbregistry-cmsis-dap.rules` |
 | `--user NAME` | `$SUDO_USER`, then `$USER`, then the current user. Only affects the printed `usermod` line. |
 
 ## 6. Linux: systemd service and udev rule
@@ -244,28 +269,42 @@ and interfaces whose names start with `docker`, `br-`, `veth`, `virbr`,
 ### 6.1 Install the service
 
 ```sh
-sudo /opt/mbtools/bin/mbregistry install-service
+sudo /opt/mbtools/bin/mbregistry service install --system
 ```
 
-This **writes two files and prints the follow-up commands without running
-them**:
+This **writes the unit and udev rule, and loads and starts the service** —
+unlike the old `install-service`, nothing is left to run by hand:
 
 ```sh
-sudo systemctl daemon-reload
-sudo systemctl enable --now mbregistry.service
-sudo udevadm control --reload-rules
-sudo udevadm trigger
-sudo usermod -aG plugdev <you>     # then log in again (new SSH session)
+systemctl daemon-reload
+systemctl enable --now mbregistry.service
+udevadm control --reload-rules
+udevadm trigger
+usermod -aG plugdev <you>     # then log in again (new SSH session)
 ```
 
+`--dry-run` prints exactly these steps without writing or running anything —
+useful to preview before running as root.
+
 It is idempotent. Re-running rewrites both files with identical content and
-never starts, stops, or restarts the service. Without root it fails with
-`mbregistry: could not write /etc/systemd/system/mbregistry.service: ...`
-and exits 1.
+reloads/re-enables the service — no duplicate rule file, no second service
+instance. Without root it fails and exits 1.
 
 Run it with the venv you want the service to use (`/opt/mbtools/bin/...`).
 The unit's `ExecStart=` is the Python interpreter of whoever ran
-`install-service`.
+`service install`.
+
+**Per-user, no root (starts at login instead of boot):**
+
+```sh
+mbregistry service install --user
+```
+
+Needs the operator already in `plugdev`, and the system-scope udev rule
+already written — both are one-time root-run steps (see 6.3). Without them,
+`install --user` refuses and prints the exact `sudo` commands to run first,
+rather than installing a daemon that can't open the boards (a lingering user
+service has no logind seat, so `uaccess` alone grants nothing).
 
 ### 6.2 The unit it writes (`/etc/systemd/system/mbregistry.service`)
 
@@ -292,8 +331,8 @@ WantedBy=multi-user.target
 - It runs as root, so the paths are `/var/lib/mbregistry/devices.db` and
   `/run/mbregistry/api.sock`. `StateDirectory=` and `RuntimeDirectory=`
   create exactly those directories.
-- **To add flags or env vars, don't edit the unit.** `install-service`
-  overwrites it. Use a drop-in (`sudo systemctl edit mbregistry.service`):
+- **To add flags or env vars, don't edit the unit.** `service install`
+  overwrites it on every run. Use a drop-in (`sudo systemctl edit mbregistry.service`):
 
   ```ini
   [Service]
@@ -312,10 +351,10 @@ WantedBy=multi-user.target
 
 ```udev
 # mbregistry -- non-root access to the micro:bit DAPLink interface
-# (VID:PID 0d28:0204). Written by `mbregistry install-service`
-# (ticket 008) -- re-running it overwrites this file with identical
-# content, so re-running install-service is idempotent. See
-# mbtools.registry.cli.render_udev_rule()'s docstring for why each rule
+# (VID:PID 0d28:0204). Written by `mbregistry service install`
+# (ticket 006-003) -- re-running it overwrites this file with identical
+# content, so re-running install is idempotent. See
+# mbtools.registry.service.render_udev_rule()'s docstring for why each rule
 # below grants access via both the plugdev group and uaccess rather than
 # just one of the two.
 
@@ -349,21 +388,34 @@ journalctl -u mbregistry -f                      # follow the log
 mbregistry list                                  # works as a normal user
 ```
 
-Uninstall:
+To uninstall, see 6.5.
+
+### 6.5 Uninstall
 
 ```sh
-sudo systemctl disable --now mbregistry
-sudo rm /etc/systemd/system/mbregistry.service /etc/udev/rules.d/99-mbregistry-cmsis-dap.rules
-sudo systemctl daemon-reload && sudo udevadm control --reload-rules
-sudo rm -rf /opt/mbtools /var/lib/mbregistry    # optional: code and database
+sudo mbregistry service uninstall --system     # stop, unload, remove the unit + udev rule
+mbregistry service uninstall --user             # per-user scope
 ```
+
+Stops and disables the service, removes the unit file (and, for `--system`,
+the udev rule too, then reruns `daemon-reload`/`udevadm control
+--reload-rules`), and removes the socket file. **Keeps `devices.db`** unless
+`--purge` is given, in which case the whole state directory is removed too.
+Never removes the operator from `plugdev`.
+
+Safe to run even when nothing is installed at that scope — it says so and
+exits 0 (safe to call repeatedly, e.g. from Ansible), naming the other scope
+if *it* has an install. `--dry-run` prints what would be stopped and removed
+without touching anything.
+
+To remove the code itself afterward: `sudo rm -rf /opt/mbtools`.
 
 ## 7. macOS: launchd
 
-`mbregistry install-service` does **not** support macOS; it writes systemd
-files. Use one of the two plists below. No USB drivers or udev equivalent
-are needed on macOS. A normal user can open the micro:bit's serial and
-CMSIS-DAP interfaces.
+`mbregistry service install` supports both scopes on macOS —
+`--system` (a LaunchDaemon) and `--user` (a LaunchAgent). No USB drivers or
+udev equivalent are needed on macOS. A normal user can open the micro:bit's
+serial and CMSIS-DAP interfaces.
 
 | | LaunchDaemon (root) | LaunchAgent (one user) |
 |---|---|---|
@@ -389,56 +441,66 @@ interpreter.
 Install into `/opt/mbtools` (section 2.1). Then:
 
 ```sh
-sudo tee /Library/LaunchDaemons/org.jointheleague.mbregistry.plist >/dev/null <<'EOF'
+sudo mbregistry service install --system
+```
+
+This writes the plist below and runs the three `launchctl` steps
+(`bootout` — tolerating "wasn't loaded" on a fresh install — then `enable`,
+then `bootstrap system`), so the service is running immediately afterward.
+`--dry-run` prints the plist and the three commands without touching
+anything.
+
+Rendered plist (`/Library/LaunchDaemons/org.jointheleague.mbregistry.plist`),
+shown here for reference — generated by `render_launchd_plist()`, not
+hand-typed:
+
+```xml
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>Label</key>
-    <string>org.jointheleague.mbregistry</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/opt/mbtools/bin/python</string>
-        <string>-m</string>
-        <string>mbtools.registry.cli</string>
-        <string>run</string>
-    </array>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PYTHONUNBUFFERED</key>
-        <string>1</string>
-    </dict>
-    <key>WorkingDirectory</key>
-    <string>/</string>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>
-        <false/>
-    </dict>
-    <key>ThrottleInterval</key>
-    <integer>10</integer>
-    <key>StandardOutPath</key>
-    <string>/Library/Logs/mbregistry.log</string>
-    <key>StandardErrorPath</key>
-    <string>/Library/Logs/mbregistry.log</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PYTHONUNBUFFERED</key>
+		<string>1</string>
+	</dict>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>Label</key>
+	<string>org.jointheleague.mbregistry</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/opt/mbtools/bin/python</string>
+		<string>-m</string>
+		<string>mbtools.registry.cli</string>
+		<string>run</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Library/Logs/mbregistry.log</string>
+	<key>StandardOutPath</key>
+	<string>/Library/Logs/mbregistry.log</string>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>WorkingDirectory</key>
+	<string>/</string>
 </dict>
 </plist>
-EOF
-sudo chown root:wheel /Library/LaunchDaemons/org.jointheleague.mbregistry.plist
-sudo chmod 644        /Library/LaunchDaemons/org.jointheleague.mbregistry.plist
-plutil -lint          /Library/LaunchDaemons/org.jointheleague.mbregistry.plist
-
-sudo launchctl enable    system/org.jointheleague.mbregistry
-sudo launchctl bootstrap system /Library/LaunchDaemons/org.jointheleague.mbregistry.plist
-sudo launchctl kickstart -k system/org.jointheleague.mbregistry   # (re)start now
 ```
 
-To add flags, append more `<string>` elements to `ProgramArguments` (e.g.
-`--no-relay-pool`, `--peer`, `other-host`). To set an env var such as
-`MBREGISTRY_TOKEN`, add it to `EnvironmentVariables`. After editing, run
-`bootout` and then `bootstrap` again.
+`ProgramArguments[0]` is the Python interpreter that ran `service install`
+(here, `/opt/mbtools/bin/python`). `service install` regenerates and
+overwrites this file on every run — there is no systemd-style drop-in for
+launchd. To add flags (`--peer`, `--no-relay-pool`, …) or env vars
+(`MBREGISTRY_TOKEN`), hand-edit `ProgramArguments`/`EnvironmentVariables`
+after installing, then reload with `sudo launchctl bootout
+system/org.jointheleague.mbregistry && sudo launchctl bootstrap system
+/Library/LaunchDaemons/org.jointheleague.mbregistry.plist` — and avoid
+re-running `service install` afterward, which would overwrite your edits.
 
 Manage it:
 
@@ -452,60 +514,23 @@ tail -f /Library/Logs/mbregistry.log
 
 ### 7.2 LaunchAgent (one user, starts at login)
 
-launchd doesn't expand `~`, so the heredoc below writes absolute paths from
-`$HOME`. Install into `~/.local/share/mbtools` (section 2.2) first.
+Install into `~/.local/share/mbtools` (section 2.2), or `uv tool install`,
+first. Then, as yourself (no `sudo`):
 
 ```sh
-mkdir -p ~/Library/LaunchAgents ~/Library/Logs
-cat > ~/Library/LaunchAgents/org.jointheleague.mbregistry.plist <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>org.jointheleague.mbregistry</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>$HOME/.local/share/mbtools/bin/python</string>
-        <string>-m</string>
-        <string>mbtools.registry.cli</string>
-        <string>run</string>
-    </array>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PYTHONUNBUFFERED</key>
-        <string>1</string>
-    </dict>
-    <key>WorkingDirectory</key>
-    <string>$HOME</string>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>
-        <false/>
-    </dict>
-    <key>ThrottleInterval</key>
-    <integer>10</integer>
-    <key>StandardOutPath</key>
-    <string>$HOME/Library/Logs/mbregistry.log</string>
-    <key>StandardErrorPath</key>
-    <string>$HOME/Library/Logs/mbregistry.log</string>
-</dict>
-</plist>
-EOF
-plutil -lint ~/Library/LaunchAgents/org.jointheleague.mbregistry.plist
-
-launchctl enable    gui/$(id -u)/org.jointheleague.mbregistry
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/org.jointheleague.mbregistry.plist
-launchctl kickstart -k gui/$(id -u)/org.jointheleague.mbregistry
+mbregistry service install --user
 ```
 
-If you used `uv tool install` instead, point `ProgramArguments[0]` at that
-tool's interpreter. Find it with
-`head -1 "$(command -v mbregistry)"`, which prints the shebang line.
+Writes `~/Library/LaunchAgents/org.jointheleague.mbregistry.plist` — the
+same shape as 7.1's plist, but with `ProgramArguments[0]` set to whichever
+interpreter ran `service install` (find it with `head -1 "$(command -v
+mbregistry)"` if you used `uv tool install`), `WorkingDirectory` set to
+`$HOME`, and the log at `~/Library/Logs/mbregistry.log` — and runs
+`launchctl bootout`/`enable`/`bootstrap gui/$(id -u)` instead of the
+system-scope `bootstrap system`. `--dry-run` previews without touching
+anything.
 
-Manage it with the same verbs as above, using `gui/$(id -u)` in place of
+Manage it with the same verbs as 7.1, using `gui/$(id -u)` in place of
 `system`, no `sudo`, and the log at `~/Library/Logs/mbregistry.log`.
 
 ### 7.3 macOS notes
@@ -521,11 +546,31 @@ Manage it with the same verbs as above, using `gui/$(id -u)` in place of
   daemon may run per host. Then run `mbregistry run` (as yourself) or
   `sudo mbregistry run` (to use the system paths).
 
+### 7.4 Uninstall
+
+```sh
+sudo mbregistry service uninstall --system     # stop, unload, remove the plist
+mbregistry service uninstall --user             # per-user scope, no sudo
+```
+
+Same behavior as Linux's `service uninstall` (6.5): stops and unloads the
+service, removes the plist and log file, keeps `devices.db` unless
+`--purge` is given, and is a safe, exit-0 no-op when nothing is installed
+at that scope. `--dry-run` previews without touching anything.
+
 ## 8. Windows: SCM service (not hardware-verified)
 
 > **Not verified on real hardware.** The Windows code paths (named-pipe API,
 > SCM integration, `%ProgramData%` paths) are covered only by unit tests
 > with fakes. Nobody has run them against a real board on Windows yet.
+
+> **`mbregistry service install`/`uninstall`/`status` are not supported on
+> Windows.** Every one exits nonzero with `mbregistry: service ... is not
+> supported on Windows` and never touches this section's SCM code at all.
+> `install-service` (below) remains the only Windows install path — it is
+> deprecated elsewhere (section 5, section 11) but unaffected on Windows,
+> per the stakeholder's explicit "leave Windows code alone" decision for
+> sprint 006.
 
 Install into a venv, for example `C:\mbtools`:
 
@@ -638,24 +683,37 @@ Upgrades keep the database. The schema migrates itself on start.
 ```sh
 # Linux, /opt venv
 sudo /opt/mbtools/bin/pip install --upgrade "git+https://github.com/League-Microbit/mbtools.git"   # or @<tag>
-sudo /opt/mbtools/bin/mbregistry install-service     # idempotent; picks up any unit/rule change
-sudo systemctl daemon-reload
-sudo systemctl restart mbregistry
+sudo /opt/mbtools/bin/mbregistry service install --system     # idempotent; rewrites and restarts
 mbregistry list
 
 # macOS LaunchDaemon
 sudo /opt/mbtools/bin/pip install --upgrade "git+https://github.com/League-Microbit/mbtools.git"
-sudo launchctl kickstart -k system/org.jointheleague.mbregistry
+sudo /opt/mbtools/bin/mbregistry service install --system     # idempotent; rewrites and restarts
 
 # uv tool (per user)
 uv tool install --reinstall "git+https://github.com/League-Microbit/mbtools.git"
+mbregistry service install --user
 ```
 
 If you **recreate** the venv instead of upgrading it (e.g. `uv venv
---clear`), stop the service first. The running root daemon leaves root-owned
-`__pycache__` files that a non-root rebuild can't delete. Upgrade one host
-at a time and check `mbregistry list` on it and on one peer before moving
-on.
+--clear`), stop the service first (`service uninstall`, or the platform's
+own stop verb). The running root daemon leaves root-owned `__pycache__`
+files that a non-root rebuild can't delete. Upgrade one host at a time and
+check `mbregistry list` on it and on one peer before moving on.
+
+**A host with a previous `install-service`-written systemd unit/udev rule**
+is upgraded in place the same way: re-running `service install --system`
+overwrites both files with equivalent (system-scope) content and, this
+time, also enables and starts the service — an explicit behavior change
+from "write only" to "write and start."
+
+**`install-service` is deprecated** (section 5) — a hidden alias for
+`service install --system`, kept for exactly one release so a script that
+still invokes it does not suddenly start and enable a real service it
+never asked to run. It prints a deprecation notice to stderr on every
+invocation and will be removed in the release after this one. Migrate any
+script or Ansible task that calls `install-service` to `service install
+--system` before then.
 
 ## 12. Logs
 
@@ -689,6 +747,7 @@ scripts instead of parsing text:
 | 4 | no such device |
 | 5 | device locked by someone else |
 | 6 | a flash ran and failed |
+| 7 | `mbregistry service install --user` (Linux) refused: the operator isn't in `plugdev` and/or the system-scope udev rule doesn't exist yet — see the printed `sudo` commands |
 | 130 | `mbdeploy` interrupted by Ctrl-C |
 
 A quick health check for agents, run on the host:
@@ -777,9 +836,9 @@ id                                      # want: plugdev in the list
 ls /etc/udev/rules.d/99-mbregistry-cmsis-dap.rules
 ```
 
-Fix: run `sudo mbregistry install-service` if the rule is missing, then
-`sudo udevadm control --reload-rules && sudo udevadm trigger`, then
-`sudo usermod -aG plugdev $USER`, and **log in again** (new SSH session).
+Fix: run `sudo mbregistry service install --system` if the rule is missing
+(it also reloads the udev rules and adds you to `plugdev`), then **log in
+again** (new SSH session) for the new group membership to take effect.
 Group membership doesn't apply to an existing session. Stopgap: `sudo
 mbserial ...`. The daemon itself runs as root and is never affected.
 

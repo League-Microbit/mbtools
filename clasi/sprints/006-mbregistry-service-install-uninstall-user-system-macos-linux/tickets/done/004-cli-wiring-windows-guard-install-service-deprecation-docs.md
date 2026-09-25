@@ -1,9 +1,16 @@
 ---
 id: '004'
 title: CLI wiring, Windows guard, install-service deprecation, docs
-status: open
-use-cases: [SUC-001, SUC-002, SUC-003, SUC-004, SUC-005]
-depends-on: ['002', '003']
+status: done
+use-cases:
+- SUC-001
+- SUC-002
+- SUC-003
+- SUC-004
+- SUC-005
+depends-on:
+- '002'
+- '003'
 github-issue: ''
 issue: mbregistry-service-install-uninstall-user-system.md
 completes_issue: true
@@ -83,31 +90,31 @@ Windows guard, and bring `docs/service.md`/`README.md` up to date.
 
 ## Acceptance Criteria
 
-- [ ] `mbregistry service install --user|--system [--dry-run]`,
+- [x] `mbregistry service install --user|--system [--dry-run]`,
       `service uninstall --user|--system [--purge]`, and `service status`
       all work end-to-end through `main([...])`, with the command runner
       mocked — no real `launchctl`/`systemctl`/`udevadm`/`usermod`/
       `loginctl` call in any test.
-- [ ] `--user`/`--system` are mutually exclusive and required on
+- [x] `--user`/`--system` are mutually exclusive and required on
       `install`/`uninstall`; omitting both or giving both is a clean
       argparse usage error (exit code 2), not a traceback.
-- [ ] `mbregistry service install --user` on a simulated Windows platform
+- [x] `mbregistry service install --user` on a simulated Windows platform
       (`monkeypatch.setattr(cli_module.sys, "platform", "win32")`) prints
       "not supported on Windows" and exits nonzero; same for
       `uninstall`/`status`; `install-service` on the same simulated
       platform is unaffected (still renders `sc.exe` commands via the
       existing Windows path).
-- [ ] `mbregistry install-service` still writes the systemd unit/udev
+- [x] `mbregistry install-service` still writes the systemd unit/udev
       rule files and prints commands (unchanged observable behavior for
       an existing caller) but now also prints the deprecation notice to
       stderr, and never calls `systemctl`/`launchctl` to actually start
       anything.
-- [ ] `docs/service.md` §6/§7 describe only `mbregistry service install`;
+- [x] `docs/service.md` §6/§7 describe only `mbregistry service install`;
       an "Uninstall" subsection exists for both platforms; §8/§11 updated
       per the Description above.
-- [ ] `README.md`'s service section no longer says macOS `install-service`
+- [x] `README.md`'s service section no longer says macOS `install-service`
       "is not supported."
-- [ ] Full sprint-scope test run is green:
+- [x] Full sprint-scope test run is green:
       `uv run pytest tests/registry/service/ tests/registry/cli/`.
 
 ## Implementation Plan

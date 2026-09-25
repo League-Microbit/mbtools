@@ -31,27 +31,24 @@ def test_cmd_install_service_dispatches_to_windows_branch_on_simulated_win32(
 
     monkeypatch.setattr(cli, "cmd_install_service_windows", fake_cmd_install_service_windows)
 
-    unit_output = tmp_path / "mbregistry.service"
-    udev_output = tmp_path / "99-mbregistry-cmsis-dap.rules"
+    # Ticket 006-004: the deprecated alias no longer takes
+    # --output/--udev-output at all (registry.service's install
+    # functions always write to their one fixed, real location) -- this
+    # test's own subject is the Windows *dispatch*, so it needs no path
+    # override, and there is none to pass any more.
     parser = cli.build_parser()
-    args = parser.parse_args(
-        [
-            "install-service",
-            "--output",
-            str(unit_output),
-            "--udev-output",
-            str(udev_output),
-        ]
-    )
+    args = parser.parse_args(["install-service"])
 
     code = cli.cmd_install_service(args)
 
     assert code == EXIT_OK
     assert len(calls) == 1
-    # the systemd-unit/udev-rule code path is never reached on Windows --
-    # neither file gets written.
-    assert not unit_output.exists()
-    assert not udev_output.exists()
+    # never even prints the deprecation notice or reaches
+    # registry.service on Windows -- ticket 006-004's own "leave Windows
+    # code alone" instruction.
+    assert calls[0] == (
+        f"{sys.executable} -m mbtools.registry.cli run --windows-service"
+    )
 
 
 def test_windows_branch_exec_path_invokes_run_with_the_windows_service_flag(monkeypatch):
@@ -90,19 +87,22 @@ def test_cmd_install_service_still_writes_systemd_unit_and_udev_rule_off_windows
     # (regression guard for the pre-ticket-005 behavior, already covered
     # exhaustively by test_cli_install_service.py), so it now forces a
     # non-"win32" platform explicitly -- deterministic on every CI leg.
+    #
+    # Ticket 006-004: --output/--udev-output no longer exist -- the two
+    # fixed path constants registry.service writes to are monkeypatched
+    # into tmp_path instead (same convention
+    # tests/registry/cli/test_cli_install_service.py's own
+    # linux_unit_paths fixture uses).
     monkeypatch.setattr(cli.sys, "platform", "linux")
     unit_output = tmp_path / "mbregistry.service"
     udev_output = tmp_path / "99-mbregistry-cmsis-dap.rules"
+    import mbtools.registry.service as service_module
+
+    monkeypatch.setattr(service_module, "LINUX_SYSTEM_UNIT_PATH", unit_output)
+    monkeypatch.setattr(service_module, "LINUX_UDEV_RULE_PATH", udev_output)
+
     parser = cli.build_parser()
-    args = parser.parse_args(
-        [
-            "install-service",
-            "--output",
-            str(unit_output),
-            "--udev-output",
-            str(udev_output),
-        ]
-    )
+    args = parser.parse_args(["install-service"])
 
     code = cli.cmd_install_service(args)
 
