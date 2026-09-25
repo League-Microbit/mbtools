@@ -46,6 +46,7 @@ from mbtools.registry.console_compat.relay_pool import SERVICE_TYPE as POOL_SERV
 from mbtools.registry.console_compat.relay_pool import TXT_REGISTRY_PORT
 from mbtools.registry.locks import LockManager
 from mbtools.registry.peering import SERVICE_TYPE as PEERING_SERVICE_TYPE
+from mbtools.registry.peering import TXT_REMOTE_PORT
 from mbtools.registry.store import Store
 from mbtools.testing.fakes import FakeUSBSource
 
@@ -300,6 +301,63 @@ def test_ephemeral_names_port_is_advertised_by_relay_pool_not_zero(store, locks)
             pool.stop()
     finally:
         names_api.stop()
+
+
+# ---------------------------------------------------------------------------
+# Sprint 007 ticket 007 hardware finding: ``--remote-port 0`` (ephemeral)
+# used to leave PeerDiscovery's own ``_mbregistry._tcp`` advertisement
+# stuck at the literal requested "0" forever, because nothing read back
+# RemoteAPIServer's real ``bound_port`` before peering.start() built its
+# ServiceInfo/TXT record -- caught running two hand-started
+# ``mbregistry run --remote-port 0`` instances on real hardware
+# (docs/acceptance/007-hardware.md), not previously exercised by any
+# test (every existing ``remote_port=0`` test here/in
+# test_cli_run_peering.py only ever asserted on
+# ``remote_api.bound_port``, never on what PeerDiscovery itself
+# advertised). Mirrors ``test_ephemeral_names_port_is_advertised_by_
+# relay_pool_not_zero``'s own "assert the real bound port made it into
+# the advertisement, not the configured one" shape.
+# ---------------------------------------------------------------------------
+
+
+def test_ephemeral_remote_port_is_advertised_by_peering_not_zero(tmp_path, socket_dir):
+    uid = _uid("ephremot")
+    store = Store(tmp_path / "devices.db")
+    usbwatch = FakeUSBSource([[_port_info(uid)]])
+
+    daemon, api, remote_api, peering = assemble_registry(
+        store=store,
+        usbwatch=usbwatch,
+        socket_path=f"{socket_dir}/api.sock",
+        remote_port=0,
+        peer_pub_port=17910,
+        peer_snapshot_port=17911,
+        zeroconf=_FakeZeroconfNamespace(),
+    )
+    try:
+        api.start()
+        remote_api.start()
+        assert remote_api.bound_port != 0
+
+        # The fix: cmd_run calls this between remote_api.start() and
+        # peering.start(). Without it, peering._own_info.port/TXT
+        # remote_port stay at the literal 0 this object was constructed
+        # with.
+        peering.set_remote_port(remote_api.bound_port)
+        peering.start()
+
+        assert peering._own_info.port == remote_api.bound_port
+        assert peering._own_info.port != 0
+        assert (
+            peering._own_info.properties[TXT_REMOTE_PORT.encode()]
+            == str(remote_api.bound_port).encode()
+        )
+        assert peering._own_info.properties[TXT_REMOTE_PORT.encode()] != b"0"
+    finally:
+        peering.stop()
+        remote_api.stop()
+        api.stop()
+        store.close()
 
 
 # ---------------------------------------------------------------------------

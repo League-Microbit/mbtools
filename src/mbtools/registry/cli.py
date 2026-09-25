@@ -1019,6 +1019,17 @@ def _run_registry(
     api.start()
     remote_api.start()
     if peering is not None:
+        # Sprint 007 ticket 007 hardware finding: sync PeerDiscovery's
+        # own advertised remote port to whatever RemoteAPIServer
+        # actually bound *before* peering.start() builds its
+        # ServiceInfo/TXT record -- a no-op for an explicit, non-zero
+        # --remote-port (bound_port already equals what peering was
+        # constructed with), but required for --remote-port 0
+        # (ephemeral), where the two would otherwise permanently
+        # diverge and the daemon would advertise a literal "0" over
+        # mDNS forever. See PeerDiscovery.set_remote_port's own
+        # docstring for the full story.
+        peering.set_remote_port(remote_api.bound_port)
         peering.start()
     names_api.start()
 
@@ -1128,7 +1139,24 @@ def _run_registry(
             "socket": str(socket_path),
             "ports": ports,
         }
-        print(json.dumps(ready_payload))
+        # Sprint 007 ticket 007 hardware finding: flush=True is not
+        # cosmetic here. stdout is block-buffered (not line-buffered)
+        # whenever it isn't a tty -- exactly the case for every real
+        # spawning parent this recipe targets (a pipe, per this
+        # function's own "so a spawning parent can read just stdout"
+        # note two paragraphs up). Without an explicit flush, this one
+        # short line sits in Python's stdout buffer until something else
+        # fills it or the process exits -- which, for a long-lived
+        # daemon whose main loop below never writes to stdout again,
+        # means a parent reading this pipe waits forever. Caught
+        # reproducing the documented "shell script piping its own stdin
+        # through" spawn recipe against real hardware
+        # (docs/acceptance/007-hardware.md); the existing test suite
+        # only ever asserted on the *payload* (a fully mocked
+        # assemble_registry/relay_pool/names_api, per ticket 005's own
+        # testing plan -- "no real sockets/ports"), never on a real pipe
+        # a parent process actually blocks reading from.
+        print(json.dumps(ready_payload), flush=True)
 
     try:
         daemon.run(interval_s=args.interval, stop=stop_event.is_set)

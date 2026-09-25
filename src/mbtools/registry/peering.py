@@ -1210,6 +1210,40 @@ class PeerDiscovery:
 
     # -- lifecycle -----------------------------------------------------
 
+    def set_remote_port(self, port: int) -> None:
+        """Override the remote-API port this instance will advertise in
+        its own ``_mbregistry._tcp`` ``ServiceInfo``/TXT record, before
+        :meth:`start` builds and registers them.
+
+        **Sprint 007 ticket 007 hardware finding.** ``__init__``'s
+        ``remote_port`` is normally the same value the caller also hands
+        :class:`~mbtools.registry.remote_api.RemoteAPIServer` as its
+        listening port -- fine for an explicit, non-zero port, but wrong
+        for ``mbregistry run --remote-port 0`` (an ephemeral port,
+        exactly what two same-host instances use per
+        ``docs/service.md``'s own multi-instance recipe): the *value*
+        this object was constructed with stays ``0`` forever, since
+        nothing previously read back ``RemoteAPIServer.bound_port`` once
+        the OS actually chose a port. The advertised SRV port and TXT
+        ``remote_port`` therefore stayed literally ``"0"``, discovered
+        by every peer, and unreachable -- caught running two hand-started
+        ``--remote-port 0`` instances on real hardware
+        (``docs/acceptance``; not previously exercised by any test, which
+        always called ``remote_api.start()``/``peering.start()`` without
+        checking the resulting ``ServiceInfo``/TXT port at all).
+
+        The caller (``cmd_run``) is expected to call this with
+        ``remote_api.bound_port`` right after ``remote_api.start()`` and
+        before ``peering.start()`` -- a no-op for the ordinary explicit-
+        port case, where ``bound_port`` already equals the value this
+        object was constructed with.  Calling it after :meth:`start` has
+        already registered the mDNS service has no effect on that
+        already-published advertisement (this method only ever updates
+        the value the *next* :meth:`start` would use); this project's
+        own daemon never calls it that way.
+        """
+        self._remote_port = port
+
     def start(self) -> None:
         """Bind the PUB/REP sockets and start the REP handler thread,
         then register this host's own mDNS advertisement and start

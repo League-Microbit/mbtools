@@ -29,6 +29,8 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -261,6 +263,11 @@ class _FakePeering(_FakeListener):
     def __init__(self, bound_port: int = 0) -> None:
         super().__init__(bound_port)
         self.connect_peer_calls: list[tuple] = []
+        # Sprint 007 ticket 007 hardware finding: cmd_run now calls this
+        # between remote_api.start() and peering.start() (see cli.py's
+        # own comment at that call site) -- recorded, not just accepted,
+        # so a test could assert on it if it ever needed to.
+        self.set_remote_port_calls: list[int] = []
 
     def publish_name_set(self, *args, **kwargs) -> None:
         pass
@@ -270,6 +277,9 @@ class _FakePeering(_FakeListener):
 
     def connect_peer(self, *args, **kwargs) -> None:
         self.connect_peer_calls.append((args, kwargs))
+
+    def set_remote_port(self, port: int) -> None:
+        self.set_remote_port_calls.append(port)
 
 
 class _FakeDaemon:
@@ -575,3 +585,94 @@ def test_run_registry_composes_ready_json_exit_with_parent_no_peering(
         if thread.is_alive():
             stop_event.set()
             thread.join(timeout=2.0)
+
+
+# ---------------------------------------------------------------------------
+# Sprint 007 ticket 007 hardware finding: the spawn recipe over a *real*
+# OS pipe, not the mocked-assembly/capsys shape every other test in this
+# file uses (per this module's own docstring, "no real sockets/ports").
+# capsys replaces ``sys.stdout`` with an in-memory object that has none
+# of a real pipe's block-buffering behavior, so it could never have
+# caught this: a real subprocess's stdout is block-buffered (not
+# line-buffered) whenever it isn't a tty -- exactly the case for a real
+# spawning parent reading this recipe's own ready line through a pipe,
+# which is the literal, documented purpose of ``--ready-json``. Without
+# an explicit ``flush=True`` on that one `print`, the JSON line sat in
+# the child's stdout buffer forever (the main loop never writes anything
+# else to stdout to flush it), and a parent honestly following
+# docs/service.md's own spawn recipe would block on ``readline()``
+# indefinitely. Caught running exactly that recipe from a real shell
+# parent against real hardware (docs/acceptance/007-hardware.md).
+# ---------------------------------------------------------------------------
+
+
+def test_ready_json_line_reaches_a_real_pipe_promptly(socket_dir):
+    """A real subprocess, real OS pipe, real (loopback, ephemeral-port)
+    sockets -- no mocks. Reads the ready line with a short deadline: on
+    the pre-fix code (``print`` with no ``flush=True``), this reliably
+    times out and fails; with the fix, the line arrives promptly.
+
+    Uses the ``socket_dir`` fixture (a short ``tempfile.mkdtemp()`` path),
+    not ``tmp_path`` -- ``tmp_path``'s own per-test nested directory name
+    (this test's own long, descriptive name included) reliably overflows
+    ``AF_UNIX``'s ~104-byte path limit on macOS, which looks identical to
+    the hang this test exists to catch (an empty read) unless its own
+    stderr is inspected -- a real pitfall hit writing this test, not
+    proving anything about the fix.
+    """
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "mbtools.registry.cli",
+            "run",
+            "--socket",
+            f"{socket_dir}/api.sock",
+            "--db",
+            f"{socket_dir}/devices.db",
+            "--remote-port",
+            "0",
+            "--pool-port",
+            "0",
+            "--names-port",
+            "0",
+            "--no-peering",
+            "--ready-json",
+            "--exit-with-parent",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    try:
+        result: dict = {}
+
+        def _read_ready_line():
+            result["line"] = proc.stdout.readline()
+
+        reader = threading.Thread(target=_read_ready_line, daemon=True)
+        reader.start()
+        reader.join(timeout=10.0)
+        assert not reader.is_alive(), (
+            "ready-json line never arrived on the real stdout pipe within "
+            "10s -- the exact hang this test exists to catch (see the "
+            "flush=True fix in cmd_run)"
+        )
+        assert result.get("line"), (
+            f"empty read from stdout; child exit={proc.poll()!r}, "
+            f"stderr={proc.stderr.read()!r}"
+        )
+
+        payload = json.loads(result["line"])
+        assert payload["ready"] is True
+        assert payload["ports"]["remote"] != 0
+
+        # --exit-with-parent: closing stdin should end the child promptly.
+        proc.stdin.close()
+        assert proc.wait(timeout=10.0) == 0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5.0)
