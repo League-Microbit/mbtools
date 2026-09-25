@@ -205,6 +205,7 @@ from zmq.utils.monitor import recv_monitor_message
 from mbtools.registry.netaddr import local_ip
 from mbtools.registry.identity import ProbeResult
 from mbtools.registry.store import (
+    STATE_ATTACHED_NO_ANNOUNCE,
     STATE_CONNECTED,
     STATE_CONNECTED_NO_FIRMWARE,
     STATE_DISCONNECTED,
@@ -499,6 +500,26 @@ def _apply_snapshot_device(store: Store, host: str, data: dict[str, Any]) -> Non
     overwritten -- the state-clobber the rejection exists to prevent would
     still land through this second call, reproducing the exact "pool
     reports 0 devices" symptom this ticket fixes.
+
+    **Sprint 007, ticket 003**: ``state`` now also recognizes
+    :data:`~mbtools.registry.store.STATE_ATTACHED_NO_ANNOUNCE` -- the
+    didn't-announce state ticket 001 split out of
+    :data:`STATE_CONNECTED_NO_FIRMWARE`'s old, broader meaning -- applied
+    via :meth:`Store.apply_remote_probe` (``result=None``), the same
+    outcome a local silent probe reaches. A ``STATE_CONNECTED_NO_FIRMWARE``
+    wire value is now applied via :meth:`Store.apply_known_blank`
+    instead of the same "``apply_remote_probe(uid, None)``" call
+    ``STATE_ATTACHED_NO_ANNOUNCE`` uses -- since ticket 001,
+    ``apply_probe_result(uid, None)`` (what ``apply_remote_probe``
+    delegates to) sets :data:`STATE_ATTACHED_NO_ANNOUNCE`, not
+    :data:`STATE_CONNECTED_NO_FIRMWARE`, so reusing it here would silently
+    downgrade a peer's genuinely-known-blank board to didn't-announce on
+    this store's side. Before this ticket, a
+    ``STATE_ATTACHED_NO_ANNOUNCE`` wire value from a peer matched none of
+    this function's branches at all and was silently dropped (this
+    function's own docstring's "only attached_unprobed... already covers
+    it" comment was true only by omission) -- this store's copy of that
+    uid simply never advanced past whatever state it was already in.
     """
     uid = data["uid"]
     store.upsert_remote_attached(uid, host, data.get("port"), data.get("vid_pid"))
@@ -515,8 +536,10 @@ def _apply_snapshot_device(store: Store, host: str, data: dict[str, Any]) -> Non
     state = data.get("state")
     if state == STATE_CONNECTED:
         store.apply_remote_probe(uid, _probe_result_from_dict(data))
-    elif state == STATE_CONNECTED_NO_FIRMWARE:
+    elif state == STATE_ATTACHED_NO_ANNOUNCE:
         store.apply_remote_probe(uid, None)
+    elif state == STATE_CONNECTED_NO_FIRMWARE:
+        store.apply_known_blank(uid)
     elif state == "disconnected":
         store.mark_remote_detached(uid)
     # "attached_unprobed": upsert_remote_attached above already covers it.
@@ -593,10 +616,20 @@ def _apply_event(store: Store, host: str, event: dict[str, Any]) -> None:
         elif event_type == EVENT_IDENTITY:
             if _attributed_to(store, uid, host):
                 state = event.get("state")
+                # Sprint 007, ticket 003: see _apply_snapshot_device's own
+                # docstring note for why STATE_ATTACHED_NO_ANNOUNCE and
+                # STATE_CONNECTED_NO_FIRMWARE are no longer applied via
+                # the same call -- ticket 001 narrowed what
+                # apply_remote_probe(uid, None) (-> apply_probe_result)
+                # sets, so a peer's genuinely-known-blank board must go
+                # through apply_known_blank instead, or it silently
+                # downgrades to didn't-announce here.
                 if state == STATE_CONNECTED:
                     store.apply_remote_probe(uid, _probe_result_from_dict(event))
-                elif state == STATE_CONNECTED_NO_FIRMWARE:
+                elif state == STATE_ATTACHED_NO_ANNOUNCE:
                     store.apply_remote_probe(uid, None)
+                elif state == STATE_CONNECTED_NO_FIRMWARE:
+                    store.apply_known_blank(uid)
             else:
                 logger.warning(
                     "peering: dropping identity for uid %s from %s -- not attributed to it here",

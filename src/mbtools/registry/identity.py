@@ -10,10 +10,30 @@ enforced by convention (this being the one place it happens), not by code.
 Ported from ``mbdeploy/src/mbdeploy/devices.py`` (``probe_type``,
 ``is_relay``) and ``microbit-radio-relay/server/src/mbrelay/inventory.py``
 (``DeviceRecord.short_uid``) and ``.../mbrelay/cli.py`` (``_port_holder``).
+
+**Sprint 007, ticket 003 — SWD chip-identity read.** This module is also
+now the *only* place mbtools reads a board's identity over SWD
+(:func:`read_device_id`/:func:`read_chip_identity`), alongside its
+existing serial ``HELLO`` transport (:func:`probe`) — the same "one place
+this kind of I/O happens" boundary sprint.md's Architecture (Step 3)
+assigns this module, extended to a second transport. Ported from
+``mbdeploy``'s ``read_device_id``/``friendly_name``/``read_board_name``
+(``mbdeploy/src/mbdeploy/devices.py``): ``connect_mode="attach"``,
+``auto_unlock=False``, ``blocking=False``, no halt, no reset -- reading
+``FICR.DEVICEID[1]`` is safe on a board already running firmware, and
+needs no cooperating serial port at all. ``pyocd`` is an optional import,
+mirroring this module's existing optional ``serial`` import, so the
+module stays importable in an environment (e.g. this project's own CI)
+that never installs it. ``session_factory`` is the test-only escape
+hatch (mirroring :func:`probe`'s own ``serial_factory``): a test passes a
+callable matching ``ConnectHelper.session_with_chosen_probe``'s call
+signature/return shape (a context manager yielding an object with
+``.target.read32(addr)``) instead of ever touching a real probe.
 """
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import subprocess
 import time
@@ -26,11 +46,41 @@ try:  # pyserial is a declared dependency, but keep this importable without
 except Exception:  # pragma: no cover
     _pyserial = None  # type: ignore
 
+try:  # pyocd is a declared dependency, but keep this importable without it
+    # installed (mirrors the _pyserial optional import immediately above) --
+    # matters for any environment (this project's own CI included) that
+    # never installs pyocd.
+    from pyocd.core.helpers import ConnectHelper as _ConnectHelper  # type: ignore
+except Exception:  # pragma: no cover - pyocd is a declared dependency
+    _ConnectHelper = None  # type: ignore
+
 from mbtools.common import DAPLINK_VID_PID
 
 logger = logging.getLogger(__name__)
 
 BAUD_RATE = 115200
+
+#: nRF5x ``FICR.DEVICEID[1]`` -- the 32-bit word the micro:bit runtime
+#: hashes into the board's five-letter friendly name. Same address on
+#: both nRF51 (micro:bit V1) and nRF52 (V2). Ported from ``mbdeploy``'s
+#: ``devices.FICR_DEVICEID1``.
+FICR_DEVICEID1 = 0x10000064
+
+#: Default ``target_override`` for :func:`read_device_id`, tried before
+#: falling back to ``None`` (pyOCD auto-detect) -- ported from
+#: ``mbdeploy``'s ``devices.DEFAULT_MCU``.
+DEFAULT_TARGET_MCU = "nrf52833"
+
+#: CODAL's friendly-name codebook: five base-5 digits, alternating
+#: consonants and vowels, most-significant digit first in the printed
+#: name. Ported verbatim from ``mbdeploy``'s ``devices._NAME_CODEBOOK``.
+_NAME_CODEBOOK = (
+    ("z", "v", "g", "p", "t"),
+    ("u", "o", "i", "e", "a"),
+    ("z", "v", "g", "p", "t"),
+    ("u", "o", "i", "e", "a"),
+    ("z", "v", "g", "p", "t"),
+)
 
 #: Per-``readline()`` read timeout passed to the underlying ``Serial``
 #: object — how long one read is allowed to block for before giving up
@@ -101,6 +151,116 @@ def short_uid(uid: str) -> str:
     last 8 characters rather than raising.
     """
     return uid[16:24] if len(uid) >= 32 else uid[-8:]
+
+
+@contextlib.contextmanager
+def _quiet_pyocd():
+    """Silence pyOCD's own logging for the duration of a read, so it can't
+    interleave with ``mbregistry``'s own log/print output. Ported verbatim
+    from ``mbdeploy``'s ``devices._quiet_pyocd``.
+    """
+    pyocd_logger = logging.getLogger("pyocd")
+    previous = pyocd_logger.level
+    pyocd_logger.setLevel(logging.CRITICAL + 1)
+    try:
+        yield
+    finally:
+        pyocd_logger.setLevel(previous)
+
+
+def friendly_name(device_id: int) -> str:
+    """The micro:bit five-letter name CODAL encodes from
+    ``FICR.DEVICEID[1]``.
+
+    This is CODAL's ``microbit_friendly_name()``: the 32-bit word is
+    written out as five base-5 digits, and digit *i* (counting from the
+    least significant) selects a letter from column *i* of
+    :data:`_NAME_CODEBOOK`, landing at position ``4 - i`` of the name.
+    Ported verbatim from ``mbdeploy``'s ``devices.friendly_name``
+    (example: ``2314287040 -> "tovez"``).
+    """
+    n = device_id & 0xFFFFFFFF
+    letters = [""] * 5
+    for i in range(5):
+        letters[4 - i] = _NAME_CODEBOOK[i][n % 5]
+        n //= 5
+    return "".join(letters)
+
+
+def read_device_id(
+    uid: str,
+    target_mcu: str = DEFAULT_TARGET_MCU,
+    *,
+    session_factory: Callable[..., Any] | None = None,
+) -> int | None:
+    """Read ``FICR.DEVICEID[1]`` from the board behind ``uid`` over SWD.
+
+    The board's name is a property of the *target* nRF, not of the debug
+    probe, so it can't be computed from ``uid`` alone -- but it can be
+    read through the probe the UID names. Attaches without halting or
+    resetting (``connect_mode="attach"``, ``auto_unlock=False``,
+    ``blocking=False``), and needs no serial port and no cooperating
+    firmware -- safe to call even while the board is silently running its
+    own firmware. Ported from ``mbdeploy``'s ``devices.read_device_id``.
+
+    ``target_mcu`` is tried first; on failure (part connect refused,
+    wrong target guess), retried once with ``target_override=None``
+    (pyOCD auto-detect) so a V1 micro:bit (nRF51, a different part from
+    ``target_mcu``'s nRF52 default) is still readable without the caller
+    having to know which generation of board it's talking to.
+
+    Returns ``None`` if pyOCD is unavailable, the probe is busy (e.g. mid
+    flash), or the target refuses the connection (locked part) on both
+    attempts -- never raises.
+
+    ``session_factory`` is a test-only escape hatch (mirroring
+    :func:`probe`'s own ``serial_factory``): a callable matching
+    ``ConnectHelper.session_with_chosen_probe``'s call signature (keyword
+    arguments ``unique_id``, ``target_override``, ``connect_mode``,
+    ``blocking``, ``auto_unlock``) and return shape (a context manager
+    yielding an object with ``.target.read32(addr)``). Production code
+    leaves it unset, using pyOCD's real ``ConnectHelper`` when installed.
+    """
+    factory = session_factory
+    if factory is None:
+        if _ConnectHelper is None:  # pragma: no cover - pyocd is a declared dependency
+            return None
+        factory = _ConnectHelper.session_with_chosen_probe
+
+    for override in (target_mcu, None):
+        try:
+            with _quiet_pyocd():
+                with factory(
+                    unique_id=uid,
+                    target_override=override,
+                    connect_mode="attach",
+                    blocking=False,
+                    auto_unlock=False,
+                ) as session:
+                    return session.target.read32(FICR_DEVICEID1)
+        except Exception:
+            continue
+    return None
+
+
+def read_chip_identity(
+    uid: str,
+    target_mcu: str = DEFAULT_TARGET_MCU,
+    *,
+    session_factory: Callable[..., Any] | None = None,
+) -> tuple[str, int] | None:
+    """The board's ``(name, device_id)`` chip identity, read once over SWD.
+
+    Convenience wrapper over :func:`read_device_id` + :func:`friendly_name`
+    -- what :mod:`mbtools.registry.daemon` calls when a serial probe comes
+    back with nothing usable and this uid has no chip identity cached yet
+    (sprint.md SUC-001). ``None`` when the device id couldn't be read (see
+    :func:`read_device_id`'s own docstring for why); never raises.
+    """
+    device_id = read_device_id(uid, target_mcu, session_factory=session_factory)
+    if device_id is None:
+        return None
+    return friendly_name(device_id), device_id
 
 
 def port_holder(port: str) -> str:
@@ -242,6 +402,18 @@ def probe(
     skip the real-hardware settle delay a fake port doesn't need.
     Production code leaves both at their defaults (``serial.Serial`` and
     :data:`_SETTLE_DELAY_S`).
+
+    **``TIOCEXCL`` (sprint 007, ticket 003 wiring)**: once the port is
+    open, this function best-effort applies
+    :func:`mbtools.registry.claims.protect_fd` to the underlying file
+    descriptor -- the belt-and-suspenders guard registry.claims's module
+    docstring describes, asking the kernel to refuse any *other*
+    ``open()`` of this same device node for as long as this probe holds
+    it (a stray ``pyocd``/``screen``/``minicom`` a developer left open,
+    say, underneath an already-claimed uid). This is purely defensive: it
+    never gates whether the probe proceeds, and a fake/test port with no
+    real ``fileno()`` (every test in this module) is silently skipped,
+    not an error.
     """
     factory = serial_factory
     if factory is None:
@@ -265,6 +437,18 @@ def probe(
             "identity.probe: %s did not open (held by %s): %s", port, holder, exc
         )
         return None
+
+    try:
+        # Best-effort TIOCEXCL -- see this function's own docstring. A
+        # fake/test port (no real fileno(), every test in this module)
+        # or any other failure is silently swallowed: this is a
+        # defense-in-depth extra, never the mechanism the probe itself
+        # relies on.
+        from mbtools.registry import claims as _claims
+
+        _claims.protect_fd(ser.fileno())
+    except Exception:
+        pass
 
     try:
         if reset_first:

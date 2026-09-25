@@ -21,7 +21,7 @@ from __future__ import annotations
 from mbtools.common import DAPLINK_VID_PID, PortInfo
 from mbtools.registry.cli import assemble_daemon_and_api, build_parser
 from mbtools.registry.store import Store
-from mbtools.testing.fakes import FakeUSBSource
+from mbtools.testing.fakes import FakeUSBSource, unavailable_chip_identity_session_factory
 
 VID, PID_ = DAPLINK_VID_PID
 UID = "9900" + "0000" + "11112222" + "3333444455556666" + "77778888" + "6e052820"
@@ -86,6 +86,7 @@ def test_assemble_daemon_and_api_claim_fn_gates_attach(tmp_path):
         usbwatch=usbwatch,
         socket_path=str(tmp_path / "api.sock"),
         claim_fn=lambda uid: None,  # deny every claim
+        chip_identity_session_factory=unavailable_chip_identity_session_factory,
     )
 
     daemon.run_once()
@@ -104,6 +105,11 @@ def test_assemble_daemon_and_api_omitted_claim_fn_keeps_default_no_op_behavior(t
         store=store,
         usbwatch=usbwatch,
         socket_path=str(tmp_path / "api.sock"),
+        # No serial_factory here -- identity.probe opens a real (but
+        # nonexistent) port and returns None, which without this fake
+        # would fall through to a *real* pyOCD session attempt (pyocd is
+        # actually installed in this project's venv).
+        chip_identity_session_factory=unavailable_chip_identity_session_factory,
     )
 
     daemon.run_once()

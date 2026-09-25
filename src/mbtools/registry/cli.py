@@ -329,6 +329,7 @@ def assemble_daemon_and_api(
     name_set_callback: Any = None,
     name_clear_callback: Any = None,
     claim_fn: Any = None,
+    chip_identity_session_factory: Any = None,
 ) -> tuple[Daemon, RegistryAPIServer | WindowsPipeAPIServer]:
     """Build one :class:`Daemon` and one local-API server that share a
     single ``threading.RLock`` -- ticket 009's fix for the cross-module
@@ -403,6 +404,12 @@ def assemble_daemon_and_api(
     :func:`mbtools.registry.claims.build_claim_fn` result through
     :func:`assemble_registry` below. Every pre-ticket-002 caller/test that
     omits it is unaffected.
+
+    ``chip_identity_session_factory`` (sprint 007, ticket 003) is
+    forwarded verbatim to :class:`Daemon`'s own parameter of the same name
+    -- see that class's own docstring. Left ``None`` here (this function's
+    own default, same as every other test-only escape hatch above), a
+    bare call gets :class:`Daemon`'s own default of "use pyOCD for real".
     """
     shared_lock = lock if lock is not None else threading.RLock()
     daemon = Daemon(
@@ -415,6 +422,7 @@ def assemble_daemon_and_api(
         event_callback=event_callback,
         lock_display_callback=lock_display_callback,
         claim_fn=claim_fn,
+        chip_identity_session_factory=chip_identity_session_factory,
     )
     api: RegistryAPIServer | WindowsPipeAPIServer
     if sys.platform == "win32":

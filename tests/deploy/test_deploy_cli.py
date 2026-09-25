@@ -58,7 +58,11 @@ from mbtools.registry.flash import FlashOp
 from mbtools.registry.identity import ProbeResult
 from mbtools.registry.locks import KIND_FLASH, HolderRef, LockManager
 from mbtools.registry.store import Store
-from mbtools.testing.fakes import FakeSerial, FakeUSBSource
+from mbtools.testing.fakes import (
+    FakeSerial,
+    FakeUSBSource,
+    unavailable_chip_identity_session_factory,
+)
 
 VID_PID = "0d28:0204"
 VID, PID_ = DAPLINK_VID_PID
@@ -498,6 +502,9 @@ def _run_daemon(tmp_path, socket_dir, announcements):
         serial_factory=script,
         settle_s=0,
         probe_timeout_s=0.05,
+        # pyocd is a real, installed dependency here -- never let this
+        # daemon touch a real session if a probe ever comes back silent.
+        chip_identity_session_factory=unavailable_chip_identity_session_factory,
     )
     api.start()
     stop_event = threading.Event()

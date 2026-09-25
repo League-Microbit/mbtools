@@ -22,7 +22,11 @@ from mbtools.common import DAPLINK_VID_PID, PortInfo
 from mbtools.registry import claims
 from mbtools.registry.daemon import Daemon
 from mbtools.registry.store import STATE_CONNECTED, STATE_DISCONNECTED, Store
-from mbtools.testing.fakes import FakeSerial, FakeUSBSource
+from mbtools.testing.fakes import (
+    FakeSerial,
+    FakeUSBSource,
+    unavailable_chip_identity_session_factory,
+)
 
 VID, PID_ = DAPLINK_VID_PID
 UID = "9900" + "0000" + "11112222" + "3333444455556666" + "77778888" + "6e052820"
@@ -57,6 +61,10 @@ def _make_daemon(usbwatch, store, claims_dir, port: str = "/dev/ttyACM0"):
         probe_timeout_s=0.05,
         settle_s=0,
         claim_fn=lambda uid: claims.try_claim(uid, claims_dir=claims_dir),
+        # pyocd is a real, installed dependency of this project -- never
+        # let a test that happens to reach the SWD fallback path touch a
+        # real session (see mbtools.testing.fakes's own docstring).
+        chip_identity_session_factory=unavailable_chip_identity_session_factory,
     )
 
 

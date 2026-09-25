@@ -22,12 +22,18 @@ from mbtools.registry.store import (
     STATE_ATTACHED_NO_ANNOUNCE,
     STATE_ATTACHED_UNPROBED,
     STATE_CONNECTED,
+    STATE_CONNECTED_NO_FIRMWARE,
     STATE_DISCONNECTED,
     Store,
     format_vid_pid,
 )
 from mbtools.serial.connect import BREAK_DURATION
-from mbtools.testing.fakes import FakeSerial, FakeUSBSource
+from mbtools.testing.fakes import (
+    FakeSerial,
+    FakeUSBSource,
+    fake_chip_identity_session_factory,
+    unavailable_chip_identity_session_factory,
+)
 
 VID, PID_ = DAPLINK_VID_PID
 UID = "9900" + "0000" + "11112222" + "3333444455556666" + "77778888" + "6e052820"
@@ -98,6 +104,16 @@ def store(tmp_path):
 
 
 def _make_daemon(usbwatch, store, script, **kwargs):
+    # chip_identity_session_factory defaults to a fake that always raises
+    # (see mbtools.testing.fakes's own docstring) -- pyocd is a real,
+    # installed dependency of this project, so leaving this unset would
+    # let any test that happens to reach the SWD fallback path (a silent
+    # probe with no cached chip identity yet) call into a *real* pyOCD
+    # session. Every test below that actually wants a successful SWD read
+    # overrides this explicitly via chip_identity_session_factory=... .
+    kwargs.setdefault(
+        "chip_identity_session_factory", unavailable_chip_identity_session_factory
+    )
     return Daemon(
         usbwatch=usbwatch,
         store=store,
@@ -247,14 +263,13 @@ def test_flash_reprobe_without_intervening_detach_still_reprobes(store):
 # ---------------------------------------------------------------------------
 
 
-def test_flash_reprobe_timeout_marks_no_announce_without_reopening_port(store):
-    """Sprint 007, ticket 001: this give-up path still calls the plain
-    ``Store.apply_probe_result(uid, None)`` (ticket 001's own scoping --
-    see daemon.py's ``run_once`` docstring -- leaves routing this specific
-    call site to ``Store.apply_known_blank`` for ticket 003, which owns
-    the full flash-triggered-known-blank wiring), so it now lands on
-    ``STATE_ATTACHED_NO_ANNOUNCE`` rather than the old
-    ``STATE_CONNECTED_NO_FIRMWARE``."""
+def test_flash_reprobe_timeout_marks_known_blank_without_reopening_port(store):
+    """Sprint 007, ticket 003: this give-up path (the device never even
+    re-enumerated before its deadline, after a flash-kind lock released)
+    genuinely knows the board is blank, so it now routes to
+    ``Store.apply_known_blank`` (``STATE_CONNECTED_NO_FIRMWARE``) instead
+    of the plain didn't-announce ``Store.apply_probe_result(uid, None)``
+    (``STATE_ATTACHED_NO_ANNOUNCE``) ticket 001 left this call site on."""
     usbwatch = FakeUSBSource([[_port_info()], []])  # never comes back
     script = _ProbeScript([ANNOUNCEMENT])
     clock = _Clock(start=0.0)
@@ -274,8 +289,41 @@ def test_flash_reprobe_timeout_marks_no_announce_without_reopening_port(store):
     clock.advance(10.0)  # now well past the deadline
     daemon.run_once()  # still absent -> gives up
 
-    assert store.get(UID).state == STATE_ATTACHED_NO_ANNOUNCE
+    assert store.get(UID).state == STATE_CONNECTED_NO_FIRMWARE
     assert script.calls == 1  # never reopened a port for a device not there
+
+
+def test_flash_reprobe_reenumerates_but_stays_silent_lands_on_known_blank(store):
+    """SUC-002 / the ``togov``-shaped scenario sprint.md's Open Question 2
+    flags (sprint 007, ticket 003): a flash-kind lock releases, the board
+    *does* re-enumerate (unlike the give-up-path test above, where it
+    never comes back at all), but the re-probe still gets no ``HELLO``
+    reply -- this must land on known-blank too, not didn't-announce, and
+    must not keep showing the board's prior (pre-flash) announcement."""
+    usbwatch = FakeUSBSource([[_port_info()], [], [_port_info()]])
+    script = _ProbeScript([ANNOUNCEMENT])  # only the first probe answers
+    daemon = _make_daemon(usbwatch, store, script)
+
+    daemon.run_once()  # attach + probe #1 -- announces
+    assert store.get(UID).state == STATE_CONNECTED
+    assert store.get(UID).device_name == "vevov"
+
+    daemon.locks.acquire(UID, KIND_FLASH, _local_holder(777))
+    daemon.locks.release(UID, _local_holder(777))  # flash_pending[UID] set
+
+    daemon.run_once()  # sees the drop (flash-induced reboot)
+    assert store.get(UID).state == STATE_DISCONNECTED
+
+    daemon.run_once()  # re-enumerates -> flash-pending re-probe #2, silent
+
+    assert script.calls == 2
+    record = store.get(UID)
+    assert record.state == STATE_CONNECTED_NO_FIRMWARE
+    # No stale prior-firmware text survives -- apply_known_blank leaves
+    # announcement fields untouched (same "preserve" rule apply_probe_result
+    # uses), but the STATE itself is what render.py's FIRMWARE cell keys
+    # off of, and it correctly reads "known blank" here, not the old value.
+    assert record.error_note is not None
 
 
 def test_flash_reprobe_before_deadline_does_not_time_out(store):
@@ -399,13 +447,12 @@ def test_event_callback_fires_detach(store):
 
 
 def test_event_callback_fires_identity_on_flash_reprobe_timeout_giveup(store):
-    """The flash-reprobe-timeout give-up path also calls
-    ``store.apply_probe_result`` (with a ``None`` result) -- a peer needs
-    to learn about that ``attached_no_announce`` transition exactly like
-    any other completed probe. (Sprint 007, ticket 001: this give-up path
-    is not yet routed to ``Store.apply_known_blank`` -- see ticket 001's
-    own scoping note in daemon.py's ``run_once`` docstring -- so it still
-    lands on the didn't-announce state, not known-blank.)"""
+    """The flash-reprobe-timeout give-up path also fires an "identity"
+    event -- a peer needs to learn about that known-blank transition
+    exactly like any other completed probe. (Sprint 007, ticket 003:
+    this give-up path now routes to ``Store.apply_known_blank``, so it
+    lands on ``STATE_CONNECTED_NO_FIRMWARE``, not the didn't-announce
+    state an ordinary silent probe uses.)"""
     usbwatch = FakeUSBSource([[_port_info()], []])  # never comes back
     script = _ProbeScript([ANNOUNCEMENT])
     clock = _Clock(start=0.0)
@@ -426,9 +473,9 @@ def test_event_callback_fires_identity_on_flash_reprobe_timeout_giveup(store):
     events.clear()
 
     clock.advance(10.0)
-    daemon.run_once()  # gives up -> identity event with attached_no_announce
+    daemon.run_once()  # gives up -> identity event, known-blank
 
-    assert events == [("identity", UID, STATE_ATTACHED_NO_ANNOUNCE)]
+    assert events == [("identity", UID, STATE_CONNECTED_NO_FIRMWARE)]
 
 
 def test_no_event_callback_registered_is_a_silent_no_op(store):
@@ -722,6 +769,7 @@ def test_two_daemons_sharing_a_real_claims_dir_only_one_claims_the_uid(tmp_path)
         probe_timeout_s=0.05,
         settle_s=0,
         claim_fn=lambda uid: claims.try_claim(uid, claims_dir=claims_dir),
+        chip_identity_session_factory=unavailable_chip_identity_session_factory,
     )
     daemon_b = Daemon(
         usbwatch=usbwatch_b,
@@ -730,6 +778,7 @@ def test_two_daemons_sharing_a_real_claims_dir_only_one_claims_the_uid(tmp_path)
         probe_timeout_s=0.05,
         settle_s=0,
         claim_fn=lambda uid: claims.try_claim(uid, claims_dir=claims_dir),
+        chip_identity_session_factory=unavailable_chip_identity_session_factory,
     )
 
     daemon_a.run_once()
@@ -745,3 +794,149 @@ def test_two_daemons_sharing_a_real_claims_dir_only_one_claims_the_uid(tmp_path)
     daemon_b.run_once()
     assert (store_a.get(UID) is not None) == a_has_it
     assert (store_b.get(UID) is not None) == b_has_it
+
+
+# ---------------------------------------------------------------------------
+# SWD chip-identity fallback (sprint 007, ticket 003) -- every test here
+# scripts identity.read_chip_identity's own session_factory escape hatch
+# (mbtools.testing.fakes.fake_chip_identity_session_factory /
+# unavailable_chip_identity_session_factory) so no real pyOCD session is
+# ever opened, matching CLAUDE.md's standing hardware rule and this
+# ticket's own "no real hardware in the automated suite" criterion.
+# ---------------------------------------------------------------------------
+
+# nRF52 FICR.DEVICEID[1] values with known CODAL friendly names (ported
+# from mbdeploy's own TestFriendlyName fixtures).
+_DEVICE_ID_TOVEZ = 2314287040
+_DEVICE_ID_GETEZ = 1784514240
+
+
+def test_silent_probe_falls_back_to_swd_naming(store):
+    """SUC-001 main flow: a board that never answers HELLO still gets its
+    real five-letter name via the SWD fallback."""
+    usbwatch = FakeUSBSource([[_port_info()]])
+    script = _ProbeScript([])  # silent -- identity.probe() returns None
+    daemon = _make_daemon(
+        usbwatch,
+        store,
+        script,
+        chip_identity_session_factory=fake_chip_identity_session_factory(
+            _DEVICE_ID_TOVEZ
+        ),
+    )
+
+    daemon.run_once()
+
+    record = store.get(UID)
+    assert record.state == STATE_ATTACHED_NO_ANNOUNCE
+    assert record.chip_identity_name == "tovez"
+    assert record.chip_identity_serial == _DEVICE_ID_TOVEZ
+
+
+def test_malformed_announcement_also_falls_back_to_swd_naming(store):
+    """The ticket's "or a blank/malformed ProbeResult" trigger: a line
+    arrived (so the probe result is not None and state lands on
+    STATE_CONNECTED) but it didn't parse against either dialect, so
+    device_name is blank -- SWD naming still fires as the NAME fallback."""
+    usbwatch = FakeUSBSource([[_port_info()]])
+    script = _ProbeScript(["garbage not matching either dialect"])
+    daemon = _make_daemon(
+        usbwatch,
+        store,
+        script,
+        chip_identity_session_factory=fake_chip_identity_session_factory(
+            _DEVICE_ID_GETEZ
+        ),
+    )
+
+    daemon.run_once()
+
+    record = store.get(UID)
+    assert record.state == STATE_CONNECTED
+    assert record.device_name == ""
+    assert record.chip_identity_name == "getez"
+
+
+def test_swd_read_happens_at_most_once_per_uid_across_detach_reattach(store):
+    """SUC-001 postcondition: once cached, never re-read, even across a
+    simulated detach/reattach cycle where the board keeps not answering
+    HELLO."""
+    usbwatch = FakeUSBSource([[_port_info()], [], [_port_info()]])
+    script = _ProbeScript([])  # every probe stays silent throughout
+    calls: list[int] = []
+    inner_factory = fake_chip_identity_session_factory(_DEVICE_ID_TOVEZ)
+
+    def counting_factory(**kwargs):
+        calls.append(1)
+        return inner_factory(**kwargs)
+
+    daemon = _make_daemon(
+        usbwatch, store, script, chip_identity_session_factory=counting_factory
+    )
+
+    daemon.run_once()  # attach + silent probe -> SWD read #1, cached
+    assert len(calls) == 1
+    assert store.get(UID).chip_identity_name == "tovez"
+
+    daemon.run_once()  # detach
+    daemon.run_once()  # reattach + silent probe again -- already cached
+
+    assert len(calls) == 1  # never read a second time
+    assert store.get(UID).chip_identity_name == "tovez"
+
+
+def test_failed_swd_read_leaves_chip_identity_unset_and_does_not_raise(store):
+    """A failed SWD read (faked to raise) leaves the chip-identity cache
+    unset (so NAME stays "-") and never raises out of the probe cycle."""
+    usbwatch = FakeUSBSource([[_port_info()]])
+    script = _ProbeScript([])
+    daemon = _make_daemon(
+        usbwatch,
+        store,
+        script,
+        chip_identity_session_factory=unavailable_chip_identity_session_factory,
+    )
+
+    daemon.run_once()  # must not raise
+
+    record = store.get(UID)
+    assert record.state == STATE_ATTACHED_NO_ANNOUNCE
+    assert record.chip_identity_name is None
+
+
+def test_swd_read_never_runs_for_a_uid_whose_claim_is_denied(store):
+    """The SWD read never runs for a uid this instance doesn't hold the
+    cross-instance claim for -- a uid whose claim attempt failed is never
+    upserted, so _maybe_probe (the only caller of
+    identity.read_chip_identity) never runs for it at all."""
+    usbwatch = FakeUSBSource([[_port_info()]])  # repeats
+    script = _ProbeScript([])
+
+    def boom_chip_identity(**kwargs):
+        raise AssertionError("SWD must never run for an unclaimed uid")
+
+    daemon = _make_daemon(
+        usbwatch,
+        store,
+        script,
+        claim_fn=lambda uid: None,  # deny every claim
+        chip_identity_session_factory=boom_chip_identity,
+    )
+
+    daemon.run_once()
+    daemon.run_once()
+
+    assert store.get(UID) is None
+
+
+def test_ordinary_silent_probe_lands_on_didnt_announce_not_known_blank(store):
+    """The two call sites remain correctly distinguished: an ordinary
+    (non-flash-triggered) silent probe lands on didn't-announce, never
+    known-blank."""
+    usbwatch = FakeUSBSource([[_port_info()]])
+    script = _ProbeScript([])
+    daemon = _make_daemon(usbwatch, store, script)
+
+    daemon.run_once()
+
+    assert store.get(UID).state == STATE_ATTACHED_NO_ANNOUNCE

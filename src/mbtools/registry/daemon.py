@@ -28,13 +28,13 @@ Every cycle, a flash-pending uid is probed as soon as it is seen attached
 again — regardless of what :meth:`Store.needs_probe` says, since a flash
 can leave the DAPLink interface enumerated throughout (no detach/reattach
 cycle to trip the store's own "reattach resets last_probe" rule) — and if
-it never reappears before its deadline, it is marked
-``attached_no_announce`` via the plain :meth:`Store.apply_probe_result`
-call (sprint 007, ticket 001 narrows what that call's ``None`` branch
-means — see ``store.py``'s module constants; ticket 003 is expected to
-route this specific give-up path to :meth:`Store.apply_known_blank`
-instead, since it can actually assert the board is blank) instead of
-waiting forever.
+it never reappears before its deadline, it is marked known-blank via
+:meth:`Store.apply_known_blank` (sprint 007, ticket 003) instead of
+waiting forever, since a flash-triggered re-probe that still gets
+nothing after the device never re-enumerated is a case this daemon can
+actually *assert* is blank, unlike an ordinary silent probe (see
+:meth:`_maybe_probe`'s own docstring for the same distinction on its own
+give-up path).
 
 **Detach handling**: a uid that drops out of a scan has any lock it holds
 force-released (a detach is not a graceful release — UC-002's
@@ -252,6 +252,17 @@ class Daemon:
     which resolves to a filesystem-free no-op that always grants the
     claim — see that same docstring note for why this, not
     :func:`mbtools.registry.claims.try_claim`, is the bare default.
+
+    ``chip_identity_session_factory`` (sprint 007, ticket 003) is
+    forwarded verbatim to :func:`mbtools.registry.identity
+    .read_chip_identity`'s own ``session_factory`` parameter on every SWD
+    read this daemon makes — the same test-only escape hatch
+    ``serial_factory``/``settle_s`` already are for
+    :func:`~mbtools.registry.identity.probe` (a test passes a callable
+    matching ``ConnectHelper.session_with_chosen_probe``'s shape instead
+    of ever touching a real pyOCD session). Defaults to ``None``, meaning
+    "use pyOCD for real" — see ``identity.read_chip_identity``'s own
+    docstring.
     """
 
     def __init__(
@@ -269,6 +280,7 @@ class Daemon:
         lock_display_callback: Callable[[str, str | None, str | None], None]
         | None = None,
         claim_fn: Callable[[str], Any] | None = None,
+        chip_identity_session_factory: Callable[..., Any] | None = None,
     ) -> None:
         self._usbwatch = usbwatch
         self._store = store
@@ -280,6 +292,7 @@ class Daemon:
         self._lock = lock if lock is not None else threading.RLock()
         self._event_callback = event_callback
         self._claim_fn = claim_fn if claim_fn is not None else _default_claim_fn
+        self._chip_identity_session_factory = chip_identity_session_factory
 
         #: uid -> the ClaimHandle-shaped object (anything with a
         #: no-argument ``.release()``) returned by :attr:`_claim_fn` for
@@ -458,21 +471,19 @@ class Daemon:
                 if uid not in current and now >= deadline:
                     logger.warning(
                         "daemon: %s never re-enumerated after flash within timeout; "
-                        "marking no-announce",
+                        "marking known-blank",
                         uid,
                     )
-                    # Sprint 007, ticket 001: apply_probe_result(uid, None)
-                    # now lands on STATE_ATTACHED_NO_ANNOUNCE rather than
-                    # STATE_CONNECTED_NO_FIRMWARE (see store.py's module
-                    # constants). This call site is a flash-triggered
-                    # re-probe that genuinely knows the board is blank, so
-                    # it belongs on Store.apply_known_blank instead -- left
-                    # as-is here per this ticket's own scoping (coordinate
-                    # with ticket 003, which owns that wiring) and to keep
-                    # this ticket's daemon.py change to the minimum needed
-                    # for its existing tests to pass against the renamed
-                    # constant.
-                    record = self._store.apply_probe_result(uid, None)
+                    # Sprint 007, ticket 003: this give-up path genuinely
+                    # knows the board is blank (a flash-triggered re-probe
+                    # that never even re-enumerated before its deadline),
+                    # so it lands on Store.apply_known_blank
+                    # (STATE_CONNECTED_NO_FIRMWARE) rather than the plain
+                    # didn't-announce Store.apply_probe_result(uid, None)
+                    # (STATE_ATTACHED_NO_ANNOUNCE) every other silent probe
+                    # uses -- see the module docstring's "Flash-triggered
+                    # re-probe" note.
+                    record = self._store.apply_known_blank(uid)
                     timed_out.append(record)
                     del self._flash_pending[uid]
 
@@ -520,6 +531,42 @@ class Daemon:
         Keying the reset on the stored role is not enough, because a new
         or wiped registry has no stored role. Probes only run on attach,
         reattach and after a flash, when resetting the board is expected.
+
+        **SWD chip-identity fallback (sprint 007, ticket 003)**: when the
+        serial probe comes back with nothing usable -- an outright timeout
+        (``result is None``) or a malformed announcement (a line arrived
+        but ``result.device_name`` is blank) -- and this uid has no
+        cached chip identity yet (:attr:`~mbtools.registry.store
+        .DeviceRecord.chip_identity_name` is ``None``), this method also
+        calls :func:`mbtools.registry.identity.read_chip_identity`,
+        outside :attr:`_lock` for the same reason ``identity.probe`` is:
+        it opens a real debug-probe session and can block. A successful
+        read is persisted via :meth:`Store.set_chip_identity`, which is
+        itself write-once (see that method's own docstring) -- so even a
+        retried read racing an already-successful one from a concurrent
+        caller can never clobber the cached value, and this uid is never
+        SWD-read again once cached (:attr:`~mbtools.registry.store
+        .DeviceRecord.chip_identity_name` is checked *before* the SWD
+        read is even attempted). A failed SWD read (``None``) is not an
+        error -- `NAME` simply stays ``-`` for this cycle, retried
+        whenever this uid is next probe-eligible, same as an ordinary
+        silent probe.
+
+        **Flash-triggered known-blank (sprint 007, ticket 003)**: when
+        the serial probe returns nothing (``result is None``) *and* this
+        uid is awaiting its flash-triggered re-probe (``uid in
+        self._flash_pending``, checked again here rather than reusing the
+        eligibility check above, since :attr:`_flash_pending` is only
+        popped after this outcome is decided), the outcome is applied via
+        :meth:`Store.apply_known_blank` instead of the plain
+        :meth:`Store.apply_probe_result` every other silent probe uses --
+        this is the one call site that can actually *assert* the board is
+        blank (it just went through a flash and still isn't answering),
+        as opposed to an ordinary silent probe, which merely didn't hear
+        anything and lands on the didn't-announce state instead. A
+        successful probe (``result is not None``) during a flash-pending
+        re-probe is unaffected -- it always goes through
+        :meth:`Store.apply_probe_result` like any other successful probe.
         """
         with self._lock:
             eligible = self._store.needs_probe(uid) or uid in self._flash_pending
@@ -536,9 +583,25 @@ class Daemon:
             reset_first=reset_first,
         )
 
+        chip_identity: tuple[str, int] | None = None
+        if result is None or not result.device_name:
+            with self._lock:
+                existing = self._store.get(uid)
+                needs_swd = existing is not None and existing.chip_identity_name is None
+            if needs_swd:
+                chip_identity = identity.read_chip_identity(
+                    uid, session_factory=self._chip_identity_session_factory
+                )
+
         with self._lock:
-            record = self._store.apply_probe_result(uid, result)
+            if result is None and uid in self._flash_pending:
+                record = self._store.apply_known_blank(uid)
+            else:
+                record = self._store.apply_probe_result(uid, result)
             self._flash_pending.pop(uid, None)
+            if chip_identity is not None:
+                name, serial = chip_identity
+                record = self._store.set_chip_identity(uid, name, serial)
 
         self._fire_events("identity", [record])
 
