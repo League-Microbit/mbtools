@@ -400,6 +400,23 @@ def test_run_registry_ready_json_single_line_with_all_bound_ports(
     }
 
 
+def test_run_registry_ready_json_includes_version_key(monkeypatch, tmp_path, capsys):
+    """Ticket 008-006: the same ``version = importlib.metadata.version
+    ("mbtools")`` string the top-level ``mbregistry --version`` flag
+    prints (see ``test_cli_version.py``) also appears here, so
+    robot-console's minimum-version check works whether it queries via
+    the flag or via a spawned ``run --ready-json``."""
+    _install_fake_assembly(monkeypatch)
+    parser = build_parser()
+    args = parser.parse_args(_run_args(tmp_path, ["--ready-json"]))
+    stop_event = threading.Event()
+
+    cli_module._run_registry(args, stop_event)
+
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert payload["version"] == cli_module._mbtools_version()
+
+
 def test_run_registry_ready_json_resolves_instance_to_short_hostname_when_omitted(
     monkeypatch, tmp_path, capsys
 ):
@@ -570,17 +587,37 @@ def test_run_registry_composes_ready_json_exit_with_parent_no_peering(
         assert payload == {
             "ready": True,
             "instance": "test-console",
+            "version": cli_module._mbtools_version(),
             "socket": str(tmp_path / "api.sock"),
             "ports": {"remote": 17999, "pool": 17998, "names": 17997},
         }
 
         os.close(write_fd)
+        write_fd = None
         thread.join(timeout=5.0)
         assert not thread.is_alive()
         assert stop_event.is_set()
         assert result["rc"] == EXIT_OK
         assert captured["assemble_registry_kwargs"]["no_peering"] is True
     finally:
+        # Ticket 008-006 hardening: if the ``assert payload == {...}``
+        # above (or anything else in the try block) raises before
+        # ``os.close(write_fd)`` runs, the target thread is left
+        # blocked forever inside `_watch_stdin_for_parent_exit`'s
+        # `readline()` -- closing only `read_file`, as this `finally`
+        # used to, does not unblock a thread already blocked in a
+        # blocking read on that fd. A leaked, still-blocked, non-daemon
+        # thread doesn't fail this test -- it hangs the whole pytest
+        # process at interpreter shutdown, waiting for that thread to
+        # exit. Closing `write_fd` here too (guarded against the
+        # already-closed case from the happy path above, which set it
+        # to None) delivers EOF unconditionally, so the watcher thread
+        # can always return before `thread.join(timeout=2.0)` below.
+        if write_fd is not None:
+            try:
+                os.close(write_fd)
+            except OSError:
+                pass
         read_file.close()
         if thread.is_alive():
             stop_event.set()

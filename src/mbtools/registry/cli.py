@@ -55,6 +55,7 @@ invoking user can write, e.g. ``--socket
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import json
 import os
 import signal
@@ -154,6 +155,16 @@ DEFAULT_UNIT_PATH = LINUX_SYSTEM_UNIT_PATH
 #: definition" treatment as :data:`DEFAULT_UNIT_PATH` above, onto
 #: :data:`~mbtools.registry.paths.LINUX_UDEV_RULE_PATH`.
 DEFAULT_UDEV_RULE_PATH = LINUX_UDEV_RULE_PATH
+
+#: Ticket 008-006: the one place this module reads the installed
+#: ``mbtools`` package version. Used both by the top-level ``--version``
+#: flag (``mbregistry <version>``) and by the ``"version"`` key
+#: ``--ready-json`` reports, so robot-console's minimum-version check
+#: (this ticket's own motivation) sees the same string either way it
+#: asks.
+def _mbtools_version() -> str:
+    return importlib.metadata.version("mbtools")
+
 
 _DB_ENV_VAR = "MBREGISTRY_DB"
 
@@ -1290,6 +1301,7 @@ def _run_registry(
         ready_payload = {
             "ready": True,
             "instance": instance if instance is not None else _short_hostname(),
+            "version": _mbtools_version(),
             "socket": str(socket_path),
             "ports": ports,
         }
@@ -1542,6 +1554,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mbregistry", description="local micro:bit device registry daemon"
     )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"mbregistry {_mbtools_version()}",
+        help="print the installed mbtools version and exit",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     list_p = sub.add_parser("list", help="list devices known to the registry")
@@ -1700,10 +1718,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             'print one JSON line (\'{"ready": true, "instance": ..., '
-            "\"socket\": ..., \"ports\": {...}}') to stdout once every "
-            "requested listener is bound, for a parent process spawning "
-            "this as a child (docs/design/robot-console-integration.md "
-            "Sec.4 item 4); no other stdout output occurs under this flag"
+            '"version": ..., "socket": ..., "ports": {...}}\') to stdout '
+            "once every requested listener is bound, for a parent process "
+            "spawning this as a child "
+            "(docs/design/robot-console-integration.md Sec.4 item 4); no "
+            "other stdout output occurs under this flag"
         ),
     )
     run_p.add_argument(

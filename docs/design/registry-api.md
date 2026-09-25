@@ -1049,6 +1049,38 @@ not: there is no Windows hardware acceptance target. Ticket 006's
 `windows-latest` GitHub Actions CI job is the first, and only, real
 verification this transport's `ctypes` bindings get.
 
+## `mbregistry --version` and `--ready-json`'s `version` key (sprint 008, ticket 006)
+
+robot-console checks a minimum `mbregistry` version before spawning or
+using it, and fails closed if it can't determine the version (see
+`docs/design/robot-console-integration.md` §4 item 5). Two surfaces
+report the same version string, both derived from one call —
+`importlib.metadata.version("mbtools")`, wrapped by
+`registry.cli._mbtools_version()` so neither call site duplicates the
+lookup:
+
+- **`mbregistry --version`** — a top-level `argparse` flag
+  (`action="version"`), so it works without a subcommand even though
+  every subcommand (`list`/`run`/…) is otherwise `required=True`; the
+  `version` action exits before that requirement is checked. Prints
+  `mbregistry <version>` to stdout (e.g. `mbregistry 0.20260924.6`) and
+  exits 0.
+- **`--ready-json`'s `version` key** — the JSON ready-line `mbregistry
+  run --ready-json` prints (sprint 007 ticket 005; shape documented in
+  `docs/service.md`'s spawn-recipe section) gained a top-level
+  `"version"` key equal to the same string, alongside `"ready"`,
+  `"instance"`, `"socket"`, and `"ports"`:
+
+  ```json
+  {"ready": true, "instance": "session-1234", "version": "0.20260924.6",
+   "socket": "/tmp/mbregistry-session/api.sock",
+   "ports": {"remote": 7440, "pool": 7444, "names": 7445}}
+  ```
+
+  This lets a parent process that spawns `mbregistry run` as a child
+  (rather than shelling out to `mbregistry --version` separately) read
+  the version off the same ready-line it already waits for.
+
 ## Exit codes
 
 `mbtools.common` defines the stable process exit codes ticket 009's CLI (and
