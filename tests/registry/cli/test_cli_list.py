@@ -38,8 +38,9 @@ def _uid(tag: str) -> str:
 UID_FREE_UNPROBED = _uid("aaaa1111")
 UID_CONNECTED = _uid("bbbb2222")
 UID_LOCKED = _uid("cccc3333")
-UID_NO_FIRMWARE = _uid("dddd4444")
+UID_NO_ANNOUNCE = _uid("dddd4444")
 UID_GONE = _uid("eeee5555")
+UID_KNOWN_BLANK = _uid("ffff6666")
 
 
 @pytest.fixture
@@ -70,11 +71,18 @@ def store(tmp_path):
         ),
     )
 
-    s.upsert_attached(UID_NO_FIRMWARE, "/dev/ttyACM3", VID_PID)
-    s.apply_probe_result(UID_NO_FIRMWARE, None)  # no announcement -> connected_no_firmware
+    s.upsert_attached(UID_NO_ANNOUNCE, "/dev/ttyACM3", VID_PID)
+    s.apply_probe_result(UID_NO_ANNOUNCE, None)  # no announcement -> attached_no_announce
 
     s.upsert_attached(UID_GONE, "/dev/ttyACM4", VID_PID)
     s.mark_disconnected(UID_GONE)
+
+    # Sprint 007, ticket 001: a genuinely-known-blank device (e.g. a
+    # flash-triggered re-probe that still gets nothing after a mass
+    # erase) -- distinct from UID_NO_ANNOUNCE above, which never asserts
+    # blankness, just "didn't hear anything".
+    s.upsert_attached(UID_KNOWN_BLANK, "/dev/ttyACM5", VID_PID)
+    s.apply_known_blank(UID_KNOWN_BLANK)
 
     yield s
     s.close()
@@ -108,7 +116,7 @@ def server(socket_dir, store, locks):
 
 
 @pytest.mark.requires_af_unix
-def test_list_table_shows_state_uid_firmware_port_and_error_notes(server, capsys):
+def test_list_table_shows_state_uid_firmware_port_and_no_trailing_lines(server, capsys):
     with pytest.raises(SystemExit) as excinfo:
         main(["list", "--socket", str(server.socket_path)])
 
@@ -118,12 +126,19 @@ def test_list_table_shows_state_uid_firmware_port_and_error_notes(server, capsys
     assert "STATE" in out and "UID" in out and "FIRMWARE" in out and "PORT" in out
     assert "free" in out  # UID_FREE_UNPROBED and UID_CONNECTED
     assert "locked by serial pid 4821" in out  # UID_LOCKED
-    assert "no-firmware" in out  # UID_NO_FIRMWARE
+    assert "no-answer" in out  # UID_NO_ANNOUNCE
+    assert "no-firmware" in out  # UID_KNOWN_BLANK
+    assert "unknown" in out  # UID_NO_ANNOUNCE's firmware cell
+    assert "no firmware" in out  # UID_KNOWN_BLANK's firmware cell
     assert "gone" in out  # UID_GONE
     assert "NEZHA2/robot" in out  # UID_CONNECTED's firmware cell
     assert "vevov" in out  # UID_CONNECTED's NAME cell
-    # error-note line under the row that needs one
-    assert "no announcement received during probe" in out
+    # Sprint 007, ticket 001 (SUC-003): the old free-text error-note line
+    # after the table is gone -- exactly one header, one rule, one row
+    # per device, nothing else.
+    assert "no announcement received during probe" not in out
+    lines = out.splitlines()
+    assert len(lines) == 2 + 6  # header + rule + one row per seeded device
 
 
 @pytest.mark.requires_af_unix
@@ -139,13 +154,22 @@ def test_list_json_matches_api_device_fields(server, capsys):
         UID_FREE_UNPROBED,
         UID_CONNECTED,
         UID_LOCKED,
-        UID_NO_FIRMWARE,
+        UID_NO_ANNOUNCE,
         UID_GONE,
+        UID_KNOWN_BLANK,
     }
     assert by_uid[UID_LOCKED]["lock_kind"] == KIND_SERIAL
     assert by_uid[UID_LOCKED]["lock_pid"] == 4821
     assert by_uid[UID_CONNECTED]["device_name"] == "vevov"
     assert by_uid[UID_GONE]["state"] == "disconnected"
+    # Sprint 007, ticket 001 (SUC-003): --json carries the same per-device
+    # detail the old free-text table trailer used to convey, as a
+    # structured field (error_note) rather than prose after the table.
+    assert by_uid[UID_NO_ANNOUNCE]["state"] == "attached_no_announce"
+    assert by_uid[UID_NO_ANNOUNCE]["error_note"] == "no announcement received during probe"
+    assert by_uid[UID_KNOWN_BLANK]["state"] == "connected_no_firmware"
+    assert by_uid[UID_KNOWN_BLANK]["error_note"]
+    assert by_uid[UID_KNOWN_BLANK]["error_note"] != by_uid[UID_NO_ANNOUNCE]["error_note"]
 
 
 # ---------------------------------------------------------------------------

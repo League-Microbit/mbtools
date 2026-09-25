@@ -18,9 +18,9 @@ from mbtools.common import DAPLINK_VID_PID, PortInfo
 from mbtools.registry.daemon import Daemon
 from mbtools.registry.locks import KIND_FLASH, KIND_SERIAL, HolderRef
 from mbtools.registry.store import (
+    STATE_ATTACHED_NO_ANNOUNCE,
     STATE_ATTACHED_UNPROBED,
     STATE_CONNECTED,
-    STATE_CONNECTED_NO_FIRMWARE,
     STATE_DISCONNECTED,
     Store,
     format_vid_pid,
@@ -246,7 +246,14 @@ def test_flash_reprobe_without_intervening_detach_still_reprobes(store):
 # ---------------------------------------------------------------------------
 
 
-def test_flash_reprobe_timeout_marks_no_firmware_without_reopening_port(store):
+def test_flash_reprobe_timeout_marks_no_announce_without_reopening_port(store):
+    """Sprint 007, ticket 001: this give-up path still calls the plain
+    ``Store.apply_probe_result(uid, None)`` (ticket 001's own scoping --
+    see daemon.py's ``run_once`` docstring -- leaves routing this specific
+    call site to ``Store.apply_known_blank`` for ticket 003, which owns
+    the full flash-triggered-known-blank wiring), so it now lands on
+    ``STATE_ATTACHED_NO_ANNOUNCE`` rather than the old
+    ``STATE_CONNECTED_NO_FIRMWARE``."""
     usbwatch = FakeUSBSource([[_port_info()], []])  # never comes back
     script = _ProbeScript([ANNOUNCEMENT])
     clock = _Clock(start=0.0)
@@ -266,7 +273,7 @@ def test_flash_reprobe_timeout_marks_no_firmware_without_reopening_port(store):
     clock.advance(10.0)  # now well past the deadline
     daemon.run_once()  # still absent -> gives up
 
-    assert store.get(UID).state == STATE_CONNECTED_NO_FIRMWARE
+    assert store.get(UID).state == STATE_ATTACHED_NO_ANNOUNCE
     assert script.calls == 1  # never reopened a port for a device not there
 
 
@@ -285,7 +292,7 @@ def test_flash_reprobe_before_deadline_does_not_time_out(store):
     clock.advance(1.0)
     daemon.run_once()  # detach; well within the 5s window
 
-    assert store.get(UID).state == STATE_DISCONNECTED  # not marked no-firmware
+    assert store.get(UID).state == STATE_DISCONNECTED  # not marked no-announce
 
 
 # ---------------------------------------------------------------------------
@@ -393,8 +400,11 @@ def test_event_callback_fires_detach(store):
 def test_event_callback_fires_identity_on_flash_reprobe_timeout_giveup(store):
     """The flash-reprobe-timeout give-up path also calls
     ``store.apply_probe_result`` (with a ``None`` result) -- a peer needs
-    to learn about that ``connected_no_firmware`` transition exactly like
-    any other completed probe."""
+    to learn about that ``attached_no_announce`` transition exactly like
+    any other completed probe. (Sprint 007, ticket 001: this give-up path
+    is not yet routed to ``Store.apply_known_blank`` -- see ticket 001's
+    own scoping note in daemon.py's ``run_once`` docstring -- so it still
+    lands on the didn't-announce state, not known-blank.)"""
     usbwatch = FakeUSBSource([[_port_info()], []])  # never comes back
     script = _ProbeScript([ANNOUNCEMENT])
     clock = _Clock(start=0.0)
@@ -415,9 +425,9 @@ def test_event_callback_fires_identity_on_flash_reprobe_timeout_giveup(store):
     events.clear()
 
     clock.advance(10.0)
-    daemon.run_once()  # gives up -> identity event with connected_no_firmware
+    daemon.run_once()  # gives up -> identity event with attached_no_announce
 
-    assert events == [("identity", UID, STATE_CONNECTED_NO_FIRMWARE)]
+    assert events == [("identity", UID, STATE_ATTACHED_NO_ANNOUNCE)]
 
 
 def test_no_event_callback_registered_is_a_silent_no_op(store):

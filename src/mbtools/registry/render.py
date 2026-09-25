@@ -22,6 +22,7 @@ from __future__ import annotations
 from typing import Any
 
 from mbtools.registry.store import (
+    STATE_ATTACHED_NO_ANNOUNCE,
     STATE_ATTACHED_UNPROBED,
     STATE_CONNECTED_NO_FIRMWARE,
     STATE_DISCONNECTED,
@@ -58,11 +59,18 @@ def _sort_devices(devices: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _state_cell(device: dict[str, Any]) -> str:
     """UC-004's STATE column: ``free`` / ``locked by <kind> pid <n>`` /
-    ``no-firmware`` / ``gone`` / ``peer unreachable``. Lock status
-    (folded into the ``list`` response by ``api._device_dict``) takes
-    precedence over ``connected_no_firmware`` -- a device can be locked
-    (e.g. mid-flash) while its last-known state is still "no firmware",
-    and the lock is the more useful thing to show.
+    ``no-answer`` / ``no-firmware`` / ``gone`` / ``peer unreachable``.
+    Lock status (folded into the ``list`` response by
+    ``api._device_dict``) takes precedence over either no-firmware state
+    -- a device can be locked (e.g. mid-flash) while its last-known state
+    is still one of those, and the lock is the more useful thing to show.
+
+    Sprint 007 (ticket 001): ``no-answer`` (:data:`STATE_ATTACHED_NO_ANNOUNCE`)
+    is a probe that got nothing back but doesn't know the board is blank;
+    ``no-firmware`` (:data:`STATE_CONNECTED_NO_FIRMWARE`) is reserved for
+    a case this store can actually assert is blank (e.g. a flash-triggered
+    re-probe that still gets nothing after a mass erase). See
+    ``registry.store``'s module-level constants for the full distinction.
 
     Sprint 003 (ticket 010): a peer-owned row (``device["host"]`` set)
     reads a different pair of fields for both checks, per sprint.md
@@ -89,6 +97,8 @@ def _state_cell(device: dict[str, Any]) -> str:
         lock_kind = device.get("lock_kind")
         if lock_kind:
             return f"locked by {lock_kind} pid {device.get('lock_pid')}"
+    if device["state"] == STATE_ATTACHED_NO_ANNOUNCE:
+        return "no-answer"
     if device["state"] == STATE_CONNECTED_NO_FIRMWARE:
         return "no-firmware"
     return "free"
@@ -112,9 +122,17 @@ def _firmware_cell(device: dict[str, Any]) -> str:
     this store's fields: no dedicated firmware-version field exists here
     (see ``store.DeviceRecord``), so ``role``/``common_name`` from the
     device's own announcement stand in for it.
+
+    Sprint 007 (ticket 001): ``unknown`` for a didn't-announce board
+    (:data:`STATE_ATTACHED_NO_ANNOUNCE` -- a probe ran and got nothing,
+    but the board plausibly has firmware we simply don't hear from);
+    ``no firmware`` only for a board known to be blank
+    (:data:`STATE_CONNECTED_NO_FIRMWARE`).
     """
     if device["state"] == STATE_ATTACHED_UNPROBED:
         return "(not probed yet)"
+    if device["state"] == STATE_ATTACHED_NO_ANNOUNCE:
+        return "unknown"
     if device["state"] == STATE_CONNECTED_NO_FIRMWARE:
         return "no firmware"
     role = device.get("role")
@@ -144,13 +162,20 @@ def _table(rows: list[list[str]], headers: list[str]) -> str:
 
 
 def render_table(devices: list[dict[str, Any]]) -> str:
-    """The STATE/NAME/UID/FIRMWARE/PORT table plus per-device error-note
-    lines -- the same text ``mbregistry list`` has printed since sprint
-    001, now available to any caller (``mbdeploy list``, ticket 008)
-    without going through the CLI. Callers print the return value with a
-    single ``print()`` call; it carries no trailing newline of its own,
-    matching the byte-for-byte output the original inline
-    ``print(_table(...))`` + one ``print()`` per error-note line produced.
+    """The STATE/NAME/UID/FIRMWARE/HOST/PORT table -- exactly one header
+    line, one rule line, and one row per device, nothing else (sprint 007,
+    ticket 001 / SUC-003: ``render_table``'s output never contains a line
+    after the table, even for a device with a non-empty ``error_note`` --
+    that detail is only available via :func:`render_json`'s structured
+    form now, not appended as free-text prose here). Available to any
+    caller (``mbdeploy list``, ticket 008) without going through the CLI.
+    Callers print the return value with a single ``print()`` call; it
+    carries no trailing newline of its own.
+
+    The ``NAME`` cell falls back to the device's cached chip identity
+    (``chip_identity_name``, sprint 007 ticket 001) when ``device_name``
+    is blank -- a board that never announces over serial still has a
+    name once its chip identity has been read over SWD (ticket 003).
 
     An empty ``devices`` list renders as the same "no devices known to
     the registry" line ``mbregistry list`` has always shown instead of an
@@ -164,7 +189,7 @@ def render_table(devices: list[dict[str, Any]]) -> str:
     rows = [
         [
             _state_cell(d),
-            d.get("device_name") or "-",
+            d.get("device_name") or d.get("chip_identity_name") or "-",
             d.get("short_uid") or d["uid"][-8:],
             _firmware_cell(d),
             _host_cell(d),
@@ -172,13 +197,7 @@ def render_table(devices: list[dict[str, Any]]) -> str:
         ]
         for d in devices
     ]
-    lines = [_table(rows, TABLE_HEADERS)]
-    for d in devices:
-        note = d.get("error_note")
-        if note:
-            label = d.get("device_name") or d.get("short_uid") or d["uid"]
-            lines.append(f"  {label}: {note}")
-    return "\n".join(lines)
+    return _table(rows, TABLE_HEADERS)
 
 
 def render_json(devices: list[dict[str, Any]]) -> dict[str, Any]:
@@ -190,5 +209,12 @@ def render_json(devices: list[dict[str, Any]]) -> dict[str, Any]:
     function stops at the structure, not the wire text, so a caller that
     wants the dict itself (e.g. to inspect it, not print it) doesn't pay
     for a round trip through a string.
+
+    Each device dict carries its own ``error_note`` (and, sprint 007
+    ticket 001, ``chip_identity_name``/``chip_identity_serial``) field
+    verbatim -- the same detail :func:`render_table` used to print as a
+    free-text line after the table now only reaches a caller through this
+    structured field, per SUC-003's "``--json`` carries the same
+    per-device detail as a structured field" requirement.
     """
     return {"devices": _sort_devices(devices)}

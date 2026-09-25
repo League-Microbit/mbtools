@@ -31,6 +31,7 @@ from mbtools.registry.peering import PeerDiscovery
 from mbtools.registry.store import (
     SOURCE_DERIVED,
     SOURCE_REGISTRY,
+    STATE_ATTACHED_NO_ANNOUNCE,
     STATE_ATTACHED_UNPROBED,
     STATE_CONNECTED,
     STATE_CONNECTED_NO_FIRMWARE,
@@ -196,13 +197,20 @@ def test_apply_event_identity_connected_sets_announcement_fields(store):
 
 
 def test_apply_event_identity_no_firmware(store):
+    """``peering._apply_event`` itself is unmodified by sprint 007 (per
+    sprint.md's Architecture: "no change to peering.py's own code") and
+    still matches the wire value ``STATE_CONNECTED_NO_FIRMWARE`` on this
+    branch -- but the local store write it delegates to
+    (``store.apply_remote_probe(uid, None)`` -> ``apply_probe_result``)
+    now lands on ``STATE_ATTACHED_NO_ANNOUNCE`` (ticket 001's
+    state-model split), not the old ``STATE_CONNECTED_NO_FIRMWARE``."""
     peering_mod._apply_event(store, "alpha", {"type": "attach", "uid": UID, "port": "p", "vid_pid": "v"})
 
     peering_mod._apply_event(
         store, "alpha", {"type": "identity", "uid": UID, "state": STATE_CONNECTED_NO_FIRMWARE}
     )
 
-    assert store.get(UID).state == STATE_CONNECTED_NO_FIRMWARE
+    assert store.get(UID).state == STATE_ATTACHED_NO_ANNOUNCE
 
 
 def test_apply_event_detach_marks_disconnected(store):

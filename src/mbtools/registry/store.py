@@ -19,7 +19,8 @@ means for a reattach: :meth:`Store.upsert_attached` resets ``last_probe``
 to ``0.0`` only when the record's previous ``state`` was ``disconnected``
 (a genuine reattach — the prior probe session ended when the device went
 away) or the record is brand new. A record that was already
-``attached_unprobed``/``connected``/``connected_no_firmware`` (e.g. the
+``attached_unprobed``/``connected``/``attached_no_announce``/
+``connected_no_firmware`` (e.g. the
 daemon restarting and rescanning devices that never actually left) keeps
 its ``last_probe`` untouched, so :meth:`Store.needs_probe` correctly
 reports "already probed, still attached" per SUC-007's "daemon restart is
@@ -74,6 +75,7 @@ __all__ = [
     "Entry",
     "PeerRecord",
     "Store",
+    "STATE_ATTACHED_NO_ANNOUNCE",
     "STATE_ATTACHED_UNPROBED",
     "STATE_CONNECTED",
     "STATE_CONNECTED_NO_FIRMWARE",
@@ -96,6 +98,25 @@ DEFAULT_DB_PATH = default_db_path()
 # Device lifecycle states, per sprint.md's ERD §4.
 STATE_ATTACHED_UNPROBED = "attached_unprobed"
 STATE_CONNECTED = "connected"
+#: Sprint 007, ticket 001: "we probed and got nothing back" -- the board
+#: plausibly has *some* firmware, it just doesn't announce over serial
+#: (blank student/robot firmware with no ``HELLO`` handler, or a firmware
+#: bug). Set by :meth:`Store.apply_probe_result` when ``result`` is
+#: ``None``. Distinct from :data:`STATE_CONNECTED_NO_FIRMWARE`, which is
+#: now reserved for the case this store can actually *assert* the board
+#: is blank (see that constant's own docstring below) -- see sprint.md's
+#: Design Rationale "repurpose STATE_CONNECTED_NO_FIRMWARE for 'known
+#: blank'".
+STATE_ATTACHED_NO_ANNOUNCE = "attached_no_announce"
+#: From sprint 007 forward, this means *only* "known blank" -- a case
+#: this store can actually assert, principally the flash-triggered
+#: re-probe that still gets nothing after a mass erase (see
+#: :meth:`Store.apply_known_blank`). Before sprint 007 this value also
+#: covered an ordinary silent probe with no assertion behind it; that
+#: broader meaning is now :data:`STATE_ATTACHED_NO_ANNOUNCE` instead. A
+#: pre-sprint-007 row already sitting at this value is not retroactively
+#: reclassified -- it relabels correctly on its next real probe event
+#: (sprint.md's Migration Concerns).
 STATE_CONNECTED_NO_FIRMWARE = "connected_no_firmware"
 STATE_DISCONNECTED = "disconnected"
 
@@ -104,6 +125,13 @@ STATE_DISCONNECTED = "disconnected"
 #: window. Kept as one constant so the API layer (ticket 008) and any test
 #: asserting on it can't drift out of sync with each other.
 _ERROR_NOTE_NO_ANNOUNCEMENT = "no announcement received during probe"
+
+#: error_note text set by :meth:`Store.apply_known_blank` -- a probe that
+#: is *known* to have found the board blank (principally a flash-triggered
+#: re-probe still getting nothing after a mass erase), as opposed to the
+#: plain "didn't hear anything" case :data:`_ERROR_NOTE_NO_ANNOUNCEMENT`
+#: covers.
+_ERROR_NOTE_KNOWN_BLANK = "board confirmed blank (no firmware) after re-probe"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS device (
@@ -138,6 +166,21 @@ _NEW_DEVICE_COLUMNS: list[tuple[str, str]] = [
     ("host", "TEXT"),
     ("remote_lock_kind", "TEXT"),
     ("remote_lock_display", "TEXT"),
+]
+
+#: Sprint 007, ticket 001: the chip-identity cache -- a board's real name
+#: and decimal serial as read from ``FICR.DEVICEID[1]`` over SWD (ticket
+#: 003), independent of the announcement-derived ``device_name`` (which
+#: goes blank again on a reflash to non-announcing firmware). A separate
+#: list from ``_NEW_DEVICE_COLUMNS`` above -- that one is documented as
+#: specifically "the three sprint-003 columns" -- added to an existing
+#: ``device`` table via the same in-place, idempotent
+#: ``ALTER TABLE ... ADD COLUMN`` pattern (see :meth:`Store._migrate_schema`),
+#: so a pre-existing ``devices.db`` from before this ticket migrates
+#: cleanly, same as sprint 003's own columns did.
+_CHIP_IDENTITY_COLUMNS: list[tuple[str, str]] = [
+    ("chip_identity_name", "TEXT"),
+    ("chip_identity_serial", "INTEGER"),
 ]
 
 _PEER_SCHEMA = """
@@ -210,6 +253,17 @@ class DeviceRecord:
     is ``None``) they are always ``None`` and must not be consulted;
     ``list``/``render`` read live ``LockManager`` state for a local row
     instead (Decision 3).
+
+    ``chip_identity_name``/``chip_identity_serial`` (sprint 007, ticket
+    001) are the board's real five-letter name and decimal serial, read
+    once over SWD from ``FICR.DEVICEID[1]`` (ticket 003) and cached
+    forever -- ``None`` until that read succeeds. Unlike every other
+    field on this record, they are *never* derived from the serial
+    announcement and are never cleared or overwritten by
+    :meth:`Store.apply_probe_result`/:meth:`Store.apply_remote_probe`,
+    even across a reflash that blanks ``device_name`` again -- a chip's
+    physical identity doesn't change when its firmware does. Set only by
+    :meth:`Store.set_chip_identity`.
     """
 
     uid: str
@@ -226,6 +280,8 @@ class DeviceRecord:
     host: str | None
     remote_lock_kind: str | None
     remote_lock_display: str | None
+    chip_identity_name: str | None
+    chip_identity_serial: int | None
     flash_count: int
     first_seen: float
     last_seen: float
@@ -248,6 +304,8 @@ def _row_to_record(row: sqlite3.Row) -> DeviceRecord:
         host=row["host"],
         remote_lock_kind=row["remote_lock_kind"],
         remote_lock_display=row["remote_lock_display"],
+        chip_identity_name=row["chip_identity_name"],
+        chip_identity_serial=row["chip_identity_serial"],
         flash_count=row["flash_count"],
         first_seen=row["first_seen"],
         last_seen=row["last_seen"],
@@ -416,10 +474,11 @@ class Store:
         self._conn.commit()
 
     def _migrate_schema(self) -> None:
-        """Add the sprint-003 ``device`` columns, the ``peer`` table, and
-        (sprint 004, ticket 001) the ``name_registry`` table, in place --
-        never a destructive rebuild, per this module's "never delete,
-        always update in place" precedent (module docstring; sprint.md's
+        """Add the sprint-003 ``device`` columns, the sprint-007
+        chip-identity columns, the ``peer`` table, and (sprint 004,
+        ticket 001) the ``name_registry`` table, in place -- never a
+        destructive rebuild, per this module's "never delete, always
+        update in place" precedent (module docstring; sprint.md's
         Migration Concerns).
 
         Runs unconditionally, every construction, right after ``_SCHEMA``'s
@@ -439,7 +498,7 @@ class Store:
         existing_columns = {
             row["name"] for row in self._conn.execute("PRAGMA table_info(device)")
         }
-        for column, decl in _NEW_DEVICE_COLUMNS:
+        for column, decl in _NEW_DEVICE_COLUMNS + _CHIP_IDENTITY_COLUMNS:
             if column not in existing_columns:
                 self._conn.execute(f"ALTER TABLE device ADD COLUMN {column} {decl}")
         self._conn.execute(_PEER_SCHEMA)
@@ -577,11 +636,17 @@ class Store:
         updates ``last_probe``/``last_seen``.
 
         On ``None`` (no announcement arrived within the probe window):
-        sets ``state="connected_no_firmware"`` and an ``error_note``, but
-        leaves any previously-known announcement fields untouched --
-        mirrors ``mbdeploy``'s "preserve existing announcement fields
-        unchanged" rule. ``last_probe``/``last_seen`` are still updated --
-        a probe was attempted, so this uid is no longer "never probed".
+        sets ``state=STATE_ATTACHED_NO_ANNOUNCE`` (sprint 007, ticket
+        001 -- "we asked and got nothing back", not an assertion that the
+        board is blank) and an ``error_note``, but leaves any
+        previously-known announcement fields untouched -- mirrors
+        ``mbdeploy``'s "preserve existing announcement fields unchanged"
+        rule. ``last_probe``/``last_seen`` are still updated -- a probe
+        was attempted, so this uid is no longer "never probed". Use
+        :meth:`apply_known_blank` instead of passing ``None`` here for a
+        call site that can actually assert the board is blank (e.g. a
+        flash-triggered re-probe that still gets nothing after a mass
+        erase).
 
         Raises :class:`KeyError` if ``uid`` has no existing record -- the
         pipeline always calls :meth:`upsert_attached` before probing.
@@ -618,8 +683,76 @@ class Store:
                     SET state = ?, error_note = ?, last_probe = ?, last_seen = ?
                     WHERE uid = ?
                     """,
-                    (STATE_CONNECTED_NO_FIRMWARE, _ERROR_NOTE_NO_ANNOUNCEMENT, now, now, uid),
+                    (STATE_ATTACHED_NO_ANNOUNCE, _ERROR_NOTE_NO_ANNOUNCEMENT, now, now, uid),
                 )
+            self._conn.commit()
+            record = self.get(uid)
+            assert record is not None
+            return record
+
+    def apply_known_blank(self, uid: str) -> DeviceRecord:
+        """Sibling to :meth:`apply_probe_result` (mirroring the existing
+        :meth:`apply_remote_probe` sibling-method precedent) for a call
+        site that can actually *assert* the board is blank, rather than
+        merely "didn't hear anything" -- principally ticket 003's
+        flash-triggered re-probe that still gets nothing after a mass
+        erase.
+
+        Sets ``state=STATE_CONNECTED_NO_FIRMWARE`` and an ``error_note``
+        distinct from :meth:`apply_probe_result`'s didn't-announce note,
+        leaving any previously-known announcement fields untouched --
+        same "preserve existing announcement fields" rule as
+        :meth:`apply_probe_result`. ``last_probe``/``last_seen`` are
+        updated -- a probe was attempted.
+
+        Raises :class:`KeyError` if ``uid`` has no existing record.
+        """
+        with self._lock:
+            if self.get(uid) is None:
+                raise KeyError(f"store.apply_known_blank: no record for uid {uid!r}")
+            now = self._now()
+            self._conn.execute(
+                """
+                UPDATE device
+                SET state = ?, error_note = ?, last_probe = ?, last_seen = ?
+                WHERE uid = ?
+                """,
+                (STATE_CONNECTED_NO_FIRMWARE, _ERROR_NOTE_KNOWN_BLANK, now, now, uid),
+            )
+            self._conn.commit()
+            record = self.get(uid)
+            assert record is not None
+            return record
+
+    def set_chip_identity(self, uid: str, name: str, serial: int) -> DeviceRecord:
+        """Persist ``uid``'s chip-identity cache (name + decimal serial)
+        -- a fixed physical property of the target chip read once over
+        SWD (ticket 003's ``identity.read_chip_identity``), independent
+        of the announcement-derived ``device_name``.
+
+        Write-once per uid: a uid that already has a cached
+        ``chip_identity_name`` is left untouched and the existing record
+        is returned unchanged -- once read, the value can never
+        legitimately change for a given physical chip (sprint.md SUC-001's
+        "cached forever ... never re-read"), so a second call (e.g. a
+        retried read racing an already-successful one) must not clobber
+        it. The primary "don't call SWD twice" gate lives in
+        ``registry.daemon`` (it checks the cache before ever calling the
+        SWD read); this is the store's own second line of defense.
+
+        Raises :class:`KeyError` if ``uid`` has no existing record.
+        """
+        with self._lock:
+            existing = self.get(uid)
+            if existing is None:
+                raise KeyError(f"store.set_chip_identity: no record for uid {uid!r}")
+            if existing.chip_identity_name is not None:
+                return existing
+            self._conn.execute(
+                "UPDATE device SET chip_identity_name = ?, chip_identity_serial = ? "
+                "WHERE uid = ?",
+                (name, serial, uid),
+            )
             self._conn.commit()
             record = self.get(uid)
             assert record is not None

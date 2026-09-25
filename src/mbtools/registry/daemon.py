@@ -29,8 +29,12 @@ again — regardless of what :meth:`Store.needs_probe` says, since a flash
 can leave the DAPLink interface enumerated throughout (no detach/reattach
 cycle to trip the store's own "reattach resets last_probe" rule) — and if
 it never reappears before its deadline, it is marked
-``connected_no_firmware`` (the store's existing "blank-equivalent" state,
-reused here rather than inventing a new one) instead of waiting forever.
+``attached_no_announce`` via the plain :meth:`Store.apply_probe_result`
+call (sprint 007, ticket 001 narrows what that call's ``None`` branch
+means — see ``store.py``'s module constants; ticket 003 is expected to
+route this specific give-up path to :meth:`Store.apply_known_blank`
+instead, since it can actually assert the board is blank) instead of
+waiting forever.
 
 **Detach handling**: a uid that drops out of a scan has any lock it holds
 force-released (a detach is not a graceful release — UC-002's
@@ -259,7 +263,8 @@ class Daemon:
         3. For each uid that was attached last cycle but is gone now:
            force-release any lock it holds, then ``store.mark_disconnected``.
         4. For each flash-pending uid that is still absent and past its
-           deadline: give up and mark it ``connected_no_firmware``.
+           deadline: give up and mark it ``attached_no_announce`` (see
+           :meth:`Store.apply_probe_result`'s ``None`` branch).
 
         "Attached last cycle" is read from ``store`` (any *locally-owned*
         record -- ``host is None`` -- whose ``state`` isn't
@@ -336,9 +341,20 @@ class Daemon:
                 if uid not in current and now >= deadline:
                     logger.warning(
                         "daemon: %s never re-enumerated after flash within timeout; "
-                        "marking no-firmware",
+                        "marking no-announce",
                         uid,
                     )
+                    # Sprint 007, ticket 001: apply_probe_result(uid, None)
+                    # now lands on STATE_ATTACHED_NO_ANNOUNCE rather than
+                    # STATE_CONNECTED_NO_FIRMWARE (see store.py's module
+                    # constants). This call site is a flash-triggered
+                    # re-probe that genuinely knows the board is blank, so
+                    # it belongs on Store.apply_known_blank instead -- left
+                    # as-is here per this ticket's own scoping (coordinate
+                    # with ticket 003, which owns that wiring) and to keep
+                    # this ticket's daemon.py change to the minimum needed
+                    # for its existing tests to pass against the renamed
+                    # constant.
                     record = self._store.apply_probe_result(uid, None)
                     timed_out.append(record)
                     del self._flash_pending[uid]
