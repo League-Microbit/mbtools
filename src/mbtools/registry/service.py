@@ -46,7 +46,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, Protocol, runtime_checkable
+from typing import IO, Any, Protocol, runtime_checkable
 
 from .paths import (
     LINUX_SYSTEM_UNIT_PATH,
@@ -301,7 +301,7 @@ def render_launchd_plist(scope: str, *, exec_path: str | None = None) -> str:
 
     plist: dict[str, object] = {
         "Label": plist_path.stem,
-        "ProgramArguments": [program, "-m", "mbtools.registry.cli", "run"],
+        "ProgramArguments": [program, "-m", "mbtools.registry.cli", "service", "run"],
         "EnvironmentVariables": {"PYTHONUNBUFFERED": "1"},
         "WorkingDirectory": _macos_working_directory(scope),
         "RunAtLoad": True,
@@ -469,6 +469,61 @@ def macos_status(scope: str, *, runner: CommandRunner | None = None) -> ServiceS
         running = result.returncode == 0
 
     return ServiceStatus(scope=scope, path=plist_path, installed=installed, running=running)
+
+
+def _macos_control(
+    action: str, scope: str, *, dry_run: bool = False, runner: CommandRunner | None = None
+) -> Path:
+    """Start, stop, or restart the already-installed launchd service at
+    ``scope`` without touching its plist. ``stop`` is ``launchctl
+    bootout`` (unloads it, so ``KeepAlive`` can't relaunch it; the plist
+    stays and it loads again at next boot); ``start``/``restart``
+    bootstrap it first (tolerating "already loaded", the same way
+    :func:`macos_install` does), then ``kickstart`` it -- ``-k`` for
+    ``restart``, which kills a running instance first.
+
+    Raises :class:`FileNotFoundError` when nothing is installed at
+    ``scope``.
+    """
+    _validate_macos_scope(scope)
+    plist_path = _macos_plist_path(scope)
+    if not plist_path.exists():
+        raise FileNotFoundError(plist_path)
+    domain = _macos_domain(scope)
+    service_target = f"{domain}/{plist_path.stem}"
+    runner = runner if runner is not None else default_runner(dry_run=dry_run)
+
+    if action == "stop":
+        try:
+            runner.run(["launchctl", "bootout", service_target])
+        except subprocess.CalledProcessError:
+            pass  # already stopped/unloaded -- not a real failure
+        return plist_path
+
+    try:
+        runner.run(["launchctl", "bootstrap", domain, str(plist_path)])
+    except subprocess.CalledProcessError:
+        pass  # already loaded -- kickstart below still (re)starts it
+    kickstart = ["launchctl", "kickstart"]
+    if action == "restart":
+        kickstart.append("-k")
+    runner.run([*kickstart, service_target])
+    return plist_path
+
+
+def macos_start(scope: str, **kwargs: Any) -> Path:
+    """Start the installed launchd service -- see :func:`_macos_control`."""
+    return _macos_control("start", scope, **kwargs)
+
+
+def macos_stop(scope: str, **kwargs: Any) -> Path:
+    """Stop (unload) the installed launchd service -- see :func:`_macos_control`."""
+    return _macos_control("stop", scope, **kwargs)
+
+
+def macos_restart(scope: str, **kwargs: Any) -> Path:
+    """Restart the installed launchd service -- see :func:`_macos_control`."""
+    return _macos_control("restart", scope, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -676,7 +731,7 @@ def render_systemd_unit(exec_start: str | None = None, *, scope: str = "system")
     """
     _validate_linux_scope(scope)
     if exec_start is None:
-        exec_start = f"{sys.executable} -m mbtools.registry.cli run"
+        exec_start = f"{sys.executable} -m mbtools.registry.cli service run"
     template = _SYSTEMD_UNIT_TEMPLATE if scope == "system" else _SYSTEMD_USER_UNIT_TEMPLATE
     return template.format(exec_start=exec_start)
 
@@ -930,3 +985,36 @@ def linux_status(scope: str, *, runner: CommandRunner | None = None) -> ServiceS
         running = result.returncode == 0
 
     return ServiceStatus(scope=scope, path=unit_path, installed=installed, running=running)
+
+
+def _linux_control(
+    action: str, scope: str, *, dry_run: bool = False, runner: CommandRunner | None = None
+) -> Path:
+    """``systemctl [--user] start|stop|restart mbregistry.service`` for
+    the already-installed unit at ``scope``, leaving the unit file and
+    its enablement alone. Raises :class:`FileNotFoundError` when nothing
+    is installed at ``scope``.
+    """
+    _validate_linux_scope(scope)
+    unit_path = _linux_unit_path(scope)
+    if not unit_path.exists():
+        raise FileNotFoundError(unit_path)
+    systemctl = ["systemctl", "--user"] if scope == "user" else ["systemctl"]
+    runner = runner if runner is not None else default_runner(dry_run=dry_run)
+    runner.run([*systemctl, action, _LINUX_UNIT_NAME])
+    return unit_path
+
+
+def linux_start(scope: str, **kwargs: Any) -> Path:
+    """Start the installed systemd unit -- see :func:`_linux_control`."""
+    return _linux_control("start", scope, **kwargs)
+
+
+def linux_stop(scope: str, **kwargs: Any) -> Path:
+    """Stop the installed systemd unit -- see :func:`_linux_control`."""
+    return _linux_control("stop", scope, **kwargs)
+
+
+def linux_restart(scope: str, **kwargs: Any) -> Path:
+    """Restart the installed systemd unit -- see :func:`_linux_control`."""
+    return _linux_control("restart", scope, **kwargs)

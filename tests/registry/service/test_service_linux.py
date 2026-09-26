@@ -41,7 +41,10 @@ from mbtools.registry.service import (
     LinuxUserPreflightError,
     ServiceStatus,
     linux_install,
+    linux_restart,
+    linux_start,
     linux_status,
+    linux_stop,
     linux_uninstall,
     render_systemd_unit,
     render_udev_rule,
@@ -139,7 +142,7 @@ def test_render_systemd_unit_defaults_to_system_scope_unchanged():
     assert "[Unit]" in unit_text
     assert "[Service]" in unit_text
     assert "[Install]" in unit_text
-    assert f"ExecStart={sys.executable} -m mbtools.registry.cli run" in unit_text
+    assert f"ExecStart={sys.executable} -m mbtools.registry.cli service run" in unit_text
     assert "Restart=on-failure" in unit_text
     assert "RuntimeDirectory=mbregistry" in unit_text
     assert "StateDirectory=mbregistry" in unit_text
@@ -158,7 +161,7 @@ def test_render_systemd_unit_user_scope_has_no_runtime_or_state_directory():
     assert "StateDirectory=" not in unit_text
     assert "WantedBy=default.target" in unit_text
     assert "WantedBy=multi-user.target" not in unit_text
-    assert f"ExecStart={sys.executable} -m mbtools.registry.cli run" in unit_text
+    assert f"ExecStart={sys.executable} -m mbtools.registry.cli service run" in unit_text
 
 
 def test_render_systemd_unit_user_scope_accepts_custom_exec_start():
@@ -503,3 +506,34 @@ def test_linux_functions_dont_depend_on_sys_platform(linux_paths, monkeypatch, r
     )
     assert result_path == linux_paths.system_unit
     assert linux_paths.system_unit.exists()
+
+
+# ---------------------------------------------------------------------------
+# start/stop/restart -- control an installed unit without reinstalling
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("control_fn", "action"),
+    [(linux_start, "start"), (linux_stop, "stop"), (linux_restart, "restart")],
+)
+def test_linux_control_runs_systemctl_action(linux_paths, control_fn, action):
+    linux_paths.system_unit.parent.mkdir(parents=True)
+    linux_paths.system_unit.write_text("unit")
+    runner = _FakeRunner()
+    control_fn("system", runner=runner)
+    assert runner.calls == [["systemctl", action, "mbregistry.service"]]
+    assert linux_paths.system_unit.exists()
+
+
+def test_linux_control_user_scope_uses_systemctl_user(linux_paths):
+    linux_paths.user_unit.parent.mkdir(parents=True)
+    linux_paths.user_unit.write_text("unit")
+    runner = _FakeRunner()
+    linux_restart("user", runner=runner)
+    assert runner.calls == [["systemctl", "--user", "restart", "mbregistry.service"]]
+
+
+def test_linux_control_raises_when_not_installed(linux_paths):
+    with pytest.raises(FileNotFoundError):
+        linux_start("system", runner=_FakeRunner())

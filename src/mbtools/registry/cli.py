@@ -58,8 +58,10 @@ import argparse
 import importlib.metadata
 import json
 import os
+import shlex
 import signal
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -106,10 +108,16 @@ from mbtools.registry.service import (
     DryRunCommandRunner,
     LinuxUserPreflightError,
     linux_install,
+    linux_restart,
+    linux_start,
     linux_status,
+    linux_stop,
     linux_uninstall,
     macos_install,
+    macos_restart,
+    macos_start,
     macos_status,
+    macos_stop,
     macos_uninstall,
 )
 from mbtools.registry.service_windows import (
@@ -1478,6 +1486,77 @@ def cmd_service_status(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _installed_service_scope(args: argparse.Namespace, subcommand: str) -> str | None:
+    """The scope ``start``/``stop``/``restart`` act on: ``--user``/
+    ``--system`` when given, else whichever scope is actually installed.
+    Prints an error and returns ``None`` when nothing is installed, or
+    when both scopes are and no flag picks one.
+    """
+    if args.user or args.system:
+        return _service_scope(args)
+    status_fn = macos_status if sys.platform == "darwin" else linux_status
+    installed = [scope for scope in ("user", "system") if status_fn(scope).installed]
+    if len(installed) == 1:
+        return installed[0]
+    if not installed:
+        print(
+            "mbregistry: no mbregistry service is installed "
+            "(see 'mbregistry service install')",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"mbregistry: both user and system services are installed; "
+            f"pass --user or --system to 'service {subcommand}'",
+            file=sys.stderr,
+        )
+    return None
+
+
+_SERVICE_CONTROL_FNS = {
+    "darwin": {"start": macos_start, "stop": macos_stop, "restart": macos_restart},
+    "linux": {"start": linux_start, "stop": linux_stop, "restart": linux_restart},
+}
+
+
+def cmd_service_control(args: argparse.Namespace) -> int:
+    """``mbregistry service start|stop|restart [--user | --system]
+    [--dry-run]`` -- control an already-installed service without
+    installing or removing anything. With no scope flag, acts on
+    whichever scope is installed (see :func:`_installed_service_scope`).
+    ``stop`` leaves the service installed; it starts again at next boot
+    or on ``service start``.
+    """
+    action = args.service_command
+    if sys.platform not in _SERVICE_PLATFORMS:
+        return _service_not_supported(action)
+
+    scope = _installed_service_scope(args, action)
+    if scope is None:
+        return EXIT_ERROR
+    control_fn = _SERVICE_CONTROL_FNS[sys.platform][action]
+    try:
+        control_fn(scope, dry_run=args.dry_run)
+    except FileNotFoundError as exc:
+        print(
+            f"mbregistry: the {scope} service is not installed (no {exc.args[0]})",
+            file=sys.stderr,
+        )
+        return EXIT_ERROR
+    except subprocess.CalledProcessError as exc:
+        print(
+            f"mbregistry: service {action} failed: {shlex.join(exc.cmd)} "
+            f"exited {exc.returncode}",
+            file=sys.stderr,
+        )
+        return EXIT_ERROR
+
+    past = {"start": "started", "stop": "stopped", "restart": "restarted"}[action]
+    verb = f"would have {past}" if args.dry_run else past
+    print(f"mbregistry: {verb} the {scope} service.", file=sys.stderr)
+    return EXIT_OK
+
+
 # ---------------------------------------------------------------------------
 # install-service -- deprecated, hidden alias for `service install --system`
 # ---------------------------------------------------------------------------
@@ -1601,7 +1680,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     unlock_p.set_defaults(func=cmd_unlock)
 
-    run_p = sub.add_parser("run", help="run the registry daemon in the foreground")
+    #: `service run`'s flags live on a shared parent parser so the hidden,
+    #: deprecated top-level `run` alias (below) accepts exactly the same
+    #: flags -- already-installed unit files/plists and scripts that still
+    #: invoke `mbregistry run ...` keep working until they are reinstalled.
+    run_p = argparse.ArgumentParser(add_help=False)
     run_p.add_argument(
         "--socket",
         help=f"api socket path (default {DEFAULT_SOCKET_PATH}, or ${_SOCKET_ENV_VAR})",
@@ -1753,13 +1836,15 @@ def build_parser() -> argparse.ArgumentParser:
             "that should not join the fleet"
         ),
     )
-    run_p.set_defaults(func=cmd_run)
+    # Deprecated, hidden alias for `service run` -- no ``help=`` kwarg, the
+    # same way `install-service` is hidden below.
+    sub.add_parser("run", parents=[run_p]).set_defaults(func=cmd_run)
 
     service_p = sub.add_parser(
         "service",
         help=(
-            "install, uninstall, or report the mbregistry service "
-            "(macOS/Linux only)"
+            "run, install, start/stop/restart, or report the mbregistry "
+            "service (install/start/stop: macOS/Linux only)"
         ),
     )
     service_sub = service_p.add_subparsers(dest="service_command", required=True)
@@ -1820,6 +1905,34 @@ def build_parser() -> argparse.ArgumentParser:
         "status", help="report both scopes' installed/running state and paths"
     )
     service_status_p.set_defaults(func=cmd_service_status)
+
+    service_sub.add_parser(
+        "run", parents=[run_p], help="run the registry daemon in the foreground"
+    ).set_defaults(func=cmd_run)
+
+    for action, action_help in (
+        ("start", "start the installed service"),
+        ("stop", "stop the installed service (stays installed)"),
+        ("restart", "restart the installed service"),
+    ):
+        control_p = service_sub.add_parser(action, help=action_help)
+        control_scope = control_p.add_mutually_exclusive_group()
+        control_scope.add_argument(
+            "--user",
+            action="store_true",
+            help="the current user's service (default: whichever scope is installed)",
+        )
+        control_scope.add_argument(
+            "--system",
+            action="store_true",
+            help="the machine-wide service, needs root/sudo",
+        )
+        control_p.add_argument(
+            "--dry-run",
+            action="store_true",
+            help="print what would be run, touching nothing",
+        )
+        control_p.set_defaults(func=cmd_service_control)
 
     #: Hidden, deprecated alias for `service install --system` (sprint 006,
     #: ticket 006-004) -- no ``help=`` kwarg at all, which is what keeps

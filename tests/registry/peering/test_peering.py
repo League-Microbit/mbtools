@@ -394,6 +394,7 @@ def test_start_registers_own_service_with_txt_ports(store):
         "remote_port": "18440",
         "pub_port": "18442",
         "snapshot_port": "18443",
+        "addrs": "192.168.1.149",
     }
     pd.stop()
 
@@ -698,3 +699,51 @@ def test_real_zeroconf_loopback_two_registries_discover_each_other(tmp_path):
     finally:
         pd_a.stop()
         pd_b.stop()
+
+
+# ---------------------------------------------------------------------------
+# Multi-homed advertising: every LAN address, in the addrs TXT order
+# ---------------------------------------------------------------------------
+
+
+def test_add_service_connects_to_the_advertised_address_on_our_subnet(store, monkeypatch):
+    # meili advertises eth0 (192.168.1.150) and wlan0 (10.9.0.150); this
+    # host is only on 192.168.1.0/24, so it must pick eth0 regardless of
+    # which address zeroconf resolved first.
+    monkeypatch.setattr(
+        peering_mod,
+        "pick_reachable",
+        lambda cands: next((c for c in cands if c.startswith("192.168.1.")), None),
+    )
+    ready = []
+    listener = _listener(store)
+    listener._on_peer_ready = lambda *args: ready.append(args)
+    info = _make_info(
+        address="10.9.0.150",
+        txt={
+            TXT_REMOTE_PORT: "7440",
+            TXT_PUB_PORT: "7442",
+            TXT_SNAPSHOT_PORT: "7443",
+            peering_mod.TXT_ADDRS: "10.9.0.150,192.168.1.150",
+        },
+    )
+
+    listener.add_service(_StaticZc(info), SERVICE_TYPE, "meili." + SERVICE_TYPE)
+
+    assert store.get_peer("meili").endpoint == "192.168.1.150:7440"
+    assert ready == [("meili", "192.168.1.150", 7442, 7443)]
+
+
+def test_add_service_excludes_own_advertisement_on_any_own_address(store):
+    listener = peering_mod._BrowseListener(
+        store=store,
+        service_type=SERVICE_TYPE,
+        own_address="192.168.1.149",
+        own_addresses=("192.168.1.149", "192.168.2.149"),
+        own_port=7440,
+    )
+    info = _make_info(address="192.168.2.149", port=7440, server="loki.local.")
+
+    listener.add_service(_StaticZc(info), SERVICE_TYPE, "loki2." + SERVICE_TYPE)
+
+    assert store.list_peers() == []

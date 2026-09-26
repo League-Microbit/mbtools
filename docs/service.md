@@ -9,7 +9,7 @@ and the code disagree, the code wins. Run `<program> --help` or
 
 - [1. What runs where](#1-what-runs-where)
 - [2. Install](#2-install)
-- [3. `mbregistry run`: defaults](#3-mbregistry-run-defaults)
+- [3. `mbregistry service run`: defaults](#3-mbregistry-service-run-defaults)
 - [4. Ports and mDNS](#4-ports-and-mdns)
 - [5. Flags and environment variables](#5-flags-and-environment-variables)
 - [6. Linux: systemd service and udev rule](#6-linux-systemd-service-and-udev-rule)
@@ -25,7 +25,7 @@ and the code disagree, the code wins. Run `<program> --help` or
 
 | Program | Kind | Needs a running `mbregistry`? |
 |---|---|---|
-| `mbregistry run` | The daemon. One per host. Watches USB, identifies micro:bits, keeps the device database, grants locks, peers with other hosts. | It *is* the daemon. |
+| `mbregistry service run` | The daemon. One per host. Watches USB, identifies micro:bits, keeps the device database, grants locks, peers with other hosts. | It *is* the daemon. |
 | `mbregistry list` | Client | yes |
 | `mbregistry unlock --force` | Client (local socket only) | yes |
 | `mbdeploy deploy / list / debug` | Client | yes |
@@ -169,9 +169,9 @@ version string the `--ready-json` line's `version` key reports (section
 `/opt/mbtools/bin/python -c "import importlib.metadata as m; print(m.version('mbtools'))"`
 or `pip show mbtools`.
 
-## 3. `mbregistry run`: defaults
+## 3. `mbregistry service run`: defaults
 
-`mbregistry run` needs no flags. The daemon keeps its database and local
+`mbregistry service run` needs no flags. The daemon keeps its database and local
 API socket in a location that depends on the platform and on whether it runs
 as root (`src/mbtools/registry/paths.py`):
 
@@ -194,7 +194,7 @@ as root (`src/mbtools/registry/paths.py`):
 - Precedence everywhere: **flag > environment variable > default**
   (`--socket` / `$MBREGISTRY_SOCKET`, `--db` / `$MBREGISTRY_DB`).
 - The `--help` text prints the default for whoever runs `--help`. If you run
-  `mbregistry run --help` as a normal user, it shows the per-user path.
+  `mbregistry service run --help` as a normal user, it shows the per-user path.
 - USB poll interval: `--interval`, default `2.0` seconds.
 - On start the daemon prints one line to stderr naming everything it bound,
   e.g.
@@ -254,7 +254,7 @@ and interfaces whose names start with `docker`, `br-`, `veth`, `virbr`,
 |---|---|---|---|
 | `--version` | (none) | n/a | Print `mbregistry <version>` to stdout and exit 0; works without a subcommand (sprint 008 ticket 006) |
 
-### `mbregistry run`
+### `mbregistry service run`
 
 | Flag | Env var | Default | Notes |
 |---|---|---|---|
@@ -303,11 +303,11 @@ each serving half the attached boards).
 ### Spawn recipe: `--ready-json` / `--exit-with-parent` / `--no-peering`
 
 A parent process (robot-console, a test harness, …) that wants to spawn
-and supervise a short-lived `mbregistry run` child — without joining it to
+and supervise a short-lived `mbregistry service run` child — without joining it to
 the mDNS/peering fleet — combines three flags:
 
 ```sh
-mbregistry run --socket /tmp/mbregistry-session/api.sock \
+mbregistry service run --socket /tmp/mbregistry-session/api.sock \
   --db /tmp/mbregistry-session/devices.db \
   --instance session-1234 \
   --ready-json --exit-with-parent --no-peering
@@ -377,13 +377,29 @@ $ mbregistry unlock 9d2f... --force
 mbregistry: 9d2f...: not locked
 ```
 
-### `mbregistry service install` / `uninstall` / `status`
+### `mbregistry service install` / `uninstall` / `start` / `stop` / `restart` / `status`
 
 ```text
 mbregistry service install   (--user | --system) [--dry-run]
 mbregistry service uninstall (--user | --system) [--purge] [--dry-run]
+mbregistry service start     [--user | --system] [--dry-run]
+mbregistry service stop      [--user | --system] [--dry-run]
+mbregistry service restart   [--user | --system] [--dry-run]
 mbregistry service status
 ```
+
+`start`/`stop`/`restart` act on an already-installed service and never
+write or remove files. Without a scope flag they act on whichever scope is
+installed (it's an error if neither or both are). On macOS, `stop` is
+`launchctl bootout` (the plist stays, so it loads again at next login/boot),
+and `start`/`restart` are `launchctl bootstrap` + `kickstart` (`-k` for
+restart). On Linux they are `systemctl [--user] start|stop|restart
+mbregistry.service`.
+
+`mbregistry service run` is the foreground daemon the service runs.
+The old top-level `mbregistry run` still works as a hidden, deprecated
+alias, so existing unit files and plists that invoke it don't need a
+reinstall right away.
 
 `--user`/`--system` is required and mutually exclusive on `install`/`uninstall` —
 there is no default scope.
@@ -574,7 +590,7 @@ serial and CMSIS-DAP interfaces.
 | Use it for | an unattended board host | a workstation |
 
 Pick **one**. Both plists use the same label. Each plist runs the venv's
-interpreter directly (`python -m mbtools.registry.cli run`). This is the
+interpreter directly (`python -m mbtools.registry.cli service run`). This is the
 same entry point the systemd unit uses, and it keeps pyOCD on the same
 interpreter.
 
@@ -681,16 +697,40 @@ Manage it with the same verbs as 7.1, using `gui/$(id -u)` in place of
 
 ### 7.3 macOS notes
 
-- **Local Network privacy (macOS 15+).** Programs a user starts can be
-  blocked from the LAN until they are allowed in *System Settings → Privacy
-  & Security → Local Network*. If a LaunchAgent daemon finds no peers but
-  the same command run in Terminal does, look there first. A root
-  LaunchDaemon is not subject to this prompt.
+- **Local Network privacy (macOS 15+) — use the LaunchDaemon on a peering
+  host.** A LaunchAgent's Python has no Local Network permission and never
+  gets a prompt for one, so macOS silently blocks its outbound LAN traffic
+  and its mDNS: connects fail with `No route to host` (errno 65), and it
+  never discovers a peer. Peers that connect *in* still work, so it looks
+  half-alive. Seen on `gala`: every peer went `peer unreachable` and stayed
+  that way across restarts, while the same command run from Terminal
+  peered fine. A bare venv `python3` usually doesn't appear under *System
+  Settings → Privacy & Security → Local Network* to allow it. A root
+  LaunchDaemon (`--system`) is not subject to Local Network privacy.
+- **The LaunchDaemon's interpreter must be on the boot disk.** The plist
+  runs whichever Python ran `service install`. If that is a dev venv on
+  an external volume, or its interpreter is a symlink onto one (uv's
+  managed Pythons under `~/.local/share/uv` when `~/.local` is itself on
+  another volume), root's launchd fails at load time with `dyld: Library
+  not loaded: @executable_path/../lib/libpython3.13.dylib` in
+  `/Library/Logs/mbregistry.log`. The volume may not even be mounted at
+  boot. Give the daemon its own non-editable install on the boot disk:
+
+  ```sh
+  sudo mkdir -p /opt/mbtools && sudo chown "$USER":staff /opt/mbtools
+  uv venv /opt/mbtools/venv --python /opt/homebrew/bin/python3
+  uv pip install --python /opt/mbtools/venv/bin/python /path/to/mbtools
+  sudo /opt/mbtools/venv/bin/mbregistry service install --system
+  ```
+
+  To update it, rerun the `uv pip install` line, then run
+  `sudo mbregistry service restart`. Client commands from any other
+  install still find the root daemon's socket (`/var/run/mbregistry/api.sock`).
 - **Application Firewall.** If it is on, allow incoming connections for
   the venv's Python (section 10).
 - To run in the foreground for debugging, stop the service first. Only one
-  daemon may run per host. Then run `mbregistry run` (as yourself) or
-  `sudo mbregistry run` (to use the system paths).
+  daemon may run per host. Then run `mbregistry service run` (as yourself) or
+  `sudo mbregistry service run` (to use the system paths).
 
 ### 7.4 Uninstall
 
@@ -746,7 +786,7 @@ requires the space after each `=`.)
 - Manage it with `sc.exe query mbregistry`, `sc.exe stop mbregistry` and
   `sc.exe delete mbregistry`.
 - Logs: a service's stdout/stderr go nowhere. To see output, stop the
-  service and run `C:\mbtools\Scripts\mbregistry run` in a console.
+  service and run `C:\mbtools\Scripts\mbregistry service run` in a console.
 - Firewall: see section 10.
 
 ## 9. Peering, `--peer`, and the auth token
@@ -758,7 +798,7 @@ requires the space after each `=`.)
   multicast works.
 - **Explicit peers** for networks mDNS can't cross (VLANs, VPNs, Wi-Fi
   with client isolation):
-  `mbregistry run --peer host-a --peer host-b.example.org:7440`. `PORT` is the
+  `mbregistry service run --peer host-a --peer host-b.example.org:7440`. `PORT` is the
   peer's **remote API** port and defaults to 7440. An explicit peer is
   assumed to use **the same** 7442/7443 as this host. If a peer runs
   non-default peering ports, only mDNS (which reads them from TXT) can find
@@ -880,7 +920,7 @@ INFO messages, so a quiet log is normal.
 | Linux (systemd) | `journalctl -u mbregistry` (`-f` to follow, `-b` since boot, `--since "10 min ago"`) |
 | macOS LaunchDaemon | `/Library/Logs/mbregistry.log` |
 | macOS LaunchAgent | `~/Library/Logs/mbregistry.log` |
-| Windows service | not captured; run `mbregistry run` in a console to see output |
+| Windows service | not captured; run `mbregistry service run` in a console to see output |
 | Foreground | the terminal |
 
 The launchd log files grow without limit. Truncate them occasionally
@@ -946,7 +986,7 @@ sudo ss -ltnp | grep -E ':(7440|7442|7443|7444|7445)\b'     # Linux
 sudo lsof -nP -iTCP -sTCP:LISTEN | grep -E ':(7440|744[2-5])' # macOS / Linux
 ```
 
-Usual cause: **a second `mbregistry`**. A foreground `mbregistry run` left
+Usual cause: **a second `mbregistry`**. A foreground `mbregistry service run` left
 over, or both a user and a system daemon. Stop the extra one; run one per
 host. **Then restart the real service.** A second daemon binds its local
 socket *before* it fails on port 7440. If it used the same socket path, it

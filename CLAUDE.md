@@ -219,7 +219,19 @@ and re-point the symlinks the same way if it doesn't say
 `~/mbtools-venv`. See `docs/acceptance/006-hardware.md` Scenario B for
 the full trace.
 
-## Firmware for tests (GitHub release assets — use `MICROBIT.hex`)
+**Known macOS quirk, not a code bug (`gala`, 2026-09-25):** a macOS
+*LaunchAgent* (`service install --user`) daemon is silently blocked by
+Local Network privacy. It gets outbound `No route to host`, discovers no
+peers over mDNS, and shows every peer as `peer unreachable`, though
+inbound peer links still work. `gala` now runs a *LaunchDaemon*
+(`--system`) from a standalone boot-disk venv at `/opt/mbtools/venv`
+(Homebrew Python). A LaunchDaemon run from the dev `.venv` fails, because
+its interpreter chain lives on external volumes (dyld `libpython` load
+error). After code changes, update `gala`'s daemon with `uv pip install
+--python /opt/mbtools/venv/bin/python .` and then `sudo mbregistry service
+restart`. See `docs/service.md` §7.3.
+
+ (GitHub release assets — use `MICROBIT.hex`)
 
 | Firmware | Repo | Announces as |
 |---|---|---|

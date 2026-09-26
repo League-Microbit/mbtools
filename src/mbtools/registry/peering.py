@@ -235,7 +235,7 @@ from zmq.utils.monitor import recv_monitor_message
 
 from mbtools.registry.eventbus import EventBus
 from mbtools.registry.locks import format_lock_suffix
-from mbtools.registry.netaddr import local_ip
+from mbtools.registry.netaddr import local_ip, local_ipv4s, pick_reachable
 from mbtools.registry.identity import ProbeResult
 from mbtools.registry.store import (
     STATE_ATTACHED_NO_ANNOUNCE,
@@ -292,6 +292,11 @@ DEFAULT_SNAPSHOT_PORT = 7443
 TXT_REMOTE_PORT = "remote_port"
 TXT_PUB_PORT = "pub_port"
 TXT_SNAPSHOT_PORT = "snapshot_port"
+#: Comma-separated advertised IPv4 addresses, in the advertiser's own
+#: preference order (wired first). mDNS itself doesn't preserve A-record
+#: order, so a browser reads the order from here and connects to the first
+#: address on one of its own subnets (:func:`_choose_address`).
+TXT_ADDRS = "addrs"
 
 #: How long a discovered instance's full ``ServiceInfo`` (address/port/TXT)
 #: is given to resolve before giving up on that one discovery event.
@@ -405,6 +410,20 @@ def _resolve_address(info: Any) -> str:
     if server:
         return str(server).rstrip(".")
     return ""
+
+
+def _choose_address(info: Any, txt: dict[str, str]) -> str:
+    """The address to connect to for a discovered peer: the first of its
+    advertised addresses (``addrs`` TXT order, else zeroconf's resolved
+    ones) that is on one of this host's directly-attached subnets, falling
+    back to :func:`_resolve_address` for a peer that advertises neither.
+    """
+    candidates = [a for a in txt.get(TXT_ADDRS, "").split(",") if a]
+    if not candidates:
+        parsed_addresses = getattr(info, "parsed_addresses", None)
+        if callable(parsed_addresses):
+            candidates = [a for a in parsed_addresses() if ":" not in a]
+    return pick_reachable(candidates) or _resolve_address(info)
 
 
 def _peer_host_from_name(name: str, service_type: str) -> str:
@@ -783,12 +802,14 @@ class _BrowseListener:
         own_address: str,
         own_port: int,
         own_host: str | None = None,
+        own_addresses: tuple[str, ...] = (),
         resolve_timeout_ms: int = _DEFAULT_RESOLVE_TIMEOUT_MS,
         on_peer_ready: Callable[[str, str, int, int], None] | None = None,
     ) -> None:
         self._store = store
         self._service_type = service_type
         self._own_address = own_address
+        self._own_addresses = {own_address, *own_addresses}
         self._own_port = own_port
         self._own_host = own_host
         self._resolve_timeout_ms = resolve_timeout_ms
@@ -818,14 +839,14 @@ class _BrowseListener:
         host = _peer_host_from_name(name, self._service_type)
         if self._own_host is not None and host == self._own_host:
             return  # this instance's own advertisement -- never a peer of itself
-        address = _resolve_address(info)
+        txt = _decode_txt(getattr(info, "properties", None))
+        address = _choose_address(info, txt)
         port = getattr(info, "port", None)
-        if address == self._own_address and port == self._own_port:
+        if address in self._own_addresses and port == self._own_port:
             return  # same check, by address/port -- kept as a second guard
             # for a caller that doesn't pass own_host (e.g. an older test
             # fixture); see the hostname check above for why address/port
             # alone is not reliable enough on its own.
-        txt = _decode_txt(getattr(info, "properties", None))
         remote_port_str = txt.get(TXT_REMOTE_PORT)
         if not address or not remote_port_str:
             logger.warning(
@@ -1299,9 +1320,12 @@ class PeerDiscovery:
     ) -> None:
         self._store = store
         self._host = host if host is not None else _short_hostname()
-        self._advertise_address = (
-            advertise_address if advertise_address is not None else _local_ip()
+        #: Every address this instance advertises, most-preferred first --
+        #: just ``advertise_address`` when one is given explicitly.
+        self._advertise_addresses = (
+            [advertise_address] if advertise_address is not None else local_ipv4s()
         )
+        self._advertise_address = self._advertise_addresses[0]
         self._remote_port = remote_port
         self._pub_port = pub_port
         self._snapshot_port = snapshot_port
@@ -1420,11 +1444,12 @@ class PeerDiscovery:
             TXT_REMOTE_PORT: str(self._remote_port),
             TXT_PUB_PORT: str(self._pub_port),
             TXT_SNAPSHOT_PORT: str(self._snapshot_port),
+            TXT_ADDRS: ",".join(self._advertise_addresses),
         }
         self._own_info = self._zc_module.ServiceInfo(
             self._service_type,
             f"{self._host}.{self._service_type}",
-            addresses=[_socket.inet_aton(self._advertise_address)],
+            addresses=[_socket.inet_aton(a) for a in self._advertise_addresses],
             port=self._remote_port,
             properties=_encode_txt(txt),
             server=f"{self._host}.local.",
@@ -1440,7 +1465,7 @@ class PeerDiscovery:
             "peering: advertising %s as %s (%s:%d, pub_port=%d, snapshot_port=%d)",
             self._host,
             self._own_info.name,
-            self._advertise_address,
+            ",".join(self._advertise_addresses),
             self._remote_port,
             self._pub_port,
             self._snapshot_port,
@@ -1450,6 +1475,7 @@ class PeerDiscovery:
             store=self._store,
             service_type=self._service_type,
             own_address=self._advertise_address,
+            own_addresses=tuple(self._advertise_addresses),
             own_port=self._remote_port,
             own_host=self._host,
             on_peer_ready=self.connect_peer,

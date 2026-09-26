@@ -42,7 +42,10 @@ import mbtools.registry.service as service_module
 from mbtools.registry.service import (
     ServiceStatus,
     macos_install,
+    macos_restart,
+    macos_start,
     macos_status,
+    macos_stop,
     macos_uninstall,
     render_launchd_plist,
 )
@@ -164,6 +167,7 @@ def test_render_launchd_plist_user_matches_docs_directives(macos_paths):
         "/opt/venv/bin/python",
         "-m",
         "mbtools.registry.cli",
+        "service",
         "run",
     ]
     assert parsed["KeepAlive"] == {"SuccessfulExit": False}
@@ -183,6 +187,7 @@ def test_render_launchd_plist_system_matches_docs_directives(macos_paths):
         "/opt/mbtools/bin/python",
         "-m",
         "mbtools.registry.cli",
+        "service",
         "run",
     ]
     assert parsed["KeepAlive"] == {"SuccessfulExit": False}
@@ -436,3 +441,48 @@ def test_macos_functions_dont_depend_on_sys_platform(macos_paths, monkeypatch, r
     result_path = macos_install("user", dry_run=False, runner=_FakeRunner())
     assert result_path == macos_paths.user_plist
     assert macos_paths.user_plist.exists()
+
+
+# ---------------------------------------------------------------------------
+# start/stop/restart -- control an installed service without reinstalling
+# ---------------------------------------------------------------------------
+
+
+def _install_user_plist(macos_paths):
+    macos_paths.user_plist.parent.mkdir(parents=True, exist_ok=True)
+    macos_paths.user_plist.write_text("plist")
+
+
+def test_macos_start_bootstraps_then_kickstarts(macos_paths):
+    _install_user_plist(macos_paths)
+    runner = _FakeRunner()
+    macos_start("user", runner=runner)
+    assert runner.calls == [
+        ["launchctl", "bootstrap", "gui/501", str(macos_paths.user_plist)],
+        ["launchctl", "kickstart", "gui/501/org.jointheleague.mbregistry"],
+    ]
+
+
+def test_macos_restart_tolerates_already_loaded_and_kills_first(macos_paths):
+    _install_user_plist(macos_paths)
+    bootstrap = ("launchctl", "bootstrap", "gui/501", str(macos_paths.user_plist))
+    runner = _FakeRunner(fail_argvs={bootstrap})
+    macos_restart("user", runner=runner)
+    assert runner.calls[-1] == [
+        "launchctl", "kickstart", "-k", "gui/501/org.jointheleague.mbregistry"
+    ]
+
+
+def test_macos_stop_boots_out_and_keeps_the_plist(macos_paths):
+    _install_user_plist(macos_paths)
+    runner = _FakeRunner()
+    macos_stop("user", runner=runner)
+    assert runner.calls == [
+        ["launchctl", "bootout", "gui/501/org.jointheleague.mbregistry"]
+    ]
+    assert macos_paths.user_plist.exists()
+
+
+def test_macos_control_raises_when_not_installed(macos_paths):
+    with pytest.raises(FileNotFoundError):
+        macos_start("system", runner=_FakeRunner())

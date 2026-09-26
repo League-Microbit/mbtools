@@ -78,7 +78,7 @@ to `mbregistry`, with the compatibility pool enabled:
   disk, for rollback (see Rollback below).
 - `mbregistry.service` is running, enabled, with the robot-console
   compatibility pool on port **7444** and the `/names` API on port
-  **7445** (both defaults — `mbregistry run` only disables the pool with
+  **7445** (both defaults — `mbregistry service run` only disables the pool with
   `--no-relay-pool`, which is not passed here).
 - The stakeholder removed one relay (`getez`) from `torture` during this
   sprint; it now has three relays, not four. Don't expect a fourth

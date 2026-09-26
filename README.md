@@ -35,8 +35,10 @@ On Linux and macOS, run `mbregistry service install (--user | --system)`
 once to install *and start* the daemon at whichever scope you want
 (`--system` needs root/sudo and starts at boot; `--user` starts at login,
 no root). `service uninstall (--user | --system) [--purge]` stops and
-removes it; `service status` reports both scopes; `--dry-run` on
-`install`/`uninstall` previews without touching anything. See
+removes it; `service start`/`stop`/`restart` control an installed
+service without reinstalling it (no scope flag needed when only one scope
+is installed); `service status` reports both scopes; `--dry-run` on
+`install`/`uninstall`/`start`/`stop`/`restart` previews without touching anything. See
 [docs/service.md](docs/service.md#6-linux-systemd-service-and-udev-rule)
 (Linux) and
 [docs/service.md](docs/service.md#7-macos-launchd) (macOS) for the full
@@ -46,10 +48,10 @@ a hidden alias for `service install --system`, kept for one release.
 On Windows, `mbregistry service ...` is not supported;
 `mbregistry install-service` remains the only install path there — it
 prints the `sc.exe` commands that register it with the Service Control
-Manager (`mbregistry run --windows-service` is what that service
+Manager (`mbregistry service run --windows-service` is what that service
 invokes); Windows support has not been verified on real hardware.
 
-`mbregistry run` needs no flags. It keeps its database and local API socket
+`mbregistry service run` needs no flags. It keeps its database and local API socket
 in the right place for the platform and the user running it:
 
 | | database | socket |
@@ -89,7 +91,7 @@ common invocation.
 ### Peering and remote access
 
 `mbregistry` instances discover each other over mDNS and share their
-device lists; `mbregistry run --peer HOST[:PORT]` adds an explicit peer
+device lists; `mbregistry service run --peer HOST[:PORT]` adds an explicit peer
 for a network mDNS can't reach. Once peered, `mbdeploy` and `mbserial`
 resolve a device by name and automatically talk to whichever host's
 registry owns it — no extra syntax is needed on those two. `mbrelay

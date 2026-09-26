@@ -109,7 +109,7 @@ from uuid import uuid4
 
 import zeroconf as _real_zeroconf
 
-from mbtools.registry.netaddr import local_ip
+from mbtools.registry.netaddr import local_ipv4s
 from mbtools.registry.locks import KIND_RELAY, HolderRef, LockManager
 from mbtools.registry.store import STATE_CONNECTED, DeviceRecord, Store
 from mbtools.relay.channel import LocalRelayChannel
@@ -168,8 +168,11 @@ def _is_relay_role(role: "str | None") -> bool:
 
 
 def _local_ip() -> str:
-    """This host's LAN IPv4 address, see :func:`mbtools.registry.netaddr.local_ip`."""
-    return local_ip()
+    """This host's most-preferred LAN IPv4 address (wired before Wi-Fi) --
+    see :func:`mbtools.registry.netaddr.local_ipv4s`. robot-console's
+    browser connects to whichever advertised address it sees first, so
+    this advertises only the one it should use."""
+    return local_ipv4s()[0]
 
 
 def _short_hostname() -> str:
