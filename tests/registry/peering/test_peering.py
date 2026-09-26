@@ -74,6 +74,9 @@ class _FakeZeroconf:
     def unregister_service(self, info):
         self.unregistered.append(info)
 
+    def update_service(self, info):
+        self.updated = getattr(self, "updated", []) + [info]
+
     def close(self):
         self.closed = True
 
@@ -747,3 +750,68 @@ def test_add_service_excludes_own_advertisement_on_any_own_address(store):
     listener.add_service(_StaticZc(info), SERVICE_TYPE, "loki2." + SERVICE_TYPE)
 
     assert store.list_peers() == []
+
+
+# ---------------------------------------------------------------------------
+# Address refresh: a roaming host re-advertises its new addresses
+# ---------------------------------------------------------------------------
+
+
+def _started_discovery(store, monkeypatch, addresses, *, advertise_address=None, port_base):
+    monkeypatch.setattr(peering_mod, "local_ipv4s", lambda: list(addresses[0]))
+    ns = _FakeZeroconfNamespace()
+    pd = PeerDiscovery(
+        store=store,
+        host="feldman",
+        advertise_address=advertise_address,
+        remote_port=port_base,
+        pub_port=port_base + 2,
+        snapshot_port=port_base + 3,
+        zeroconf=ns,
+        self_check_interval_s=3600,
+        address_check_interval_s=3600,
+    )
+    pd.start()
+    return pd, ns
+
+
+def test_refresh_addresses_re_advertises_after_a_dhcp_move(store, monkeypatch):
+    # feldman: advertised .195 at boot, Wi-Fi roamed to .210.
+    addresses = [["192.168.1.195"]]
+    pd, ns = _started_discovery(store, monkeypatch, addresses, port_base=18540)
+    try:
+        assert pd.advertise_addresses == ["192.168.1.195"]
+        monkeypatch.setattr(peering_mod, "local_ipv4s", lambda: ["192.168.1.210"])
+
+        assert pd.refresh_addresses() is True
+
+        info = ns.instance.updated[-1]
+        assert info.name == "feldman." + SERVICE_TYPE
+        assert info.parsed_addresses() == ["192.168.1.210"]
+        assert peering_mod._decode_txt(info.properties)["addrs"] == "192.168.1.210"
+        assert pd.advertise_addresses == ["192.168.1.210"]
+        assert pd.refresh_addresses() is False  # unchanged -> no re-announce
+    finally:
+        pd.stop()
+
+
+def test_refresh_addresses_keeps_old_list_while_no_lan_address(store, monkeypatch):
+    pd, ns = _started_discovery(store, monkeypatch, [["192.168.1.210"]], port_base=18550)
+    try:
+        monkeypatch.setattr(peering_mod, "local_ipv4s", lambda: ["127.0.1.1"])
+        assert pd.refresh_addresses() is False
+        assert pd.advertise_addresses == ["192.168.1.210"]
+    finally:
+        pd.stop()
+
+
+def test_refresh_addresses_never_changes_a_pinned_address(store, monkeypatch):
+    pd, ns = _started_discovery(
+        store, monkeypatch, [["10.0.0.1"]], advertise_address="192.168.1.149", port_base=18560
+    )
+    try:
+        monkeypatch.setattr(peering_mod, "local_ipv4s", lambda: ["192.168.1.210"])
+        assert pd.refresh_addresses() is False
+        assert pd.advertise_addresses == ["192.168.1.149"]
+    finally:
+        pd.stop()

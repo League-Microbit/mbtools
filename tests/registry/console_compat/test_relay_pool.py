@@ -247,6 +247,9 @@ class _FakeZeroconf:
     def unregister_service(self, info):
         self.unregistered.append(info)
 
+    def update_service(self, info):
+        self.updated = getattr(self, "updated", []) + [info]
+
     def close(self):
         self.closed = True
 
@@ -418,3 +421,30 @@ def test_start_stop_idempotent(store, locks):
     pool.stop()
     pool.stop()  # no-op
     assert port != 0
+
+
+# ---------------------------------------------------------------------------
+# address refresh: a roaming laptop re-advertises its new address
+# ---------------------------------------------------------------------------
+
+
+def test_refresh_address_re_advertises_after_a_dhcp_move(store, locks, monkeypatch):
+    import mbtools.registry.console_compat.relay_pool as relay_pool_mod
+
+    monkeypatch.setattr(relay_pool_mod, "_local_ip", lambda: "192.168.1.195")
+    ns = _FakeZeroconfNamespace()
+    pool = relay_pool_mod.RelayPool(
+        store=store, locks=locks, host="127.0.0.1", port=0, zeroconf=ns,
+        instance_host="feldman", address_check_interval_s=3600,
+    )
+    pool.start()
+    try:
+        monkeypatch.setattr(relay_pool_mod, "_local_ip", lambda: "192.168.1.210")
+        assert pool.refresh_address() is True
+        info = ns.instance.updated[-1]
+        assert info.addresses == [socket.inet_aton("192.168.1.210")]
+        assert pool.refresh_address() is False
+        monkeypatch.setattr(relay_pool_mod, "_local_ip", lambda: "127.0.1.1")
+        assert pool.refresh_address() is False
+    finally:
+        pool.stop()

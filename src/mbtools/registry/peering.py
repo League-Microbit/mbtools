@@ -344,6 +344,12 @@ _HEARTBEAT_OPTS_MS = (
 #: ``Zeroconf`` instance -- see :meth:`PeerDiscovery._run_self_check`.
 _DEFAULT_SELF_CHECK_INTERVAL_S = 60.0
 
+#: How often :class:`PeerDiscovery` re-reads this host's LAN addresses and
+#: re-advertises when they changed -- a laptop that roams to another Wi-Fi
+#: network, or gets a new DHCP lease after sleep, must not keep
+#: advertising an address that may now belong to someone else.
+_DEFAULT_ADDRESS_CHECK_INTERVAL_S = 15.0
+
 
 def _local_ip() -> str:
     """This host's LAN IPv4 address, see :func:`mbtools.registry.netaddr.local_ip`."""
@@ -1316,6 +1322,7 @@ class PeerDiscovery:
         lock: threading.RLock | None = None,
         auth_token: str | None = None,
         self_check_interval_s: float = _DEFAULT_SELF_CHECK_INTERVAL_S,
+        address_check_interval_s: float = _DEFAULT_ADDRESS_CHECK_INTERVAL_S,
         eventbus: EventBus | None = None,
     ) -> None:
         self._store = store
@@ -1326,6 +1333,11 @@ class PeerDiscovery:
             [advertise_address] if advertise_address is not None else local_ipv4s()
         )
         self._advertise_address = self._advertise_addresses[0]
+        #: An explicit ``advertise_address`` is pinned; otherwise the list
+        #: is re-read every ``address_check_interval_s`` (:meth:`refresh_addresses`).
+        self._addresses_pinned = advertise_address is not None
+        self._address_check_interval_s = address_check_interval_s
+        self._listener: _BrowseListener | None = None
         self._remote_port = remote_port
         self._pub_port = pub_port
         self._snapshot_port = snapshot_port
@@ -1440,20 +1452,7 @@ class PeerDiscovery:
 
         self._zc = self._zc_module.Zeroconf()
 
-        txt = {
-            TXT_REMOTE_PORT: str(self._remote_port),
-            TXT_PUB_PORT: str(self._pub_port),
-            TXT_SNAPSHOT_PORT: str(self._snapshot_port),
-            TXT_ADDRS: ",".join(self._advertise_addresses),
-        }
-        self._own_info = self._zc_module.ServiceInfo(
-            self._service_type,
-            f"{self._host}.{self._service_type}",
-            addresses=[_socket.inet_aton(a) for a in self._advertise_addresses],
-            port=self._remote_port,
-            properties=_encode_txt(txt),
-            server=f"{self._host}.local.",
-        )
+        self._own_info = self._build_own_info(f"{self._host}.{self._service_type}")
         self._zc.register_service(self._own_info, allow_name_change=True)
         # ticket 010: explicit, always-on record of which single address
         # this instance chose to advertise (Decision 10's candidate 2,
@@ -1480,6 +1479,7 @@ class PeerDiscovery:
             own_host=self._host,
             on_peer_ready=self.connect_peer,
         )
+        self._listener = listener
         self._browser = self._zc_module.ServiceBrowser(
             self._zc, self._service_type, listener=listener
         )
@@ -1546,9 +1546,73 @@ class PeerDiscovery:
 
     # -- ticket 010: self-check diagnostic -------------------------------
 
+    @property
+    def advertise_addresses(self) -> list[str]:
+        """The addresses currently advertised, most-preferred first."""
+        return list(self._advertise_addresses)
+
+    def _build_own_info(self, name: str) -> Any:
+        txt = {
+            TXT_REMOTE_PORT: str(self._remote_port),
+            TXT_PUB_PORT: str(self._pub_port),
+            TXT_SNAPSHOT_PORT: str(self._snapshot_port),
+            TXT_ADDRS: ",".join(self._advertise_addresses),
+        }
+        return self._zc_module.ServiceInfo(
+            self._service_type,
+            name,
+            addresses=[_socket.inet_aton(a) for a in self._advertise_addresses],
+            port=self._remote_port,
+            properties=_encode_txt(txt),
+            server=f"{self._host}.local.",
+        )
+
+    def refresh_addresses(self) -> bool:
+        """Re-read this host's LAN addresses and, when they changed,
+        re-announce the service with the new A records and ``addrs`` TXT.
+        Returns whether anything changed.
+
+        Found on the student fleet (feldman): its Wi-Fi roamed from
+        192.168.1.195/24 to 192.168.1.210/21 half an hour after boot, the
+        daemon kept advertising .195, DHCP handed .195 to another device,
+        and every peer connected to that device instead. A pinned
+        ``advertise_address`` is never refreshed, and a moment with no
+        LAN address at all (Wi-Fi reconnecting) keeps the old list rather
+        than advertising loopback.
+        """
+        if self._addresses_pinned or self._zc is None or self._own_info is None:
+            return False
+        new = local_ipv4s()
+        if not new or all(a.startswith("127.") for a in new):
+            return False
+        if new == self._advertise_addresses:
+            return False
+        logger.warning(
+            "peering: this host's addresses changed (%s -> %s); re-advertising",
+            ",".join(self._advertise_addresses),
+            ",".join(new),
+        )
+        self._advertise_addresses = new
+        self._advertise_address = new[0]
+        info = self._build_own_info(self._own_info.name)
+        self._zc.update_service(info)
+        self._own_info = info
+        if self._listener is not None:
+            self._listener._own_address = new[0]
+            self._listener._own_addresses = {new[0], *new}
+        return True
+
     def _self_check_loop(self) -> None:
-        while not self._self_check_stop_event.wait(self._self_check_interval_s):
-            self._run_self_check()
+        next_self_check = time.monotonic() + self._self_check_interval_s
+        interval = min(self._self_check_interval_s, self._address_check_interval_s)
+        while not self._self_check_stop_event.wait(interval):
+            try:
+                self.refresh_addresses()
+            except Exception:
+                logger.exception("peering: address refresh failed")
+            if time.monotonic() >= next_self_check:
+                next_self_check = time.monotonic() + self._self_check_interval_s
+                self._run_self_check()
 
     def _run_self_check(self) -> None:
         """Best-effort liveness probe (Decision 10): re-resolve this

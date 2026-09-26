@@ -244,6 +244,7 @@ class RelayPool:
         channel_factory: "Callable[[str], Any] | None" = None,
         zeroconf: Any = None,
         reject_message: str = DEFAULT_REJECT_MESSAGE,
+        address_check_interval_s: float = 15.0,
     ) -> None:
         self._store = store
         self._locks = locks
@@ -254,6 +255,12 @@ class RelayPool:
         self._advertise_address = (
             advertise_address if advertise_address is not None else _local_ip()
         )
+        #: An explicit ``advertise_address`` is pinned; otherwise it is
+        #: re-read every ``address_check_interval_s`` (:meth:`refresh_address`).
+        self._address_pinned = advertise_address is not None
+        self._address_check_interval_s = address_check_interval_s
+        self._address_thread: "threading.Thread | None" = None
+        self._address_stop = threading.Event()
         self._lock = lock if lock is not None else threading.RLock()
         self._control = control if control is not None else RelayControl()
         self._channel_factory: Callable[[str], Any] = (
@@ -303,18 +310,56 @@ class RelayPool:
         self._accept_thread.start()
 
         self._zc = self._zc_module.Zeroconf()
+        self._own_info = self._build_own_info(f"{self._instance_host}.{SERVICE_TYPE}")
+        self._zc.register_service(self._own_info, allow_name_change=True)
+
+        self._address_stop.clear()
+        self._address_thread = threading.Thread(
+            target=self._address_loop, name="mbtools-relay-pool-address", daemon=True
+        )
+        self._address_thread.start()
+
+        self._started = True
+
+    def _build_own_info(self, name: str) -> Any:
         txt = {TXT_REGISTRY_PORT: str(self._names_api_port)}
-        self._own_info = self._zc_module.ServiceInfo(
+        return self._zc_module.ServiceInfo(
             SERVICE_TYPE,
-            f"{self._instance_host}.{SERVICE_TYPE}",
+            name,
             addresses=[socket.inet_aton(self._advertise_address)],
             port=self._port,
             properties=_encode_txt(txt),
             server=f"{self._instance_host}.local.",
         )
-        self._zc.register_service(self._own_info, allow_name_change=True)
 
-        self._started = True
+    def refresh_address(self) -> bool:
+        """Re-read the preferred LAN address and re-announce the
+        ``_mbrelay._tcp`` record when it changed -- see
+        ``registry.peering.PeerDiscovery.refresh_addresses`` for why (a
+        roaming laptop must not keep advertising a stale DHCP address).
+        Returns whether anything changed."""
+        if self._address_pinned or self._zc is None or self._own_info is None:
+            return False
+        new = _local_ip()
+        if not new or new.startswith("127.") or new == self._advertise_address:
+            return False
+        logger.warning(
+            "relay_pool: this host's address changed (%s -> %s); re-advertising",
+            self._advertise_address,
+            new,
+        )
+        self._advertise_address = new
+        info = self._build_own_info(self._own_info.name)
+        self._zc.update_service(info)
+        self._own_info = info
+        return True
+
+    def _address_loop(self) -> None:
+        while not self._address_stop.wait(self._address_check_interval_s):
+            try:
+                self.refresh_address()
+            except Exception:
+                logger.exception("relay_pool: address refresh failed")
 
     def stop(self) -> None:
         """Withdraw the mDNS advertisement, stop accepting new
@@ -328,6 +373,12 @@ class RelayPool:
         RemoteAPIServer.stop``'s own convention. Idempotent."""
         if not self._started:
             return
+
+        # Stop the address refresher before tearing zeroconf down under it.
+        self._address_stop.set()
+        if self._address_thread is not None:
+            self._address_thread.join(timeout=2.0)
+            self._address_thread = None
 
         if self._zc is not None:
             if self._own_info is not None:

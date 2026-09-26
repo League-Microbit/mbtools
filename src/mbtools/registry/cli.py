@@ -1264,9 +1264,11 @@ def _run_registry(
     names_api_note = f", names API on {names_api.bound_port}"
     if peering is not None:
         peer_note = f", {len(peer_specs)} explicit peer(s)" if peer_specs else ""
+        addrs = getattr(peering, "advertise_addresses", None)
+        addrs_note = f", advertising {','.join(addrs)}" if addrs else ""
         peering_note = (
             f", peering active (pub {peer_pub_port}, snapshot {peer_snapshot_port}"
-            f"{peer_note})"
+            f"{peer_note}{addrs_note})"
         )
     else:
         peering_note = ", peering disabled (--no-peering)"
