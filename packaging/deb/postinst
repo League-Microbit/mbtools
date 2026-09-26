@@ -1,22 +1,72 @@
 #!/bin/sh
-# mbtools postinst: udev rule, plugdev group, and (re)start mbregistry.service.
+# mbtools postinst: take over from any older mbtools install, then set up
+# the udev rule and (re)start the packaged mbregistry.service.
 set -e
 
+PREFIX=/usr/lib/mbtools
+BACKUP_SUFFIX=pre-mbtools-deb
+
+# Move $1 aside to $1.$BACKUP_SUFFIX (replacing an older backup) and say so.
+move_aside() {
+    rm -rf "$1.$BACKUP_SUFFIX"
+    mv "$1" "$1.$BACKUP_SUFFIX"
+    echo "mbtools: took over from an older install: moved $1 to $1.$BACKUP_SUFFIX" >&2
+}
+
+# An older install -- `mbregistry service install --system`, or a venv under
+# /opt/mbtools deployed by ansible or by hand -- leaves these behind. systemd
+# prefers a unit in /etc over the packaged one in /usr/lib, and /usr/local/bin
+# comes before /usr/bin on PATH, so each one would keep the old install
+# running. The package is meant to be the install, so it moves them aside.
+take_over() {
+    etc_unit=/etc/systemd/system/mbregistry.service
+    old_exec=""
+    if [ -e "$etc_unit" ] || [ -L "$etc_unit" ]; then
+        old_exec="$(sed -n 's/^ExecStart=//p' "$etc_unit" 2>/dev/null | head -1)"
+        if [ -d /run/systemd/system ]; then
+            systemctl disable --now mbregistry.service >/dev/null 2>&1 || true
+        fi
+        move_aside "$etc_unit"
+    fi
+    if [ -d "$etc_unit.d" ]; then
+        move_aside "$etc_unit.d"
+    fi
+    # A dangling wants/ link left by the old unit's `enable`.
+    for link in /etc/systemd/system/*.wants/mbregistry.service; do
+        if [ -L "$link" ] && [ ! -e "$link" ]; then
+            rm -f "$link"
+        fi
+    done
+
+    # The older install's udev rule duplicates the packaged one.
+    if [ -e /etc/udev/rules.d/99-mbregistry-cmsis-dap.rules ]; then
+        move_aside /etc/udev/rules.d/99-mbregistry-cmsis-dap.rules
+    fi
+
+    for cmd in mbregistry mbdeploy mbserial mbrelay; do
+        path="/usr/local/bin/$cmd"
+        if [ -e "$path" ] || [ -L "$path" ]; then
+            if [ "$(readlink -f "$path" 2>/dev/null)" != "$PREFIX/venv/bin/$cmd" ]; then
+                move_aside "$path"
+            fi
+        fi
+    done
+
+    if [ -n "$old_exec" ]; then
+        echo "mbtools: the old service ran: $old_exec" >&2
+        echo "mbtools: its files were left in place; delete that install once you're happy with the package." >&2
+    fi
+}
+
 if [ "$1" = "configure" ]; then
+    take_over
+
     getent group plugdev >/dev/null || groupadd --system plugdev
 
     if [ -d /run/udev ] && command -v udevadm >/dev/null; then
         udevadm control --reload-rules || true
         udevadm trigger --subsystem-match=tty --subsystem-match=usb \
             --subsystem-match=hidraw || true
-    fi
-
-    # A unit in /etc (from `mbregistry service install --system` or an older
-    # hand/ansible install) overrides the packaged one in /usr/lib and would
-    # keep running the old install. Say so rather than silently starting it.
-    if [ -e /etc/systemd/system/mbregistry.service ]; then
-        echo "mbtools: /etc/systemd/system/mbregistry.service overrides the packaged unit;" >&2
-        echo "mbtools: remove it (and its old install) and run 'systemctl daemon-reload' to use this package." >&2
     fi
 
     if [ -d /run/systemd/system ]; then

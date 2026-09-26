@@ -37,11 +37,15 @@ starts `mbregistry.service` as root, adds the micro:bit udev rule, and
 restarts the daemon after every upgrade. `apt remove mbtools` stops it;
 `apt purge mbtools` also deletes `/var/lib/mbregistry`.
 
-A host with an older install (`mbregistry service install --system`, or a
-venv under `/opt/mbtools`) has a unit in `/etc/systemd/system` that
-overrides the packaged one. Remove that first:
-`sudo mbregistry service uninstall --system`, or delete the unit and run
-`sudo systemctl daemon-reload`.
+The package takes over from an older install (`mbregistry service install
+--system`, or a venv under `/opt/mbtools` deployed by hand or by ansible).
+It stops the old service, moves its unit file, drop-ins and udev rule from
+`/etc` aside (to `*.pre-mbtools-deb`), does the same for any `mbregistry`/
+`mbdeploy`/`mbserial`/`mbrelay` in `/usr/local/bin` that would shadow
+`/usr/bin`, and starts its own service. It leaves the old install's files
+in place and prints where they are, so you can delete them. Stop whatever
+deployed the old install (e.g. the ansible playbook) from re-running, or it
+will write its unit back.
 
 Releases are built by `.github/workflows/release-deb.yml`. To cut one, run
 `dotconfig version bump`, commit, then `git tag v<version> && git push

@@ -57,8 +57,20 @@ jobs:
           for image in ubuntu:22.04 ubuntu:24.04 debian:13; do
             echo "::group::$image"
             docker run --rm -v "$PWD/dist:/dist:ro" "$image" sh -ec '
+              # Simulate an older install the package must take over from.
+              mkdir -p /etc/systemd/system/mbregistry.service.d /etc/udev/rules.d /opt/mbtools/bin
+              printf "[Service]\nExecStart=/opt/mbtools/bin/python -m mbtools.registry.cli run\n" \
+                > /etc/systemd/system/mbregistry.service
+              echo "# old" > /etc/udev/rules.d/99-mbregistry-cmsis-dap.rules
+              ln -s /opt/mbtools/bin/mbregistry /usr/local/bin/mbregistry
               apt-get update -qq
               DEBIAN_FRONTEND=noninteractive apt-get install -y -qq /dist/mbtools_*.deb
+              test ! -e /etc/systemd/system/mbregistry.service
+              test -e /etc/systemd/system/mbregistry.service.pre-mbtools-deb
+              test ! -e /etc/systemd/system/mbregistry.service.d
+              test ! -e /etc/udev/rules.d/99-mbregistry-cmsis-dap.rules
+              test ! -L /usr/local/bin/mbregistry
+              test "$(command -v mbregistry)" = /usr/bin/mbregistry
               mbregistry --version
               mbregistry service --help >/dev/null
               mbdeploy --help >/dev/null
