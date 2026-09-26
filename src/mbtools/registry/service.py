@@ -302,7 +302,10 @@ def render_launchd_plist(scope: str, *, exec_path: str | None = None) -> str:
     plist: dict[str, object] = {
         "Label": plist_path.stem,
         "ProgramArguments": [program, "-m", "mbtools.registry.cli", "service", "run"],
-        "EnvironmentVariables": {"PYTHONUNBUFFERED": "1"},
+        # PYTHONDONTWRITEBYTECODE: a root LaunchDaemon must not leave
+        # root-owned __pycache__ in a user-owned venv (it breaks the next
+        # non-root reinstall).
+        "EnvironmentVariables": {"PYTHONUNBUFFERED": "1", "PYTHONDONTWRITEBYTECODE": "1"},
         "WorkingDirectory": _macos_working_directory(scope),
         "RunAtLoad": True,
         "KeepAlive": {"SuccessfulExit": False},
@@ -680,6 +683,9 @@ After=network.target
 [Service]
 Type=simple
 ExecStart={exec_start}
+# Running as root, the daemon would otherwise write root-owned __pycache__
+# into the (user-owned) venv, which breaks the next non-root reinstall.
+Environment=PYTHONDONTWRITEBYTECODE=1
 Restart=on-failure
 RestartSec=2
 RuntimeDirectory=mbregistry
