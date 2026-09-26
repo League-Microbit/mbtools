@@ -1,0 +1,18 @@
+Package: mbtools
+Version: @VERSION@
+Architecture: @ARCH@
+Maintainer: League-Microbit mbtools <https://github.com/League-Microbit/mbtools/issues>
+Installed-Size: @INSTALLED_KB@
+Depends: libc6, libusb-1.0-0, udev
+Recommends: systemd
+Section: utils
+Priority: optional
+Homepage: https://github.com/League-Microbit/mbtools
+Description: find, flash and talk to BBC micro:bits across a fleet of hosts
+ mbregistry is the per-host daemon that watches USB for micro:bits,
+ identifies them, grants exclusive locks, and peers with other hosts over
+ mDNS/ZeroMQ. mbdeploy, mbserial and mbrelay are its clients.
+ .
+ Self-contained: bundles its own Python under /usr/lib/mbtools. Installs
+ and starts mbregistry.service (as root) and a udev rule for the micro:bit
+ DAPLink interface.

@@ -1,0 +1,110 @@
+name: Release .deb
+
+# Builds the self-contained mbtools .deb (packaging/deb/build-deb.sh) for
+# amd64 and arm64 on native runners, smoke-tests each by installing it in
+# clean Ubuntu/Debian containers, and -- for a pushed v* tag -- publishes
+# a GitHub release with the packages attached.
+#
+# Release assets, per architecture:
+#   mbtools_<version>_<arch>.deb   the versioned package
+#   mbtools_<arch>.deb             the same file under a fixed name, so
+#                                  releases/latest/download/mbtools_<arch>.deb
+#                                  always fetches the newest package
+#                                  (packaging/deb/install-mbtools.sh uses it)
+#
+# To release: bump the version (dotconfig version bump), commit, then
+#   git tag v<version> && git push origin v<version>
+# The tag must match pyproject.toml's version or the build fails.
+# workflow_dispatch builds and tests the packages without releasing.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Check the tag matches the package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' pyproject.toml | head -1)"
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match pyproject.toml version $version"
+            exit 1
+          fi
+
+      - name: Build the .deb
+        run: packaging/deb/build-deb.sh
+
+      - name: Smoke-test the install in clean containers
+        run: |
+          for image in ubuntu:22.04 ubuntu:24.04 debian:13; do
+            echo "::group::$image"
+            docker run --rm -v "$PWD/dist:/dist:ro" "$image" sh -ec '
+              apt-get update -qq
+              DEBIAN_FRONTEND=noninteractive apt-get install -y -qq /dist/mbtools_*.deb
+              mbregistry --version
+              mbregistry service --help >/dev/null
+              mbdeploy --help >/dev/null
+              mbserial --help >/dev/null
+              mbrelay --help >/dev/null
+              test -f /usr/lib/systemd/system/mbregistry.service
+              test -f /usr/lib/udev/rules.d/99-mbregistry-cmsis-dap.rules
+              DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq mbtools
+              test ! -e /usr/bin/mbregistry
+            '
+            echo "::endgroup::"
+          done
+
+      - name: Add the fixed-name copy
+        run: cp dist/mbtools_*_${{ matrix.arch }}.deb dist/mbtools_${{ matrix.arch }}.deb
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.arch }}
+          path: dist/*.deb
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: deb-*
+          merge-multiple: true
+          path: dist
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.deb \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "mbtools ${GITHUB_REF_NAME#v}" \
+            --generate-notes \
+            --notes "Install or update on Ubuntu/Debian (amd64 or arm64):
+
+          \`\`\`sh
+          curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/packaging/deb/install-mbtools.sh | sudo sh
+          \`\`\`"

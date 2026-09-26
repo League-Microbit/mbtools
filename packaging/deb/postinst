@@ -1,0 +1,29 @@
+#!/bin/sh
+# mbtools postinst: udev rule, plugdev group, and (re)start mbregistry.service.
+set -e
+
+if [ "$1" = "configure" ]; then
+    getent group plugdev >/dev/null || groupadd --system plugdev
+
+    if [ -d /run/udev ] && command -v udevadm >/dev/null; then
+        udevadm control --reload-rules || true
+        udevadm trigger --subsystem-match=tty --subsystem-match=usb \
+            --subsystem-match=hidraw || true
+    fi
+
+    # A unit in /etc (from `mbregistry service install --system` or an older
+    # hand/ansible install) overrides the packaged one in /usr/lib and would
+    # keep running the old install. Say so rather than silently starting it.
+    if [ -e /etc/systemd/system/mbregistry.service ]; then
+        echo "mbtools: /etc/systemd/system/mbregistry.service overrides the packaged unit;" >&2
+        echo "mbtools: remove it (and its old install) and run 'systemctl daemon-reload' to use this package." >&2
+    fi
+
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload
+        systemctl enable mbregistry.service
+        systemctl restart mbregistry.service
+    fi
+fi
+
+exit 0

@@ -18,6 +18,36 @@ Successor to `mbdeploy` (Busboombot/mbdeploy) and the `mbrelay` server in
 `microbit-radio-relay` — see [docs/migration.md](docs/migration.md) for the
 fleet migration runbook that retires them.
 
+## Install on Ubuntu/Debian
+
+Every release publishes a self-contained `.deb` for amd64 and arm64. It
+bundles its own Python under `/usr/lib/mbtools`, so it works on Ubuntu
+22.04/24.04 and Debian 12/13 regardless of the system Python. To install or
+update to the latest release:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/League-Microbit/mbtools/main/packaging/deb/install-mbtools.sh | sudo sh
+```
+
+The script is idempotent (it does nothing if that version is already
+installed), so it is safe to run on a schedule or from configuration
+management. Pass a version to pin one: `sudo sh install-mbtools.sh
+0.20260926.1`. The package installs the four commands in `/usr/bin`,
+starts `mbregistry.service` as root, adds the micro:bit udev rule, and
+restarts the daemon after every upgrade. `apt remove mbtools` stops it;
+`apt purge mbtools` also deletes `/var/lib/mbregistry`.
+
+A host with an older install (`mbregistry service install --system`, or a
+venv under `/opt/mbtools`) has a unit in `/etc/systemd/system` that
+overrides the packaged one. Remove that first:
+`sudo mbregistry service uninstall --system`, or delete the unit and run
+`sudo systemctl daemon-reload`.
+
+Releases are built by `.github/workflows/release-deb.yml`. To cut one, run
+`dotconfig version bump`, commit, then `git tag v<version> && git push
+origin v<version>`. `packaging/deb/build-deb.sh` builds the same package
+on any Ubuntu box.
+
 ## Usage
 
 **Installing and running the daemon as a service** (install methods,

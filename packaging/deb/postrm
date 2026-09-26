@@ -1,0 +1,20 @@
+#!/bin/sh
+# mbtools postrm: reload systemd/udev; purge also removes registry state.
+set -e
+
+case "$1" in
+    remove|purge)
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload || true
+        fi
+        if [ -d /run/udev ] && command -v udevadm >/dev/null; then
+            udevadm control --reload-rules || true
+        fi
+        ;;
+esac
+
+if [ "$1" = "purge" ]; then
+    rm -rf /var/lib/mbregistry
+fi
+
+exit 0
