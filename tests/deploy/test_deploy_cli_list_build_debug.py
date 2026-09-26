@@ -151,7 +151,7 @@ def test_mbdeploy_list_table_identical_to_mbregistry_list(
 
     assert deploy_out == registry_out
     assert "vevov" in deploy_out
-    assert "locked by flash pid 4821" in deploy_out
+    assert "locked" in deploy_out
 
 
 @pytest.mark.requires_af_unix

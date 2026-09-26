@@ -109,7 +109,13 @@ def test_connected_device_with_role_and_common_name_is_free_and_shows_role_slash
     assert "vevov" in data_line
 
 
-def test_locked_device_shows_locked_by_kind_pid_regardless_of_underlying_state():
+def _state_and_lock(out: str) -> tuple[str, str]:
+    """(STATE, LOCKED) cells of the first data row."""
+    cells = out.splitlines()[2].split()
+    return cells[0], cells[1]
+
+
+def test_locked_local_device_shows_locked_and_local_when_unlabelled():
     d = _device(
         short_uid="cccccccc",
         state=STATE_CONNECTED,
@@ -118,83 +124,62 @@ def test_locked_device_shows_locked_by_kind_pid_regardless_of_underlying_state()
         lock_kind="serial",
         lock_pid=4821,
     )
-    out = render_table([d])
-    data_line = out.splitlines()[2]
-    assert "locked by serial pid 4821" in data_line
+    assert _state_and_lock(render_table([d])) == ("locked", "local")
 
 
-def test_locked_device_with_no_label_or_since_shows_no_suffix():
-    """``lock_since`` unset (this fixture's default -- a test predating
-    sprint 008 ticket 002, or the value ``list`` returns for a device
-    this connection never locked, which never happens for a device
-    that's actually locked in production, but is the shape a hand-built
-    fixture without it exercises) means no suffix at all -- the exact
-    pre-ticket-002 cell text."""
-    d = _device(
-        short_uid="ccccccc1",
-        state=STATE_CONNECTED,
-        lock_kind="serial",
-        lock_pid=4821,
-    )
-    out = render_table([d])
-    data_line = out.splitlines()[2]
-    assert "locked by serial pid 4821" in data_line
-    assert "(" not in data_line
-
-
-def test_locked_device_with_since_but_no_label_shows_age_only():
-    now = 2_000_000_000.0
-    d = _device(
-        short_uid="ccccccc2",
-        state=STATE_CONNECTED,
-        lock_kind="serial",
-        lock_pid=4821,
-        lock_since=now - 725,  # 12m5s ago
-    )
-    out = render_table([d], now=now)
-    data_line = out.splitlines()[2]
-    assert "locked by serial pid 4821 (12m)" in data_line
-
-
-def test_locked_device_with_label_and_since_shows_both():
+def test_locked_local_device_lock_column_is_the_label_machine():
     now = 2_000_000_000.0
     d = _device(
         short_uid="ccccccc3",
         state=STATE_CONNECTED,
-        lock_kind="flash",
+        lock_kind="relay",
         lock_pid=99,
-        lock_label="alice-laptop",
+        lock_label="gala / robot-console",
         lock_since=now - 725,
     )
     out = render_table([d], now=now)
-    data_line = out.splitlines()[2]
-    assert "locked by flash pid 99 (alice-laptop, 12m)" in data_line
+    assert _state_and_lock(out) == ("locked", "gala")
+    assert "robot-console" not in out
+    assert "12m" not in out
 
 
-def test_peer_owned_locked_row_shows_baked_in_remote_display_unmodified():
-    """Design Rationale Decision 2: a peer-owned row's label/since text
-    already rides inside ``remote_lock_display`` (baked in by
-    ``registry.peering.publish_lock_event`` before this store ever sees
-    it) -- ``render.py`` must not try to reformat or double-append
-    anything for that branch, just show the cached string verbatim, same
-    as before this ticket."""
+def test_peer_owned_locked_row_lock_column_comes_from_display_label():
     d = _device(
         short_uid="ccccccc4",
         state=STATE_CONNECTED,
-        host="loki",
+        host="hodr",
         peer_reachable=True,
-        remote_lock_kind="flash",
-        remote_lock_display="pid 4821 (alice-laptop, 12m)",
+        remote_lock_kind="relay",
+        remote_lock_display=(
+            "session 6decdf37-cac5-4dc2-a470-c344fdcfb398 on 192.168.1.240 "
+            "(gala / robot-console, 0s)"
+        ),
     )
     out = render_table([d])
-    data_line = out.splitlines()[2]
-    assert "locked by flash pid 4821 (alice-laptop, 12m)" in data_line
+    assert _state_and_lock(out) == ("locked", "gala")
+    assert "6decdf37" not in out
+
+
+def test_peer_owned_locked_row_without_label_uses_on_address_or_owner():
+    d = _device(
+        short_uid="ccccccc5",
+        state=STATE_CONNECTED,
+        host="hodr",
+        peer_reachable=True,
+        remote_lock_kind="relay",
+        remote_lock_display="session abc on 192.168.1.240 (0s)",
+    )
+    assert _state_and_lock(render_table([d])) == ("locked", "192.168.1.240")
+    d["remote_lock_display"] = "pid 4821"
+    assert _state_and_lock(render_table([d])) == ("locked", "hodr")
+
+
+def test_unlocked_device_lock_column_is_dash():
+    d = _device(short_uid="cccccccd", state=STATE_CONNECTED)
+    assert _state_and_lock(render_table([d])) == ("free", "-")
 
 
 def test_locked_device_takes_precedence_over_no_firmware_state():
-    # A device can be locked (e.g. mid-flash) while its last-known state
-    # is still "no firmware" -- the lock is the more useful thing to show
-    # in the STATE column, per _state_cell's own docstring.
     d = _device(
         short_uid="dddddddd",
         state=STATE_CONNECTED_NO_FIRMWARE,
@@ -202,9 +187,8 @@ def test_locked_device_takes_precedence_over_no_firmware_state():
         lock_pid=99,
     )
     out = render_table([d])
-    data_line = out.splitlines()[2]
-    assert "locked by flash pid 99" in data_line
-    assert "no-firmware" not in data_line
+    assert _state_and_lock(out)[0] == "locked"
+    assert "no-firmware" not in out
 
 
 def test_connected_no_firmware_device_is_no_firmware_state_and_firmware_cell():
@@ -237,9 +221,8 @@ def test_locked_device_takes_precedence_over_no_announce_state():
         lock_pid=99,
     )
     out = render_table([d])
-    data_line = out.splitlines()[2]
-    assert "locked by flash pid 99" in data_line
-    assert "no-answer" not in data_line
+    assert _state_and_lock(out)[0] == "locked"
+    assert "no-answer" not in out
 
 
 def test_disconnected_device_is_gone_state():
@@ -427,7 +410,7 @@ def test_remote_row_reachable_shows_hostname_and_cached_lock_display():
     out = render_table([d])
     data_line = out.splitlines()[2]
     assert "loki  /dev/ttyACM7" in data_line.rstrip()
-    assert "locked by serial pid 4821" in data_line
+    assert data_line.split()[:2] == ["locked", "loki"]
     # A remote row's cached lock display must never fall back to the
     # local-only lock_kind/lock_pid fields (which are always None for a
     # peer-owned row -- see api._device_dict).
@@ -534,7 +517,7 @@ def test_sort_by_host_puts_local_first_then_peers_alphabetically():
 
 def test_render_table_honors_sort_by():
     out = render_table(_sort_fixture(), sort_by="name")
-    names = [line.split()[1] for line in out.splitlines()[2:]]
+    names = [line.split()[2] for line in out.splitlines()[2:]]
     assert names == ["Alpha", "mid", "zeta"]
 
 

@@ -19,10 +19,10 @@ rendering code exists").
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Any
 
-from mbtools.registry.locks import format_lock_suffix
 from mbtools.registry.store import (
     STATE_ATTACHED_NO_ANNOUNCE,
     STATE_ATTACHED_UNPROBED,
@@ -46,7 +46,7 @@ __all__ = [
 #: dash when absent") asserts a row *ends with* its PORT cell; keeping
 #: PORT last is what makes that assertion -- and any other caller making
 #: the same "PORT is the last column" assumption -- still true.
-TABLE_HEADERS = ["STATE", "NAME", "UID", "FIRMWARE", "HOST", "PORT"]
+TABLE_HEADERS = ["STATE", "LOCKED", "NAME", "UID", "FIRMWARE", "HOST", "PORT"]
 
 
 #: Column names accepted as ``sort_by`` by :func:`render_table` and
@@ -103,16 +103,9 @@ def _state_cell(device: dict[str, Any], now: float) -> str:
     -- a device can be locked (e.g. mid-flash) while its last-known state
     is still one of those, and the lock is the more useful thing to show.
 
-    Sprint 008 (ticket 002): a local row's lock cell appends the held
-    lock's label/since text (``format_lock_suffix``, e.g. ``"locked by
-    serial pid 4821 (alice-laptop, 12m)"``) when ``lock_since`` is set --
-    ``now`` (threaded down from :func:`render_table`, never read
-    internally, keeping this module's "no I/O outside its own arguments"
-    contract) is what the elapsed age is computed against. A peer-owned
-    row needs no equivalent change here: its ``remote_lock_display``
-    cell already carries the same text, baked in by
-    ``registry.peering.publish_lock_event`` (Design Rationale Decision 2)
-    before it ever reaches this store.
+    A locked device shows just ``locked``; the machine holding the lock
+    goes in its own LOCKED column (:func:`_lock_cell`), and the full lock
+    detail (kind, pid, label, age) stays in ``list --json``.
 
     Sprint 007 (ticket 001): ``no-answer`` (:data:`STATE_ATTACHED_NO_ANNOUNCE`)
     is a probe that got nothing back but doesn't know the board is blank;
@@ -138,22 +131,55 @@ def _state_cell(device: dict[str, Any], now: float) -> str:
         return "peer unreachable"
     if device["state"] == STATE_DISCONNECTED:
         return "gone"
-    if host is not None:
-        lock_kind = device.get("remote_lock_kind")
-        if lock_kind:
-            return f"locked by {lock_kind} {device.get('remote_lock_display')}"
-    else:
-        lock_kind = device.get("lock_kind")
-        if lock_kind:
-            suffix = format_lock_suffix(
-                device.get("lock_label"), device.get("lock_since"), now=now
-            )
-            return f"locked by {lock_kind} pid {device.get('lock_pid')}{suffix}"
+    if _is_locked(device):
+        return "locked"
     if device["state"] == STATE_ATTACHED_NO_ANNOUNCE:
         return "no-answer"
     if device["state"] == STATE_CONNECTED_NO_FIRMWARE:
         return "no-firmware"
     return "free"
+
+
+def _is_locked(device: dict[str, Any]) -> bool:
+    key = "remote_lock_kind" if device.get("host") is not None else "lock_kind"
+    return bool(device.get(key))
+
+
+#: The ``(<label>, <age>)`` tail ``format_lock_suffix`` bakes into a
+#: peer's replicated ``remote_lock_display`` text.
+_DISPLAY_LABEL_RE = re.compile(r"\(([^()]*), [^,()]*\)\s*$")
+#: The ``on <address>`` a relay-session lock's display names its client by.
+_DISPLAY_ON_RE = re.compile(r"\bon (\S+)")
+
+
+def _lock_cell(device: dict[str, Any]) -> str:
+    """LOCKED column: the machine holding the lock, ``-`` when unlocked.
+
+    A lock's label is the client's own ``"<machine> / <program>"`` text
+    (e.g. ``"gala / robot-console"``), so the machine is the part before
+    ``" / "``. A peer-owned row only carries the replicated display
+    string, so the label is recovered from its ``(<label>, <age>)`` tail,
+    else its ``on <address>``. An unlabelled lock falls back to the host
+    that owns the board (``local`` for this registry's own).
+    """
+    if not _is_locked(device):
+        return "-"
+    host = device.get("host")
+    label = None
+    if host is None:
+        label = device.get("lock_label")
+    else:
+        display = device.get("remote_lock_display") or ""
+        match = _DISPLAY_LABEL_RE.search(display)
+        if match and match.group(1):
+            label = match.group(1)
+        else:
+            match = _DISPLAY_ON_RE.search(display)
+            if match:
+                return match.group(1)
+    if label:
+        return label.split(" / ")[0].strip()
+    return host or "local"
 
 
 def _host_cell(device: dict[str, Any]) -> str:
@@ -257,6 +283,7 @@ def render_table(
     rows = [
         [
             _state_cell(d, now),
+            _lock_cell(d),
             _name_cell(d),
             d.get("short_uid") or d["uid"][-8:],
             _firmware_cell(d),

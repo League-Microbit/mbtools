@@ -125,7 +125,7 @@ def test_list_table_shows_state_uid_firmware_port_and_no_trailing_lines(server, 
 
     assert "STATE" in out and "UID" in out and "FIRMWARE" in out and "PORT" in out
     assert "free" in out  # UID_FREE_UNPROBED and UID_CONNECTED
-    assert "locked by serial pid 4821" in out  # UID_LOCKED
+    assert "locked" in out  # UID_LOCKED
     assert "no-answer" in out  # UID_NO_ANNOUNCE
     assert "no-firmware" in out  # UID_KNOWN_BLANK
     assert "unknown" in out  # UID_NO_ANNOUNCE's firmware cell
@@ -245,7 +245,7 @@ def test_list_json_sort_by_state(server, capsys, flag):
 
     assert excinfo.value.code == EXIT_OK
     uids = [d["uid"] for d in json.loads(capsys.readouterr().out)["devices"]]
-    # free (x2) < gone < locked by ... < no-answer < no-firmware
+    # free (x2) < gone < locked < no-answer < no-firmware
     assert uids.index(UID_GONE) < uids.index(UID_LOCKED)
     assert uids.index(UID_LOCKED) < uids.index(UID_NO_ANNOUNCE)
     assert uids.index(UID_NO_ANNOUNCE) < uids.index(UID_KNOWN_BLANK)
