@@ -348,7 +348,7 @@ def _parse_peer_spec(spec: str) -> tuple[str, int]:
 
 
 def cmd_list(args: argparse.Namespace) -> int:
-    """``mbregistry list [--json]`` -- connect to the api socket, ask for
+    """``mbregistry list [--json] [-s|-n|-f|-H]`` -- connect to the api socket, ask for
     every device, render it. Never touches ``store``/``locks`` directly
     (see module docstring). Ticket 001's extraction: the socket
     connect/framing/JSON that used to live inline here now lives in
@@ -384,10 +384,10 @@ def cmd_list(args: argparse.Namespace) -> int:
         return exc.exit_code
 
     if args.json:
-        print(json.dumps(render_json(devices), indent=2))
+        print(json.dumps(render_json(devices, sort_by=args.sort_by), indent=2))
         return EXIT_OK
 
-    print(render_table(devices))
+    print(render_table(devices, sort_by=args.sort_by))
     return EXIT_OK
 
 
@@ -1570,7 +1570,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--socket",
         help=f"api socket path (default {DEFAULT_SOCKET_PATH}, or ${_SOCKET_ENV_VAR})",
     )
-    list_p.set_defaults(func=cmd_list)
+    list_sort = list_p.add_mutually_exclusive_group()
+    for short, key in (("-s", "state"), ("-n", "name"), ("-f", "firmware"), ("-H", "host")):
+        list_sort.add_argument(
+            short,
+            f"--by-{key}",
+            dest="sort_by",
+            action="store_const",
+            const=key,
+            help=f"sort by {key.upper()} (default: by UID)",
+        )
+    list_p.set_defaults(func=cmd_list, sort_by=None)
 
     unlock_p = sub.add_parser(
         "unlock", help="forcibly release a device's lock (local socket only)"

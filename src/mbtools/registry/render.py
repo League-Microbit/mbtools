@@ -31,6 +31,7 @@ from mbtools.registry.store import (
 )
 
 __all__ = [
+    "SORT_KEYS",
     "TABLE_HEADERS",
     "render_table",
     "render_json",
@@ -48,15 +49,50 @@ __all__ = [
 TABLE_HEADERS = ["STATE", "NAME", "UID", "FIRMWARE", "HOST", "PORT"]
 
 
-def _sort_devices(devices: list[dict[str, Any]]) -> list[dict[str, Any]]:
+#: Column names accepted as ``sort_by`` by :func:`render_table` and
+#: :func:`render_json` (``mbregistry list``'s ``--by-state``/``--by-name``/
+#: ``--by-firmware``/``--by-host`` flags).
+SORT_KEYS = ("state", "name", "firmware", "host")
+
+
+def _name_cell(device: dict[str, Any]) -> str:
+    return device.get("device_name") or device.get("chip_identity_name") or "-"
+
+
+def _sort_devices(
+    devices: list[dict[str, Any]],
+    sort_by: str | None = None,
+    *,
+    now: float | None = None,
+) -> list[dict[str, Any]]:
     """Stable display order shared by both :func:`render_table` and
     :func:`render_json` -- short UID when known, else the full UID.
     Sorting here (rather than leaving it to each caller) is what makes
     "shared verbatim" true for order, not just cell formatting: a caller
     that fetches the same devices from ``registry.client.list()`` gets
     the same order out of either render function.
+
+    ``sort_by`` (one of :data:`SORT_KEYS`), if given, orders by that
+    column's *displayed* cell text (case-insensitive) instead, with the
+    UID order above as the tie-breaker. ``host`` puts ``local`` rows
+    first, then peers alphabetically.
     """
-    return sorted(devices, key=lambda d: d.get("short_uid") or d["uid"])
+    ordered = sorted(devices, key=lambda d: d.get("short_uid") or d["uid"])
+    if sort_by is None:
+        return ordered
+    if sort_by == "state":
+        if now is None:
+            now = time.time()
+        return sorted(ordered, key=lambda d: _state_cell(d, now).lower())
+    if sort_by == "name":
+        return sorted(ordered, key=lambda d: _name_cell(d).lower())
+    if sort_by == "firmware":
+        return sorted(ordered, key=lambda d: _firmware_cell(d).lower())
+    if sort_by == "host":
+        return sorted(
+            ordered, key=lambda d: (d.get("host") is not None, _host_cell(d).lower())
+        )
+    raise ValueError(f"unknown sort key {sort_by!r} (expected one of {SORT_KEYS})")
 
 
 def _state_cell(device: dict[str, Any], now: float) -> str:
@@ -177,7 +213,12 @@ def _table(rows: list[list[str]], headers: list[str]) -> str:
     return "\n".join(out)
 
 
-def render_table(devices: list[dict[str, Any]], *, now: float | None = None) -> str:
+def render_table(
+    devices: list[dict[str, Any]],
+    *,
+    now: float | None = None,
+    sort_by: str | None = None,
+) -> str:
     """The STATE/NAME/UID/FIRMWARE/HOST/PORT table -- exactly one header
     line, one rule line, and one row per device, nothing else (sprint 007,
     ticket 001 / SUC-003: ``render_table``'s output never contains a line
@@ -203,10 +244,12 @@ def render_table(devices: list[dict[str, Any]], *, now: float | None = None) -> 
     Defaults to :func:`time.time` (this function's only I/O, mirroring
     every other module's ``now_fn``-style convention rather than
     threading a clock through every caller that doesn't care about it).
+
+    ``sort_by`` -- see :func:`_sort_devices`.
     """
     if now is None:
         now = time.time()
-    devices = _sort_devices(devices)
+    devices = _sort_devices(devices, sort_by, now=now)
 
     if not devices:
         return "no devices known to the registry"
@@ -214,7 +257,7 @@ def render_table(devices: list[dict[str, Any]], *, now: float | None = None) -> 
     rows = [
         [
             _state_cell(d, now),
-            d.get("device_name") or d.get("chip_identity_name") or "-",
+            _name_cell(d),
             d.get("short_uid") or d["uid"][-8:],
             _firmware_cell(d),
             _host_cell(d),
@@ -225,7 +268,9 @@ def render_table(devices: list[dict[str, Any]], *, now: float | None = None) -> 
     return _table(rows, TABLE_HEADERS)
 
 
-def render_json(devices: list[dict[str, Any]]) -> dict[str, Any]:
+def render_json(
+    devices: list[dict[str, Any]], *, sort_by: str | None = None
+) -> dict[str, Any]:
     """The ``--json``-equivalent structured form -- the same
     ``{"devices": [...]}`` shape ``mbregistry list --json`` has always
     ``json.dumps``'d, with devices in the same sort order
@@ -242,4 +287,4 @@ def render_json(devices: list[dict[str, Any]]) -> dict[str, Any]:
     structured field, per SUC-003's "``--json`` carries the same
     per-device detail as a structured field" requirement.
     """
-    return {"devices": _sort_devices(devices)}
+    return {"devices": _sort_devices(devices, sort_by)}

@@ -477,3 +477,69 @@ def test_remote_row_unreachable_wins_over_disconnected_state():
     data_line = out.splitlines()[2]
     assert "peer unreachable" in data_line
     assert "gone" not in data_line
+
+
+# ---------------------------------------------------------------------------
+# sort_by -- mbregistry list's --by-state/--by-name/--by-firmware/--by-host
+# ---------------------------------------------------------------------------
+
+
+def _sort_fixture() -> list[dict]:
+    return [
+        _device(
+            uid="u1", short_uid="11111111", state=STATE_CONNECTED,
+            device_name="zeta", role="RADIOBRIDGE", common_name="relay", host="magni",
+        ),
+        _device(
+            uid="u2", short_uid="22222222", state=STATE_DISCONNECTED,
+            device_name="Alpha", role="NEZHA2", common_name="robot",
+        ),
+        _device(
+            uid="u3", short_uid="33333333", state=STATE_CONNECTED,
+            device_name="mid", role="JOYSTICK", common_name="joystick", host="hodr",
+        ),
+    ]
+
+
+def _short_uids(devices: list[dict]) -> list[str]:
+    return [d["short_uid"] for d in devices]
+
+
+def test_default_order_is_by_short_uid():
+    rows = render_json(list(reversed(_sort_fixture())))["devices"]
+    assert _short_uids(rows) == ["11111111", "22222222", "33333333"]
+
+
+def test_sort_by_state_uses_displayed_state_with_uid_tiebreak():
+    rows = render_json(_sort_fixture(), sort_by="state")["devices"]
+    # "free" (u1, u3 by uid) before "gone" (u2)
+    assert _short_uids(rows) == ["11111111", "33333333", "22222222"]
+
+
+def test_sort_by_name_is_case_insensitive():
+    rows = render_json(_sort_fixture(), sort_by="name")["devices"]
+    assert _short_uids(rows) == ["22222222", "33333333", "11111111"]
+
+
+def test_sort_by_firmware_uses_firmware_cell():
+    rows = render_json(_sort_fixture(), sort_by="firmware")["devices"]
+    # JOYSTICK/... < NEZHA2/... < RADIOBRIDGE/...
+    assert _short_uids(rows) == ["33333333", "22222222", "11111111"]
+
+
+def test_sort_by_host_puts_local_first_then_peers_alphabetically():
+    rows = render_json(_sort_fixture(), sort_by="host")["devices"]
+    assert _short_uids(rows) == ["22222222", "33333333", "11111111"]
+
+
+def test_render_table_honors_sort_by():
+    out = render_table(_sort_fixture(), sort_by="name")
+    names = [line.split()[1] for line in out.splitlines()[2:]]
+    assert names == ["Alpha", "mid", "zeta"]
+
+
+def test_unknown_sort_key_raises():
+    import pytest
+
+    with pytest.raises(ValueError):
+        render_json(_sort_fixture(), sort_by="port")

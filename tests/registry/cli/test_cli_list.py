@@ -216,3 +216,44 @@ def test_list_flag_overrides_socket_env_var(server, tmp_path, monkeypatch, capsy
         main(["list", "--socket", str(server.socket_path)])
 
     assert excinfo.value.code == EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# sort flags
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.requires_af_unix
+@pytest.mark.parametrize("flag", ["-n", "--by-name"])
+def test_list_sort_by_name_short_and_long(server, capsys, flag):
+    with pytest.raises(SystemExit) as excinfo:
+        main(["list", flag, "--socket", str(server.socket_path)])
+
+    assert excinfo.value.code == EXIT_OK
+    rows = capsys.readouterr().out.splitlines()[2:]
+    # unnamed rows ("-") sort first, then getez before vevov
+    getez = next(i for i, r in enumerate(rows) if "getez" in r)
+    vevov = next(i for i, r in enumerate(rows) if "vevov" in r)
+    assert (getez, vevov) == (len(rows) - 2, len(rows) - 1)
+
+
+@pytest.mark.requires_af_unix
+@pytest.mark.parametrize("flag", ["-s", "--by-state"])
+def test_list_json_sort_by_state(server, capsys, flag):
+    with pytest.raises(SystemExit) as excinfo:
+        main(["list", "--json", flag, "--socket", str(server.socket_path)])
+
+    assert excinfo.value.code == EXIT_OK
+    uids = [d["uid"] for d in json.loads(capsys.readouterr().out)["devices"]]
+    # free (x2) < gone < locked by ... < no-answer < no-firmware
+    assert uids.index(UID_GONE) < uids.index(UID_LOCKED)
+    assert uids.index(UID_LOCKED) < uids.index(UID_NO_ANNOUNCE)
+    assert uids.index(UID_NO_ANNOUNCE) < uids.index(UID_KNOWN_BLANK)
+    assert set(uids[:2]) == {UID_FREE_UNPROBED, UID_CONNECTED}
+
+
+@pytest.mark.parametrize("flags", [["-s", "-n"], ["--by-firmware", "-H"]])
+def test_list_sort_flags_are_mutually_exclusive(flags):
+    with pytest.raises(SystemExit) as excinfo:
+        main(["list", *flags])
+    assert excinfo.value.code == 2
