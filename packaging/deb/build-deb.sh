@@ -46,6 +46,16 @@ uv venv --python "$PY" "$PREFIX/venv"
 uv pip install --python "$PREFIX/venv/bin/python" --link-mode copy --compile-bytecode dist/mbtools-*.whl
 "$PREFIX/venv/bin/mbregistry" --version
 
+# Trim what a headless daemon never uses from the bundled interpreter: the
+# stdlib test suite, Tk/IDLE, static libraries and C headers.
+PYHOME="$(dirname "$(dirname "$(readlink -f "$PY")")")"
+rm -rf "$PYHOME"/lib/python3.*/test "$PYHOME"/lib/python3.*/idlelib \
+  "$PYHOME"/lib/python3.*/tkinter "$PYHOME"/lib/python3.*/turtledemo \
+  "$PYHOME"/lib/python3.*/lib-dynload/_tkinter* "$PYHOME"/lib/libtcl* "$PYHOME"/lib/libtk* \
+  "$PYHOME"/lib/tcl* "$PYHOME"/lib/tk* "$PYHOME"/include
+find "$PYHOME" -name '*.a' -delete
+"$PREFIX/venv/bin/mbregistry" --version
+
 # -- stage the package tree --------------------------------------------------
 mkdir -p "$STAGE/usr/lib" "$STAGE/usr/bin" "$STAGE/DEBIAN" \
   "$STAGE/usr/lib/systemd/system" "$STAGE/usr/lib/udev/rules.d" \
