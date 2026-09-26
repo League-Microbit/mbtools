@@ -506,3 +506,53 @@ def test_force_unlock_closes_a_live_stream_session_and_the_holder_sees_eof(
     resp = second.request({"op": "list"})
     assert resp["ok"] is True
     second.close()
+
+
+# ---------------------------------------------------------------------------
+# detached boards: never fall through to the port path
+# ---------------------------------------------------------------------------
+
+
+def test_lock_on_a_detached_board_is_not_found(make_server, store):
+    store.mark_disconnected(LOCAL_UID)
+    srv = make_server()
+    client = _StreamClient(srv.socket_path)
+
+    resp = client.request({"op": "lock", "uid": LOCAL_UID, "kind": KIND_SERIAL})
+
+    assert resp["ok"] is False
+    assert resp["code"] == CODE_NOT_FOUND
+    assert "not attached" in resp["error"]
+    client.close()
+
+
+def test_stream_on_a_board_that_detached_after_locking_is_refused(
+    make_server, store, fake_serials
+):
+    srv = make_server()
+    client = _StreamClient(srv.socket_path)
+    _lock_serial(client)
+    store.mark_disconnected(LOCAL_UID)
+
+    resp = client.request({"op": "stream", "uid": LOCAL_UID})
+
+    assert resp["ok"] is False
+    assert resp["code"] == CODE_NOT_FOUND
+    assert fake_serials == []  # the port was never opened
+    client.close()
+
+
+def test_open_stream_closes_when_its_board_detaches(make_server, store, locks, fake_serials):
+    # A different board plugged into the same port must never be served
+    # on the detached board's stream.
+    srv = make_server()
+    client = _StreamClient(srv.socket_path)
+    _lock_serial(client)
+    assert client.request({"op": "stream", "uid": LOCAL_UID}) == {"ok": True}
+    _wait_until(lambda: len(fake_serials) == 1)
+
+    store.mark_disconnected(LOCAL_UID)
+
+    _wait_until(lambda: fake_serials[0].close_calls == 1, timeout=5.0)
+    _wait_until(lambda: locks.status(LOCAL_UID) is None)
+    client.close()

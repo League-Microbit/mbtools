@@ -777,6 +777,9 @@ class RemoteAPIServer(BaseAPIServer):
                     f"{uid}: flash requires a flash-kind lock held by this "
                     "connection (call 'lock' first)",
                 )
+            detached = self._detached_error(record)
+            if detached is not None:
+                return _flash_error(detached["code"], detached["error"])
 
         def log(line: str) -> None:
             self._write(wfile, {"type": "log", "line": line})

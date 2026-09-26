@@ -864,6 +864,9 @@ class RegistryAPIServer(BaseAPIServer):
                     f"{uid}: flash requires a flash-kind lock held by this "
                     "connection (call 'lock' first)",
                 )
+            detached = self._detached_error(record)
+            if detached is not None:
+                return _flash_error(detached["code"], detached["error"])
 
         # The run itself: deliberately outside the shared lock (see the
         # module docstring and this method's own docstring). ``uid``'s

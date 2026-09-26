@@ -86,6 +86,7 @@ import json
 import logging
 import socket
 import threading
+import time
 from dataclasses import asdict
 from typing import Any, Callable
 
@@ -107,7 +108,13 @@ from mbtools.registry.locks import (
     LockManager,
     LockStatus,
 )
-from mbtools.registry.store import AmbiguousNameError, DeviceRecord, Entry, Store
+from mbtools.registry.store import (
+    STATE_DISCONNECTED,
+    AmbiguousNameError,
+    DeviceRecord,
+    Entry,
+    Store,
+)
 from mbtools.registry.stream_frame import (
     FRAME_BREAK,
     FRAME_CLOSE,
@@ -143,6 +150,10 @@ logger = logging.getLogger(__name__)
 #: Relocated here from ``remote_api.py`` (ticket 004) so both concrete
 #: subclasses share the one sentinel instead of each minting its own.
 _WATCH = object()
+
+#: How often an open stream re-checks that its board is still attached on
+#: the same port (:meth:`BaseAPIServer._stream_still_valid`).
+_STREAM_ATTACH_CHECK_S = 1.0
 
 
 def _entry_dict(entry: Entry) -> dict[str, Any]:
@@ -379,6 +390,34 @@ class BaseAPIServer:
             return None, _error(CODE_NOT_FOUND, f"no such device: {token!r}")
         return record, None
 
+    @staticmethod
+    def _detached_error(record: DeviceRecord) -> dict[str, Any] | None:
+        """``not_found`` for a locally-owned device that is no longer
+        attached. Its row keeps its last port, and that port may now
+        belong to a different board, so a lock, stream or flash on it
+        must never fall through to the port path. ``None`` when the
+        device is attached, or owned by a peer (the owning host makes its
+        own check).
+        """
+        if record.host is None and record.state == STATE_DISCONNECTED:
+            return _error(
+                CODE_NOT_FOUND,
+                f"{record.uid} is not attached (last seen on {record.port or '?'})",
+            )
+        return None
+
+    def _stream_still_valid(self, uid: str, port: str) -> bool:
+        """Is ``uid`` still attached on ``port``? Checked periodically by
+        an open stream so a detached board's session closes instead of
+        carrying whatever board is plugged into that port next."""
+        with self._lock:
+            record = self._store.get(uid)
+        return (
+            record is not None
+            and record.state != STATE_DISCONNECTED
+            and record.port == port
+        )
+
     # -- shared ops ----------------------------------------------------------
 
     def _op_list(self) -> dict[str, Any]:
@@ -457,6 +496,9 @@ class BaseAPIServer:
             if err is not None:
                 return err
             assert record is not None
+            detached = self._detached_error(record)
+            if detached is not None:
+                return detached
             try:
                 self._locks.acquire(record.uid, kind, holder, label=label)
             except LockHeldError as exc:
@@ -649,6 +691,9 @@ class BaseAPIServer:
                     _error(CODE_INVALID_REQUEST, f"{record.uid} has no known port to open"),
                     None,
                 )
+            detached = self._detached_error(record)
+            if detached is not None:
+                return detached, None
             return {"ok": True}, record
 
     def _handle_stream(
@@ -723,7 +768,20 @@ class BaseAPIServer:
         stop = threading.Event()
 
         def _pump_port_to_client() -> None:
+            next_check = time.monotonic() + _STREAM_ATTACH_CHECK_S
             while not stop.is_set():
+                if time.monotonic() >= next_check:
+                    next_check = time.monotonic() + _STREAM_ATTACH_CHECK_S
+                    if not self._stream_still_valid(uid, port):
+                        logger.warning(
+                            "_api_base: %s detached from %s; closing its stream",
+                            uid,
+                            port,
+                        )
+                        stop.set()
+                        with contextlib.suppress(OSError):
+                            conn.shutdown(socket.SHUT_RDWR)
+                        break
                 try:
                     data = ser.read(max(1, ser.in_waiting))
                 except Exception:
