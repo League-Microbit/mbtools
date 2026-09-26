@@ -679,3 +679,36 @@ def test_sweep_releases_lock_of_real_dead_subprocess():
         if proc.poll() is None:
             proc.kill()
             proc.wait()
+
+
+# ---------------------------------------------------------------------------
+# lock logging: who took, was refused, and released each lock
+# ---------------------------------------------------------------------------
+
+
+def test_lock_lifecycle_is_logged_with_holder_and_label(caplog):
+    import logging
+
+    from mbtools.registry.locks import HolderRef, LockHeldError, LockManager
+
+    caplog.set_level(logging.INFO, logger="mbtools.registry.locks")
+    now = [1000.0]
+    locks = LockManager(now_fn=lambda: now[0])
+    alice = HolderRef(origin="local", ref="4821", pid=4821)
+    bob = HolderRef(origin="remote", ref="s1", host="192.168.1.240")
+
+    locks.acquire("uid-1", "relay", alice, label="feldman / robot-console")
+    try:
+        locks.acquire("uid-1", "flash", bob, label="gala / mbdeploy")
+    except LockHeldError:
+        pass
+    now[0] += 125
+    locks.release("uid-1", alice)
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert messages == [
+        "lock: uid-1 relay lock acquired by pid 4821 (feldman / robot-console)",
+        "lock: uid-1 flash lock refused for session s1 on 192.168.1.240 (gala / mbdeploy)"
+        " -- held (relay) by pid 4821 (feldman / robot-console)",
+        "lock: uid-1 relay lock released, was held by pid 4821 (feldman / robot-console)",
+    ]

@@ -65,9 +65,12 @@ knows about ``peering``/ZeroMQ.
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from typing import Callable
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "LockManager",
@@ -197,6 +200,13 @@ def _describe_holder(holder: HolderRef) -> str:
     return f"session {holder.ref} on {holder.host}"
 
 
+def _log_holder(holder: HolderRef, label: str | None) -> str:
+    """``pid 4821 (feldman / robot-console)`` -- the holder plus its
+    label, for the lock log lines."""
+    text = _describe_holder(holder)
+    return f"{text} ({label})" if label else text
+
+
 def _format_age(seconds: float) -> str:
     """A short, human-scale elapsed-time string -- seconds under a
     minute, minutes under an hour, hours beyond that. Not a general
@@ -315,9 +325,18 @@ class LockManager:
         """
         current = self._locks.get(uid)
         if current is not None:
+            logger.info(
+                "lock: %s %s lock refused for %s -- held (%s) by %s",
+                uid,
+                kind,
+                _log_holder(holder, label),
+                current.kind,
+                _log_holder(current.holder, current.label),
+            )
             raise LockHeldError(uid, current)
         since = self._now_fn()
         self._locks[uid] = LockStatus(kind=kind, holder=holder, label=label, since=since)
+        logger.info("lock: %s %s lock acquired by %s", uid, kind, _log_holder(holder, label))
         if self._lock_display_callback is not None:
             self._lock_display_callback(uid, kind, _describe_holder(holder), label, since)
         return True
@@ -336,7 +355,7 @@ class LockManager:
         current = self._locks.get(uid)
         if current is None or current.holder != holder:
             return False
-        self._release(uid, current)
+        self._release(uid, current, "released")
         return True
 
     def force_release(self, uid: str) -> LockStatus | None:
@@ -364,7 +383,7 @@ class LockManager:
         current = self._locks.get(uid)
         if current is None:
             return None
-        self._release(uid, current)
+        self._release(uid, current, "force-released")
         return current
 
     def sweep(self, is_alive: Callable[[HolderRef], bool]) -> list[str]:
@@ -387,7 +406,7 @@ class LockManager:
             uid for uid, status in self._locks.items() if not is_alive(status.holder)
         ]
         for uid in dead_uids:
-            self._release(uid, self._locks[uid])
+            self._release(uid, self._locks[uid], "released (holder gone)")
         return dead_uids
 
     def status(self, uid: str) -> LockStatus | None:
@@ -402,7 +421,7 @@ class LockManager:
         """
         return self._locks.get(uid)
 
-    def _release(self, uid: str, holder: LockStatus) -> None:
+    def _release(self, uid: str, holder: LockStatus, how: str = "released") -> None:
         """Shared release mechanics: drop the table entry, then fire the
         flash-release callback if ``holder`` was flash-kind, then fire
         the lock-display callback (any kind) with
@@ -416,6 +435,13 @@ class LockManager:
         skipped from the other.
         """
         del self._locks[uid]
+        logger.info(
+            "lock: %s %s lock %s, was held by %s",
+            uid,
+            holder.kind,
+            how,
+            _log_holder(holder.holder, holder.label),
+        )
         if holder.kind == KIND_FLASH and self._flash_release_callback is not None:
             self._flash_release_callback(uid)
         if self._lock_display_callback is not None:

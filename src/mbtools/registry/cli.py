@@ -57,6 +57,7 @@ from __future__ import annotations
 import argparse
 import importlib.metadata
 import json
+import logging
 import os
 import shlex
 import signal
@@ -989,6 +990,29 @@ def assemble_names_api(
     )
 
 
+#: Overrides the daemon's log level (DEBUG, INFO, WARNING, ...).
+_LOG_LEVEL_ENV_VAR = "MBREGISTRY_LOG_LEVEL"
+
+
+def _configure_daemon_logging() -> None:
+    """Send the daemon's log records to stderr (the journal, under
+    systemd/launchd) at INFO, so lock acquire/refuse/release lines
+    (``registry.locks``) and the other INFO records are visible -- with
+    no configuration only WARNING and above ever surfaced. A no-op when
+    logging is already configured (an embedding test harness, say).
+    ``$MBREGISTRY_LOG_LEVEL`` overrides the level.
+    """
+    root = logging.getLogger()
+    if root.handlers:
+        return
+    level_name = os.environ.get(_LOG_LEVEL_ENV_VAR, "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s")
+    # zeroconf and pyocd are chatty at INFO; keep them at WARNING.
+    for noisy in ("zeroconf", "pyocd"):
+        logging.getLogger(noisy).setLevel(max(level, logging.WARNING))
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     """``mbregistry run`` -- the daemon's actual entry point. Dispatches
     to :func:`_run_registry` (the real production pipeline), either
@@ -1020,6 +1044,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     flag-gated extra. ``--peer`` only adds *explicit* peers on top of
     whatever mDNS already finds; it never replaces mDNS discovery.
     """
+    _configure_daemon_logging()
     if args.windows_service:
         return run_as_windows_service(lambda stop_event: _run_registry(args, stop_event))
 
