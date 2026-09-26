@@ -819,6 +819,73 @@ def test_peer_vanish_marks_unreachable_and_reconnect_marks_reachable_again(store
         store.close()
 
 
+def test_link_that_reconnects_by_itself_is_marked_reachable_again(store, tmp_path):
+    """feldman: every peer link dropped at once, ZeroMQ reconnected the SUB
+    sockets on its own, but nothing re-ran the snapshot -- the peers
+    stayed "peer unreachable" with stale device rows because their mDNS
+    records never changed (so connect_peer was never called again). Here
+    alpha comes back on the *same* ports and nobody calls connect_peer:
+    the reconnect alone must bring the peer back, with a fresh snapshot.
+    """
+    store_b = Store(tmp_path / "beta.db")
+    store.upsert_attached(UID, "/dev/ttyACM0", "0d28:0204")
+
+    peering_a = _make_peering(store, host="alpha", pub_port=17772, snapshot_port=17773)
+    peering_b = _make_peering(store_b, host="beta", pub_port=17782, snapshot_port=17783)
+    peering_a2 = None
+    try:
+        peering_a.start()
+        peering_b.start()
+        store_b.record_peer_seen("alpha", f"127.0.0.1:{_remote_port(17772)}")
+        peering_b.connect_peer("alpha", "127.0.0.1", 17772, 17773)
+        assert _wait_until(lambda: store_b.get_peer("alpha").reachable is True)
+
+        peering_a.stop()
+        assert _wait_until(lambda: store_b.get_peer("alpha").reachable is False, timeout=10.0)
+
+        # Meanwhile alpha's device list changed; the resync must pick it up.
+        store.mark_disconnected(UID)
+        peering_a2 = _make_peering(store, host="alpha", pub_port=17772, snapshot_port=17773)
+        peering_a2.start()
+
+        assert _wait_until(lambda: store_b.get_peer("alpha").reachable is True, timeout=15.0)
+        assert _wait_until(
+            lambda: store_b.get(UID) is not None and store_b.get(UID).state == "disconnected",
+            timeout=5.0,
+        )
+    finally:
+        peering_b.stop()
+        if peering_a2 is not None:
+            peering_a2.stop()
+        store.close()
+
+
+def test_resync_keeps_link_dropped_when_the_peer_is_still_down(store, tmp_path):
+    store_b = Store(tmp_path / "beta.db")
+    peering_b = _make_peering(store_b, host="beta", pub_port=17792, snapshot_port=17793)
+    reachable_calls: list[str] = []
+    try:
+        peering_b.start()
+        link = peering_mod._PeerLink(
+            host="alpha",
+            store=store_b,
+            zmq_module=peering_mod._real_zmq,
+            context=peering_b._zmq_ctx,
+            pub_address="tcp://127.0.0.1:17794",
+            snapshot_address="tcp://127.0.0.1:17795",  # nothing listening
+            on_unreachable=None,
+            on_reachable=lambda host: reachable_calls.append(host),
+            snapshot_timeout_ms=200,
+        )
+        link._link_dropped.set()
+        assert link.resync() is False
+        assert link.link_dropped is True
+        assert reachable_calls == []
+    finally:
+        peering_b.stop()
+        store_b.close()
+
+
 # ---------------------------------------------------------------------------
 # ticket 002 (sprint 004): name_registry replication -- real loopback
 # sockets, mirroring this module's existing device-row integration tests

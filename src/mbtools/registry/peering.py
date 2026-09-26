@@ -350,6 +350,11 @@ _DEFAULT_SELF_CHECK_INTERVAL_S = 60.0
 #: advertising an address that may now belong to someone else.
 _DEFAULT_ADDRESS_CHECK_INTERVAL_S = 15.0
 
+#: How often :class:`PeerDiscovery` retries the snapshot for a peer link
+#: still marked dropped -- the backstop for a reconnect whose monitor event
+#: was missed (see :meth:`_PeerLink.resync`).
+_DEFAULT_RESYNC_INTERVAL_S = 30.0
+
 
 def _local_ip() -> str:
     """This host's LAN IPv4 address, see :func:`mbtools.registry.netaddr.local_ip`."""
@@ -896,6 +901,14 @@ class _BrowseListener:
         self._on_peer_ready(host, address, pub_port, snapshot_port)
 
 
+def _reconnected_event(zmq_module: Any) -> Any:
+    """The monitor event that means a SUB link is usable again: the ZMTP
+    handshake completing (libzmq 4.3+), else the bare TCP connect."""
+    return getattr(zmq_module, "EVENT_HANDSHAKE_SUCCEEDED", None) or getattr(
+        zmq_module, "EVENT_CONNECTED", None
+    )
+
+
 class _PeerLink:
     """One peer's live ZeroMQ link: SUB-subscribe first, REQ snapshot
     fetch, then ongoing SUB consumption plus a monitor-socket watch for
@@ -949,6 +962,61 @@ class _PeerLink:
         # snapshot dispatch above introduced, found and fixed in the same
         # change, not shipped separately).
         self._link_dropped = threading.Event()
+        #: Re-fetches the snapshot after a dropped link reconnects -- see
+        #: :meth:`resync`.
+        self._resync_thread: threading.Thread | None = None
+        self._resync_guard = threading.Lock()
+
+    @property
+    def link_dropped(self) -> bool:
+        return self._link_dropped.is_set()
+
+    def resync(self) -> bool:
+        """Bring a dropped link back: clear :attr:`_link_dropped`, re-fetch
+        the snapshot (refreshing this peer's device rows) and mark the
+        peer reachable again. Returns whether that worked; on failure the
+        link stays marked dropped for the next try.
+
+        ZeroMQ reconnects the SUB socket by itself after a drop, but
+        nothing used to re-run the snapshot, and :attr:`_link_dropped`
+        blocked even a late one from marking the peer reachable -- so a
+        peer whose mDNS record never changed stayed "peer unreachable"
+        with stale device rows forever (feldman, after every link dropped
+        at once; gala, after its Wi-Fi misroute).
+        """
+        if self._stop_event.is_set() or not self._link_dropped.is_set():
+            return False
+        if not self._resync_guard.acquire(blocking=False):
+            return False  # one already in flight
+        try:
+            self._link_dropped.clear()
+            try:
+                ok = self._fetch_snapshot()
+            except self._zmq.error.ZMQError:
+                ok = False  # context torn down by stop()
+            if ok:
+                logger.warning(
+                    "peering: link to %s (%s) is back; peer reachable again",
+                    self._host,
+                    self._pub_address,
+                )
+            else:
+                self._link_dropped.set()
+            return ok
+        finally:
+            self._resync_guard.release()
+
+    def start_resync(self) -> None:
+        """Run :meth:`resync` on its own thread (never on the monitor or
+        zeroconf thread -- the snapshot fetch can block for its timeout)."""
+        if self._stop_event.is_set() or not self._link_dropped.is_set():
+            return
+        if self._resync_thread is not None and self._resync_thread.is_alive():
+            return
+        self._resync_thread = threading.Thread(
+            target=self.resync, name=f"peer-resync-{self._host}", daemon=True
+        )
+        self._resync_thread.start()
 
     def start(self) -> None:
         """Connect+subscribe the SUB socket synchronously, then hand the
@@ -1022,7 +1090,9 @@ class _PeerLink:
             except Exception:
                 logger.debug("peering: %s unsupported on this SUB socket", opt_name)
 
-    def _fetch_snapshot(self) -> None:
+    def _fetch_snapshot(self) -> bool:
+        """Fetch and apply the peer's snapshot. Returns whether it marked
+        the peer reachable."""
         req = self._ctx.socket(self._zmq.REQ)
         req.setsockopt(self._zmq.LINGER, 0)
         req.setsockopt(self._zmq.RCVTIMEO, self._snapshot_timeout_ms)
@@ -1049,7 +1119,7 @@ class _PeerLink:
                 self._host,
                 self._snapshot_address,
             )
-            return
+            return False
         finally:
             req.close(linger=0)
 
@@ -1057,7 +1127,7 @@ class _PeerLink:
             reply_obj = json.loads(reply.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
             logger.exception("peering: malformed snapshot reply from %s", self._host)
-            return
+            return False
 
         # ticket 002: a valid reply is now ``{"devices": [...], "names":
         # [...]}`` (see _rep_loop/_snapshot_payload/_snapshot_name_payload)
@@ -1074,7 +1144,7 @@ class _PeerLink:
                 self._snapshot_address,
                 reply_obj,
             )
-            return
+            return False
 
         with self._lock:
             for device in reply_obj.get("devices", []):
@@ -1086,6 +1156,22 @@ class _PeerLink:
                         device.get("uid"),
                         self._host,
                     )
+            # The snapshot is this peer's complete list of attached
+            # boards, so any row still tagged with this peer but missing
+            # from it was detached while the link was down (its detach
+            # event never reached us) -- without this, a board unplugged
+            # or moved during an outage stays listed on the old host.
+            seen = {device.get("uid") for device in reply_obj.get("devices", [])}
+            for record in self._store.list_devices():
+                if (
+                    record.host == self._host
+                    and record.uid not in seen
+                    and record.state != STATE_DISCONNECTED
+                ):
+                    try:
+                        self._store.mark_remote_detached(record.uid)
+                    except KeyError:
+                        pass
             for name_entry in reply_obj.get("names", []):
                 try:
                     _apply_snapshot_name(self._store, name_entry)
@@ -1117,9 +1203,10 @@ class _PeerLink:
                 "already observed dropped; not marking reachable",
                 self._host,
             )
-            return
+            return False
         if self._on_reachable is not None:
             self._on_reachable(self._host)
+        return True
 
     def _recv_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -1153,6 +1240,8 @@ class _PeerLink:
                 )
                 if self._on_unreachable is not None:
                     self._on_unreachable(self._host)
+            elif event.get("event") == _reconnected_event(self._zmq) and self._link_dropped.is_set():
+                self.start_resync()
 
     def stop(self) -> None:
         """Stop every background thread (joined, with a timeout) before
@@ -1177,6 +1266,9 @@ class _PeerLink:
         if self._recv_thread is not None:
             self._recv_thread.join(timeout=2.0)
             self._recv_thread = None
+        if self._resync_thread is not None:
+            self._resync_thread.join(timeout=(self._snapshot_timeout_ms / 1000.0) + 1.0)
+            self._resync_thread = None
         if self._monitor_thread is not None:
             self._monitor_thread.join(timeout=2.0)
             self._monitor_thread = None
@@ -1604,12 +1696,23 @@ class PeerDiscovery:
 
     def _self_check_loop(self) -> None:
         next_self_check = time.monotonic() + self._self_check_interval_s
-        interval = min(self._self_check_interval_s, self._address_check_interval_s)
+        next_resync = time.monotonic() + _DEFAULT_RESYNC_INTERVAL_S
+        interval = min(
+            self._self_check_interval_s,
+            self._address_check_interval_s,
+            _DEFAULT_RESYNC_INTERVAL_S,
+        )
         while not self._self_check_stop_event.wait(interval):
             try:
                 self.refresh_addresses()
             except Exception:
                 logger.exception("peering: address refresh failed")
+            if time.monotonic() >= next_resync:
+                next_resync = time.monotonic() + _DEFAULT_RESYNC_INTERVAL_S
+                with self._peer_links_lock:
+                    dropped = [l for l in self._peer_links.values() if l.link_dropped]
+                for link in dropped:
+                    link.start_resync()
             if time.monotonic() >= next_self_check:
                 next_self_check = time.monotonic() + self._self_check_interval_s
                 self._run_self_check()
