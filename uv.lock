@@ -302,7 +302,7 @@ wheels = [
 
 [[package]]
 name = "mbtools"
-version = "0.20260924.7"
+version = "0.20260925.1"
 source = { editable = "." }
 dependencies = [
     { name = "intelhex" },
