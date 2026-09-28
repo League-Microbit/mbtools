@@ -119,4 +119,7 @@ jobs:
 
           \`\`\`sh
           curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/packaging/deb/install-mbtools.sh | sudo sh
-          \`\`\`"
+          \`\`\`
+
+          Or run it as a container (Linux only; see docs/docker.md):
+          \`docker pull ghcr.io/league-microbit/mbtools:${GITHUB_REF_NAME#v}\`"
