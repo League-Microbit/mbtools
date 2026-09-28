@@ -1,0 +1,42 @@
+# Keep the Docker build context to what the image actually needs:
+# pyproject.toml + src/ (installed via `pip install .`). Everything
+# below is either version control, local tooling state, CLASI process
+# artifacts/docs, or test/build output -- none of it is needed inside
+# the image.
+
+.git/
+.github/
+
+# CLASI process artifacts and docs -- not part of the shipped package.
+.clasi/
+clasi/
+docs/
+.agents/
+.mcp.json
+AGENTS.md
+CLAUDE.md
+
+# Local Python tooling state.
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Test sources and other packaging channels -- not needed to build or
+# run the container image.
+tests/
+packaging/
+scripts/
+
+# Misc local/editor state.
+.DS_Store
+*.swp
