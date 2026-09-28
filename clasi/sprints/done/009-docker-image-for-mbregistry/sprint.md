@@ -1,7 +1,7 @@
 ---
 id: 009
 title: Docker image for mbregistry
-status: executing
+status: done
 branch: sprint/009-docker-image-for-mbregistry
 use-cases:
 - SUC-001
