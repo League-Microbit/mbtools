@@ -52,6 +52,10 @@ Releases are built by `.github/workflows/release-deb.yml`. To cut one, run
 origin v<version>`. `packaging/deb/build-deb.sh` builds the same package
 on any Ubuntu box.
 
+Prefer a container instead? Every release also publishes a multi-arch
+Docker image (Linux only) to `ghcr.io/league-microbit/mbtools`. See
+[docs/docker.md](docs/docker.md) for the run recipe and mechanics.
+
 ## Usage
 
 **Installing and running the daemon as a service** (install methods,
