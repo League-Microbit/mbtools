@@ -1,0 +1,42 @@
+# Example compose recipe for running mbregistry in a container
+# (sprint 009). See docs/docker.md (ticket 009-003) for the full
+# mechanics/limitations writeup -- this file documents the run recipe
+# itself.
+#
+# network_mode: host is required, not just convenient: mDNS peer
+# discovery needs multicast, and the daemon must advertise the host's
+# own IP/hostname so peers can reach it back -- bridge networking
+# breaks both (see sprint 009's Architecture / Out of Scope: "Bridge
+# networking" is explicitly unsupported). This also means ports
+# 7440/7442/7443/7444 need no `-p` mapping -- they're already the
+# host's own ports.
+#
+# A native mbregistry.service running on the same host must be stopped
+# first -- both want the same socket/db paths and the same serial
+# devices.
+#
+# Linux only: Docker Desktop on macOS/Windows runs containers in a VM
+# with no USB passthrough and no LAN multicast, so this recipe doesn't
+# work there -- use the native venv/.deb install on those platforms
+# instead.
+
+services:
+  mbregistry:
+    image: ghcr.io/league-microbit/mbtools:latest
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - /dev:/dev
+      - /var/lib/mbregistry:/var/lib/mbregistry
+      - /run/mbregistry:/run/mbregistry
+    device_cgroup_rules:
+      # Majors confirmed on a real host (hodr: Debian 13, aarch64) via
+      # `cat /proc/devices` -- not fixed across distros/kernels; re-check
+      # there if a board doesn't show up on a different host.
+      - "c 166:* rmw"   # ttyACM -- micro:bit CDC serial port
+      - "c 189:* rmw"   # usb_device -- raw USB (pyocd's CMSIS-DAP v2 backend)
+      - "c 242:* rmw"   # hidraw -- CMSIS-DAP HID backend
+    # Simple fallback if the device_cgroup_rules above don't cover a
+    # given host's device majors (e.g. a distro/kernel with different
+    # numbering): grants full device access, no cgroup-rule bookkeeping.
+    # privileged: true
