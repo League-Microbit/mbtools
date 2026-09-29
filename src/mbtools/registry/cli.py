@@ -471,6 +471,8 @@ def assemble_daemon_and_api(
     chip_identity_session_factory: Any = None,
     pipe_name: str | None = None,
     eventbus: EventBus | None = None,
+    poll_callback: Any = None,
+    peer_resync_callback: Any = None,
 ) -> tuple[Daemon, RegistryAPIServer | WindowsPipeAPIServer]:
     """Build one :class:`Daemon` and one local-API server that share a
     single ``threading.RLock`` -- ticket 009's fix for the cross-module
@@ -576,6 +578,23 @@ def assemble_daemon_and_api(
     pre-ticket-008-001 caller/test that omits it. :func:`assemble_registry`
     always passes the one ``EventBus`` it constructs for the whole
     daemon pipeline.
+
+    ``poll_callback``/``peer_resync_callback`` (sprint 010, ticket 002)
+    are forwarded verbatim to whichever API server this function
+    constructs (its own ``poll_callback``/``peer_resync_callback``
+    constructor parameters -- see ``_api_base.BaseAPIServer``'s own
+    docstring for what they wire into ``rescan``). Both default to
+    ``None`` here too, exactly like ``event_callback``/
+    ``lock_display_callback`` above -- a bare call (every pre-ticket-
+    010-002 caller/test) leaves rescan's forced poll/peer-resync
+    unwired, not a new failure mode, just the same "no-op unless
+    someone wires it" convention every other optional callback here
+    already follows. :func:`assemble_registry` is the one caller that
+    wires them for real, to ``daemon.run_once``/``peer_discovery.
+    resync_reachable_peers`` -- see that function's own docstring for
+    why it can't simply pass ``daemon.run_once`` as a keyword argument
+    to *this* call (the ``daemon`` it wants to reference is one this
+    very call is about to construct).
     """
     shared_lock = lock if lock is not None else threading.RLock()
     daemon = Daemon(
@@ -600,6 +619,8 @@ def assemble_daemon_and_api(
             lock=shared_lock,
             name_set_callback=name_set_callback,
             name_clear_callback=name_clear_callback,
+            poll_callback=poll_callback,
+            peer_resync_callback=peer_resync_callback,
         )
     else:
         flash_op = FlashOp(locks=daemon.locks, store=store, runner=flash_runner)
@@ -613,6 +634,8 @@ def assemble_daemon_and_api(
             eventbus=eventbus,
             name_set_callback=name_set_callback,
             name_clear_callback=name_clear_callback,
+            poll_callback=poll_callback,
+            peer_resync_callback=peer_resync_callback,
         )
     return daemon, api
 
@@ -858,6 +881,24 @@ def assemble_registry(
         if peer_discovery is not None:
             peer_discovery.publish_name_clear(name)
 
+    # Sprint 010, ticket 002: rescan's own two trigger hooks. `_poll_callback`
+    # is a closure, not a direct `daemon.run_once` reference, because
+    # `daemon` does not exist yet at this point -- it is *this very call*
+    # (`assemble_daemon_and_api` below) that constructs it and hands it
+    # back. Ordinary Python closure late-binding makes this safe: by the
+    # time `_poll_callback` is ever actually invoked (a real `rescan`
+    # request, well after this function has returned), `daemon` has long
+    # since been assigned in this enclosing scope. `peer_resync_callback`
+    # has no such ordering problem -- `peer_discovery` (or `None`, under
+    # `--no-peering`) already exists above, constructed before this call
+    # for the same reason `event_callback`/`lock_display_callback` need
+    # it -- so it is passed directly, mirroring every `publish_*` wiring
+    # above: `None` here leaves `_op_rescan`'s own `peer_resync_callback`
+    # unset, the same pre-existing safe default `--no-peering` already
+    # gives every other peering-dependent hook, not a new failure mode.
+    def _poll_callback() -> None:
+        daemon.run_once()
+
     daemon, api = assemble_daemon_and_api(
         store=store,
         usbwatch=usbwatch,
@@ -876,6 +917,10 @@ def assemble_registry(
         chip_identity_session_factory=chip_identity_session_factory,
         pipe_name=pipe_name,
         eventbus=eventbus,
+        poll_callback=_poll_callback,
+        peer_resync_callback=(
+            peer_discovery.resync_reachable_peers if peer_discovery is not None else None
+        ),
     )
     remote_api = RemoteAPIServer(
         host=remote_host,

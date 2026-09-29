@@ -38,6 +38,10 @@ from mbtools.testing.fakes import (
 VID, PID_ = DAPLINK_VID_PID
 UID = "9900" + "0000" + "11112222" + "3333444455556666" + "77778888" + "6e052820"
 UID2 = "9900" + "0000" + "11112222" + "aaaabbbbccccdddd" + "77778888" + "6e052820"
+# A peer-owned uid (sprint 010, ticket 002's own rescan regression test)
+# -- never inserted by the `store` fixture itself, mirrors
+# tests/registry/api/test_api.py's own UID_REMOTE.
+UID_REMOTE = "bb11" + "0000" + "11112222" + "3333444455556666" + "77778888" + "6e052820"
 ANNOUNCEMENT = "device NEZHA2 robot vevov 1198504156"
 RELAY_ANNOUNCEMENT = "DEVICE:RADIOBRIDGE:relay:getez:1779042496"
 
@@ -548,6 +552,59 @@ def test_remote_owned_row_not_physically_present_is_never_marked_disconnected(st
     assert record.host == "hodr"
     assert record.state != STATE_DISCONNECTED
     assert events == []
+
+
+def test_rescan_purged_rows_never_desync_previously_attached(store):
+    """Sprint 010, ticket 002 regression -- see sprint.md's Migration
+    Concerns: ``run_once``'s own ``previously_attached`` set is built
+    from ``host is None and state != disconnected`` rows only.
+    ``rescan``'s purge candidates (``Store.candidates_for_purge``) are
+    exactly the complement of that: a locally-owned row candidate is
+    always ``disconnected``, and a peer-owned row candidate always has
+    ``host is not None`` -- so neither can ever have been a member of
+    ``previously_attached``, and deleting it out from under a running
+    daemon can never desync the attach/detach diff. Confirmed here by a
+    real ``Store.purge()`` call between two ``run_once()`` cycles, not
+    just by reading the code -- no ``daemon.py`` change was needed to
+    make this true.
+    """
+    usbwatch = FakeUSBSource([[_port_info()]])  # UID stays physically present throughout
+    script = _ProbeScript([ANNOUNCEMENT])
+    events: list[tuple[str, str]] = []
+    daemon = _make_daemon(
+        usbwatch, store, script, event_callback=lambda t, r: events.append((t, r.uid))
+    )
+    daemon.run_once()
+    assert store.get(UID).state == STATE_CONNECTED
+    events.clear()
+
+    # A "gone" local row -- one of rescan's own purge candidates.
+    store.upsert_attached(UID2, "/dev/ttyACM1", format_vid_pid(VID, PID_))
+    store.mark_disconnected(UID2)
+    # A remote-owned row, owned by a now-unreachable peer -- also a
+    # purge candidate, regardless of its own state.
+    store.record_peer_seen("hodr", "hodr:8900")
+    store.upsert_remote_attached(UID_REMOTE, "hodr", "/dev/ttyACM9", format_vid_pid(VID, PID_))
+    store.mark_peer_unreachable("hodr")
+
+    candidates = store.candidates_for_purge()
+    assert set(candidates.device_uids) == {UID2, UID_REMOTE}
+    result = store.purge(candidates.device_uids, candidates.unreachable_peers)
+    assert set(result.removed_device_uids) == {UID2, UID_REMOTE}
+    assert store.get(UID2) is None
+    assert store.get(UID_REMOTE) is None
+
+    daemon.run_once()
+
+    # No spurious attach/detach for either purged row, and the still-
+    # physically-attached UID is untouched (no reprobe -- this rule is
+    # pre-existing and unaffected by the purge).
+    assert events == []
+    assert store.get(UID2) is None
+    assert store.get(UID_REMOTE) is None
+    record = store.get(UID)
+    assert record is not None
+    assert record.state == STATE_CONNECTED
 
 
 # ---------------------------------------------------------------------------

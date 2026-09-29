@@ -15,15 +15,20 @@ down here since it becomes sprint 002's de facto contract; see also
 ``docs/design/registry-api.md``): newline-delimited JSON over the Unix
 socket, one connection per client session. Each request line is a JSON
 object with an ``"op"`` field (``list``/``get``/``find``/``lock``/
-``unlock``/``force_unlock``/``flash``/``mark_flashed``/``names_get``/
-``names_set``/``names_clear``/``names_list``/``watch``/``stream`` --
-the four ``names_*`` ops, sprint 004 ticket 005, are ``BaseAPIServer``'s
-name-registry ops, not scoped to a device at all; ``force_unlock``,
-sprint 008 ticket 003, is local-socket only, this class's own (never
-shared into ``_api_base.py``); ``watch`` (sprint 008 ticket 001) and
-``stream`` (sprint 003 ticket 007, relocated to this transport too by
-sprint 008 ticket 004) are the two this class doesn't own the mechanics
-of -- see ``_api_base.BaseAPIServer._op_watch``/``_handle_watch`` and
+``unlock``/``force_unlock``/``flash``/``mark_flashed``/``rescan``/
+``names_get``/``names_set``/``names_clear``/``names_list``/``watch``/
+``stream`` -- the four ``names_*`` ops, sprint 004 ticket 005, are
+``BaseAPIServer``'s name-registry ops, not scoped to a device at all;
+``force_unlock``, sprint 008 ticket 003, is local-socket only, this
+class's own (never shared into ``_api_base.py``); ``rescan`` (sprint 010
+ticket 002) is ``BaseAPIServer``'s own local-only op instead --
+implemented once there so both this transport and
+``api_windows.WindowsPipeAPIServer`` get it, but (like
+``force_unlock``) never dispatched by ``remote_api.RemoteAPIServer``;
+``watch`` (sprint 008 ticket 001) and ``stream`` (sprint 003 ticket 007,
+relocated to this transport too by sprint 008 ticket 004) are the two
+this class doesn't own the mechanics of -- see
+``_api_base.BaseAPIServer._op_watch``/``_handle_watch`` and
 ``._op_stream_precheck``/``_handle_stream`` respectively); each
 non-streaming op writes exactly one JSON response line, except ``watch``
 (an ``ok`` acknowledgement followed by one JSON line per subsequent
@@ -342,6 +347,8 @@ class RegistryAPIServer(BaseAPIServer):
         stream_baud: int | None = None,
         stream_settle_s: float | None = None,
         break_duration_s: float | None = None,
+        poll_callback: Callable[[], None] | None = None,
+        peer_resync_callback: Callable[[], None] | None = None,
     ) -> None:
         self.socket_path = Path(socket_path)
         self._store = store
@@ -360,6 +367,15 @@ class RegistryAPIServer(BaseAPIServer):
         # test that constructs one directly, unaffected.
         self._name_set_callback = name_set_callback
         self._name_clear_callback = name_clear_callback
+        # Sprint 010 ticket 002: rescan's own two optional trigger hooks
+        # -- see ``_api_base.BaseAPIServer``'s own docstring/class-attribute
+        # comments; ``None`` (the default) leaves rescan's purge itself
+        # unaffected, only skipping the forced poll/peer-resync it would
+        # otherwise trigger, unaffected for every pre-ticket-010-002
+        # caller/test that omits them. ``cli.assemble_registry`` passes
+        # ``daemon.run_once``/``peer_discovery.resync_reachable_peers``.
+        self._poll_callback = poll_callback
+        self._peer_resync_callback = peer_resync_callback
         # Sprint 008 ticket 001: the ``watch`` op's event source
         # (``_api_base.BaseAPIServer._op_watch``/``_handle_watch``) --
         # ``registry.cli``'s assembly always passes the one ``EventBus``
@@ -718,6 +734,8 @@ class RegistryAPIServer(BaseAPIServer):
             resp = self._op_flash(req, pid, acquired_uids, wfile)
         elif op == "mark_flashed":
             resp = self._op_mark_flashed(req, holder)
+        elif op == "rescan":
+            resp = self._op_rescan(req)
         elif op == "names_get":
             resp = self._op_names_get(req)
         elif op == "names_set":
@@ -741,11 +759,12 @@ class RegistryAPIServer(BaseAPIServer):
 
     # -- ops --------------------------------------------------------------
     #
-    # list/find/lock/unlock/mark_flashed are inherited from BaseAPIServer
-    # (ticket 006) -- see this class's own docstring and that module's.
-    # `flash` (ticket 008's remote-flash territory) and `force_unlock`
-    # (sprint 008 ticket 003, local-socket only -- never shared into
-    # `_api_base.py`/dispatched by `remote_api.py`) stay here.
+    # list/find/lock/unlock/mark_flashed/rescan are inherited from
+    # BaseAPIServer (ticket 006; `rescan` sprint 010 ticket 002) -- see
+    # this class's own docstring and that module's. `flash` (ticket 008's
+    # remote-flash territory) and `force_unlock` (sprint 008 ticket 003,
+    # local-socket only -- never shared into `_api_base.py`/dispatched by
+    # `remote_api.py`) stay here.
 
     def _op_force_unlock(self, req: dict[str, Any]) -> dict[str, Any]:
         """``force_unlock(uid)`` (sprint 008, ticket 003): drop ``uid``'s

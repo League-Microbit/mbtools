@@ -202,7 +202,8 @@ def make_server(socket_dir, store, locks):
     servers = []
 
     def _make(*, runner=None, peer_pid_fn=None, is_pid_alive_fn=None, sweep_interval_s=100.0,
-              name_set_callback=None, name_clear_callback=None, eventbus=None):
+              name_set_callback=None, name_clear_callback=None, eventbus=None,
+              poll_callback=None, peer_resync_callback=None):
         flash_op = FlashOp(locks=locks, store=store, runner=runner if runner is not None else _SpyRunner())
         srv = RegistryAPIServer(
             socket_path=f"{socket_dir}/api.sock",
@@ -215,6 +216,8 @@ def make_server(socket_dir, store, locks):
             name_set_callback=name_set_callback,
             name_clear_callback=name_clear_callback,
             eventbus=eventbus,
+            poll_callback=poll_callback,
+            peer_resync_callback=peer_resync_callback,
         )
         srv.start()
         servers.append(srv)
@@ -1288,5 +1291,178 @@ def test_names_callbacks_default_to_none_and_are_never_required(make_server):
     resp = client.request({"op": "names_set", "name": "tovez", "channel": 20, "group": 30})
     assert resp["ok"] is True
     resp = client.request({"op": "names_clear", "name": "tovez"})
+    assert resp["ok"] is True
+    client.close()
+
+
+# ---------------------------------------------------------------------------
+# rescan (sprint 010, ticket 002)
+# ---------------------------------------------------------------------------
+
+
+def test_rescan_dry_run_reports_without_mutating(make_server, store):
+    store.mark_disconnected(UID2)  # a "gone" local row -- a purge candidate
+
+    srv = make_server()
+    client = _Client(srv.socket_path)
+    resp = client.request({"op": "rescan", "dry_run": True})
+
+    assert resp["ok"] is True
+    assert resp["dry_run"] is True
+    assert resp["removed"]["devices"] == [UID2]
+    assert resp["removed"]["peers"] == []
+    assert resp["skipped_locked"] == []
+    # Nothing was actually removed.
+    assert srv._store.get(UID2) is not None
+    client.close()
+
+
+def test_rescan_removes_gone_local_device(make_server, store):
+    store.mark_disconnected(UID2)
+
+    srv = make_server()
+    client = _Client(srv.socket_path)
+    resp = client.request({"op": "rescan"})
+
+    assert resp["ok"] is True
+    assert resp["dry_run"] is False
+    assert resp["removed"]["devices"] == [UID2]
+    assert resp["removed"]["peers"] == []
+    assert resp["skipped_locked"] == []
+    assert srv._store.get(UID2) is None
+    # UID (still attached/connected) is left alone.
+    assert srv._store.get(UID) is not None
+    client.close()
+
+
+def test_rescan_skips_locked_uid_and_never_deletes_it(make_server, store, locks):
+    store.mark_disconnected(UID2)
+    locks.acquire(UID2, KIND_SERIAL, _local_holder(PID_A))
+
+    srv = make_server()
+    client = _Client(srv.socket_path)
+    resp = client.request({"op": "rescan"})
+
+    assert resp["ok"] is True
+    assert resp["removed"]["devices"] == []
+    assert resp["skipped_locked"] == [UID2]
+    # Never passed to Store.purge() -- the row survives.
+    assert srv._store.get(UID2) is not None
+    client.close()
+
+
+def test_rescan_removes_unreachable_peers_devices_and_peer_row(make_server, store):
+    store.record_peer_seen("loki", "loki:8900")
+    store.upsert_remote_attached(UID_REMOTE, "loki", "/dev/ttyACM9", VID_PID)
+    store.mark_peer_unreachable("loki")
+
+    srv = make_server()
+    client = _Client(srv.socket_path)
+    resp = client.request({"op": "rescan"})
+
+    assert resp["ok"] is True
+    assert resp["removed"]["devices"] == [UID_REMOTE]
+    assert resp["removed"]["peers"] == ["loki"]
+    assert srv._store.get(UID_REMOTE) is None
+    assert srv._store.get_peer("loki") is None
+    client.close()
+
+
+def test_rescan_leaves_name_registry_untouched(make_server, store):
+    store.mark_disconnected(UID2)
+    store.set("tovez", 20, 30)
+
+    srv = make_server()
+    client = _Client(srv.socket_path)
+    resp = client.request({"op": "rescan"})
+
+    assert resp["ok"] is True
+    assert srv._store.get_name("tovez") is not None
+    client.close()
+
+
+def test_rescan_publishes_device_removed_and_peer_removed_events(make_server, store):
+    store.mark_disconnected(UID2)
+    store.record_peer_seen("loki", "loki:8900")
+    store.upsert_remote_attached(UID_REMOTE, "loki", "/dev/ttyACM9", VID_PID)
+    store.mark_peer_unreachable("loki")
+
+    bus = EventBus()
+    q = bus.subscribe()
+    srv = make_server(eventbus=bus)
+    client = _Client(srv.socket_path)
+    resp = client.request({"op": "rescan"})
+    assert resp["ok"] is True
+
+    events = [q.get(timeout=2.0) for _ in range(3)]
+    device_events = {e["uid"]: e for e in events if e["type"] == "device_removed"}
+    peer_events = [e for e in events if e["type"] == "peer_removed"]
+    assert device_events == {
+        UID2: {"type": "device_removed", "uid": UID2, "host": None},
+        UID_REMOTE: {"type": "device_removed", "uid": UID_REMOTE, "host": "loki"},
+    }
+    assert peer_events == [{"type": "peer_removed", "host": "loki"}]
+    client.close()
+
+
+def test_rescan_dry_run_publishes_no_events(make_server, store):
+    store.mark_disconnected(UID2)
+    bus = EventBus()
+    q = bus.subscribe()
+    srv = make_server(eventbus=bus)
+    client = _Client(srv.socket_path)
+
+    resp = client.request({"op": "rescan", "dry_run": True})
+    assert resp["ok"] is True
+    assert q.empty()
+    client.close()
+
+
+def test_rescan_calls_poll_and_peer_resync_callbacks_once_on_a_real_rescan(make_server, store):
+    store.mark_disconnected(UID2)
+    poll_calls = []
+    resync_calls = []
+    srv = make_server(
+        poll_callback=lambda: poll_calls.append(1),
+        peer_resync_callback=lambda: resync_calls.append(1),
+    )
+    client = _Client(srv.socket_path)
+
+    resp = client.request({"op": "rescan"})
+
+    assert resp["ok"] is True
+    assert len(poll_calls) == 1
+    assert len(resync_calls) == 1
+    client.close()
+
+
+def test_rescan_dry_run_never_calls_poll_or_peer_resync_callbacks(make_server, store):
+    store.mark_disconnected(UID2)
+    poll_calls = []
+    resync_calls = []
+    srv = make_server(
+        poll_callback=lambda: poll_calls.append(1),
+        peer_resync_callback=lambda: resync_calls.append(1),
+    )
+    client = _Client(srv.socket_path)
+
+    resp = client.request({"op": "rescan", "dry_run": True})
+
+    assert resp["ok"] is True
+    assert poll_calls == []
+    assert resync_calls == []
+    client.close()
+
+
+def test_rescan_callbacks_default_to_none_and_are_never_required(make_server, store):
+    """A server built without poll_callback/peer_resync_callback (every
+    pre-ticket-010-002 construction) still serves rescan -- the
+    callbacks are fire-if-present, never a precondition."""
+    store.mark_disconnected(UID2)
+    srv = make_server()
+    client = _Client(srv.socket_path)
+
+    resp = client.request({"op": "rescan"})
+
     assert resp["ok"] is True
     client.close()

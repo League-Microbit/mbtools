@@ -1,9 +1,12 @@
 """mbtools.registry.api_windows — the Windows counterpart to
 ``mbtools.registry.api.RegistryAPIServer``: the same local device-query
-API (``list``/``find``/``lock``/``unlock``/``mark_flashed``, plus the
-name-registry ops ``registry._api_base.BaseAPIServer`` also provides)
-over a Win32 named pipe instead of a Unix domain socket (spec §3.5 /
-brief §9.2, this sprint's ticket 003).
+API (``list``/``find``/``lock``/``unlock``/``mark_flashed``/``rescan``,
+plus the name-registry ops ``registry._api_base.BaseAPIServer`` also
+provides) over a Win32 named pipe instead of a Unix domain socket (spec
+§3.5 / brief §9.2, this sprint's ticket 003; ``rescan`` is sprint 010
+ticket 002's own addition -- see that module's own docstring for why it
+lives in the shared base rather than a Unix-socket-only op like
+``api.RegistryAPIServer``'s own ``force_unlock``).
 
 Per sprint.md Decision 1 ("standard library only, no ``pywin32``"),
 every Windows API call here goes through ``ctypes.windll`` directly —
@@ -54,8 +57,8 @@ running (mirrors ``usbwatch.py``'s own
 ``monkeypatch.setattr(usbwatch._list_ports, ...)`` precedent).
 
 **No protocol/op logic of its own**: every op
-(``list``/``find``/``lock``/``unlock``/``mark_flashed``, plus the
-name-registry ops) dispatches through
+(``list``/``find``/``lock``/``unlock``/``mark_flashed``/``rescan``, plus
+the name-registry ops) dispatches through
 ``mbtools.registry._api_base.BaseAPIServer``, exactly as
 ``registry.api.RegistryAPIServer`` does — ``WindowsPipeAPIServer``
 supplies only ``_holder_for_connection`` and the pipe transport/
@@ -647,6 +650,8 @@ class WindowsPipeAPIServer(BaseAPIServer):
         name_set_callback: Callable[[Entry], None] | None = None,
         name_clear_callback: Callable[[str], None] | None = None,
         win32: Any | None = None,
+        poll_callback: Callable[[], None] | None = None,
+        peer_resync_callback: Callable[[], None] | None = None,
     ) -> None:
         self.pipe_name = pipe_name if pipe_name is not None else DEFAULT_PIPE_NAME
         self._store = store
@@ -665,6 +670,15 @@ class WindowsPipeAPIServer(BaseAPIServer):
         # `api.RegistryAPIServer`'s own constructor.
         self._name_set_callback = name_set_callback
         self._name_clear_callback = name_clear_callback
+        # Sprint 010 ticket 002: rescan's own two optional trigger hooks
+        # -- see ``_api_base.BaseAPIServer``'s own docstring/class-attribute
+        # comments and ``api.RegistryAPIServer``'s own identical wiring.
+        # ``None`` (the default) leaves rescan's purge itself unaffected,
+        # only skipping the forced poll/peer-resync it would otherwise
+        # trigger. ``cli.assemble_registry`` passes ``daemon.run_once``/
+        # ``peer_discovery.resync_reachable_peers`` here too.
+        self._poll_callback = poll_callback
+        self._peer_resync_callback = peer_resync_callback
 
         self._lock = lock if lock is not None else threading.RLock()
         self._stop_event = threading.Event()
@@ -921,6 +935,8 @@ class WindowsPipeAPIServer(BaseAPIServer):
             resp = self._op_unlock(req, holder, acquired_uids)
         elif op == "mark_flashed":
             resp = self._op_mark_flashed(req, holder)
+        elif op == "rescan":
+            resp = self._op_rescan(req)
         elif op == "names_get":
             resp = self._op_names_get(req)
         elif op == "names_set":
@@ -935,5 +951,6 @@ class WindowsPipeAPIServer(BaseAPIServer):
 
     # -- ops --------------------------------------------------------------
     #
-    # list/find/lock/unlock/mark_flashed/names_* are all inherited from
-    # BaseAPIServer -- see this class's own docstring and that module's.
+    # list/find/lock/unlock/mark_flashed/rescan/names_* are all inherited
+    # from BaseAPIServer -- see this class's own docstring and that
+    # module's.

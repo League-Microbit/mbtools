@@ -1,9 +1,12 @@
 ---
 id: '002'
 title: 'Daemon/API: local rescan op with forced poll and peer resync'
-status: open
-use-cases: [SUC-001, SUC-002]
-depends-on: ['001']
+status: done
+use-cases:
+- SUC-001
+- SUC-002
+depends-on:
+- '001'
 github-issue: ''
 issue: mbregistry-rescan-command.md
 completes_issue: true
@@ -48,18 +51,18 @@ entries this ticket implements.
 
 ## Acceptance Criteria
 
-- [ ] `{"op": "rescan", "dry_run": <bool, optional, default false>}`
+- [x] `{"op": "rescan", "dry_run": <bool, optional, default false>}`
       is dispatched by both `api.RegistryAPIServer` and
       `api_windows.WindowsPipeAPIServer`, and rejected (same
       unrecognized-op response every other unknown op gets) by
       `remote_api.RemoteAPIServer`.
-- [ ] `_op_rescan` computes candidates via
+- [x] `_op_rescan` computes candidates via
       `Store.candidates_for_purge()`, then excludes any uid currently
       locked (`self._locks.status(uid) is not None`) from the delete
       set — an excluded uid is reported in the response as skipped
       (with enough detail for the CLI's "skipped 1 locked" summary
       line), never passed to `Store.purge()`.
-- [ ] On a non-`dry_run` call: `Store.purge()` is called with the
+- [x] On a non-`dry_run` call: `Store.purge()` is called with the
       locked-filtered uid/host sets, actually-removed rows are
       published on `self._eventbus` (when present — see the Windows
       note above) as new `device_removed`/`peer_removed` event types
@@ -69,20 +72,20 @@ entries this ticket implements.
       `peer_resync_callback()` are each called once if not `None`
       (both optional/no-op by default, matching the
       `event_callback`-style convention).
-- [ ] On a `dry_run` call: no `Store.purge()` call, no event
+- [x] On a `dry_run` call: no `Store.purge()` call, no event
       published, no `poll_callback`/`peer_resync_callback` call — the
       response reports the same candidate/skip sets a non-dry-run call
       would act on.
-- [ ] Response shape carries enough structure for both the CLI's
+- [x] Response shape carries enough structure for both the CLI's
       human summary and `--json` (e.g. `{"ok": true, "removed":
       {"devices": [...], "peers": [...]}, "skipped_locked": [...],
       "dry_run": bool}`).
-- [ ] `api.RegistryAPIServer.__init__`/`api_windows.WindowsPipeAPIServer.__init__`
+- [x] `api.RegistryAPIServer.__init__`/`api_windows.WindowsPipeAPIServer.__init__`
       both gain `poll_callback: Callable[[], None] | None = None` and
       `peer_resync_callback: Callable[[], None] | None = None`,
       forwarded into the shared base exactly like every other
       optional callback parameter these constructors already accept.
-- [ ] `peering.PeerDiscovery` gains `resync_reachable_peers()` — for
+- [x] `peering.PeerDiscovery` gains `resync_reachable_peers()` — for
       every currently-connected `_PeerLink` (i.e. every entry in
       `self._peer_links`, connected or not — a link's own
       `force_resync` no-ops if the link isn't started), triggers a
@@ -95,7 +98,7 @@ entries this ticket implements.
       uses (so a `force_resync()` racing an in-flight drop-triggered
       `resync()` for the same link is a safe no-op, not a double
       fetch).
-- [ ] `cli.assemble_daemon_and_api` gains `poll_callback`/
+- [x] `cli.assemble_daemon_and_api` gains `poll_callback`/
       `peer_resync_callback` parameters forwarded to whichever API
       server it constructs; `cli.assemble_registry` passes
       `poll_callback=daemon.run_once` and
@@ -103,7 +106,7 @@ entries this ticket implements.
       peer_discovery is not None else None` through to it (so
       `--no-peering` leaves `peer_resync_callback` `None`, a pre-existing
       safe default, not a new failure mode).
-- [ ] `daemon.py`'s `run_once` attach/detach diff is confirmed (by a
+- [x] `daemon.py`'s `run_once` attach/detach diff is confirmed (by a
       new regression test, not just by reading the code) to be
       unaffected by a row `rescan` deletes out from under it: purging
       a row that is either locally-`disconnected` or not
@@ -169,3 +172,51 @@ Add the two dispatch lines (`api.py`'s and `api_windows.py`'s own
   tests/registry/api_windows/ tests/registry/peering/
   tests/registry/daemon/ tests/registry/cli/`.
 - **Verification command**: same as above.
+
+## Implementation Notes
+
+- `_op_rescan` (`src/mbtools/registry/_api_base.py`) holds `self._lock`
+  for candidate computation + lock-filtering + `Store.purge()` only;
+  event publish and the two trigger callbacks fire after releasing it,
+  mirroring `_op_names_set`'s "the shared lock only guards the short
+  bookkeeping" precedent. A device's `host` for its `device_removed`
+  event is captured via `self._store.get(uid)` *before* `purge()`
+  deletes the row (nothing to look up afterward). Two new module-level
+  constants, `EVENT_DEVICE_REMOVED`/`EVENT_PEER_REMOVED`, keep these
+  event-type strings out of `registry.peering`'s own `EVENT_*`
+  constants (deliberately distinct namespaces — these two never cross
+  `PeerDiscovery`'s PUB socket).
+- `_PeerLink.force_resync()` mirrors `start_resync()`'s thread-spawning
+  shape but is unconditional (no `_link_dropped` precondition) and
+  never touches `_link_dropped`/`on_reachable` bookkeeping itself
+  (`_fetch_snapshot()` already calls `on_reachable` on success, same as
+  every other path). Guarded by the same non-blocking `_resync_guard`
+  acquire `resync()` uses, so the two can never double-fetch for the
+  same link.
+- `cli.assemble_registry`'s `poll_callback` is necessarily a closure
+  (`def _poll_callback(): daemon.run_once()`), not a direct
+  `daemon.run_once` reference — `daemon` doesn't exist yet at the
+  point `assemble_daemon_and_api` is called (that call is what
+  constructs it and hands it back), so ordinary Python closure
+  late-binding is used instead: the closure is defined before `daemon`
+  is assigned, but by the time it's ever actually invoked (a real
+  `rescan` request, after `assemble_registry` has returned) `daemon`
+  is long since bound in the enclosing scope. `peer_resync_callback`
+  has no such ordering problem since `peer_discovery` is already
+  constructed earlier in `assemble_registry`'s own body, so it's
+  passed directly as a bound method.
+- Regression test added in `tests/registry/daemon/test_daemon.py`
+  (`test_rescan_purged_rows_never_desync_previously_attached`) per the
+  last acceptance criterion — confirms with a real `Store.purge()`
+  call between two `Daemon.run_once()` cycles that a purged row (local
+  disconnected or peer-owned) is never a member of
+  `previously_attached`; no `daemon.py` code change was needed.
+- Full scoped test run (macOS/braeburn-class host): `uv run pytest
+  tests/registry/api/ tests/registry/api_windows/ tests/registry/peering/
+  tests/registry/daemon/ tests/registry/cli/ tests/registry/remote_api/
+  tests/registry/store/` — 559 passed, 1 skipped (the pre-existing
+  Linux-only `SO_PEERCRED` test, skipped on macOS as designed), 2
+  deselected (`test_cli_spawn.py::test_ready_json_line_reaches_a_real_pipe_promptly`
+  and `test_peering.py::test_real_zeroconf_loopback_two_registries_discover_each_other`,
+  both pre-existing local-machine failures unrelated to this ticket —
+  UDP 5353 held by Chrome on this dev Mac).

@@ -112,7 +112,15 @@ def _dispatch(srv, req, *, pid=PID_A, acquired_uids=None):
 
 @pytest.fixture
 def make_server(store, locks):
-    def _make(*, peer_pid_fn=None, is_pid_alive_fn=None, win32=None, pipe_name=None):
+    def _make(
+        *,
+        peer_pid_fn=None,
+        is_pid_alive_fn=None,
+        win32=None,
+        pipe_name=None,
+        poll_callback=None,
+        peer_resync_callback=None,
+    ):
         return api_windows.WindowsPipeAPIServer(
             pipe_name=pipe_name,
             store=store,
@@ -120,6 +128,8 @@ def make_server(store, locks):
             peer_pid_fn=peer_pid_fn,
             is_pid_alive_fn=is_pid_alive_fn,
             win32=win32 if win32 is not None else _NullWin32(),
+            poll_callback=poll_callback,
+            peer_resync_callback=peer_resync_callback,
         )
 
     return _make
@@ -374,6 +384,99 @@ def test_names_registry_ops_round_trip(make_server):
 
     clear_resp, _ = _dispatch(srv, {"op": "names_clear", "name": "tovez"})
     assert clear_resp["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# rescan (sprint 010, ticket 002)
+# ---------------------------------------------------------------------------
+
+
+def test_rescan_removes_gone_local_device_over_the_named_pipe(make_server, store):
+    store.mark_disconnected(UID2)
+    srv = make_server()
+
+    resp, _ = _dispatch(srv, {"op": "rescan"})
+
+    assert resp["ok"] is True
+    assert resp["removed"]["devices"] == [UID2]
+    assert store.get(UID2) is None
+
+
+def test_rescan_dry_run_does_not_mutate(make_server, store):
+    store.mark_disconnected(UID2)
+    srv = make_server()
+
+    resp, _ = _dispatch(srv, {"op": "rescan", "dry_run": True})
+
+    assert resp["ok"] is True
+    assert resp["dry_run"] is True
+    assert resp["removed"]["devices"] == [UID2]
+    assert store.get(UID2) is not None
+
+
+def test_rescan_skips_locked_uid(make_server, store, locks):
+    store.mark_disconnected(UID2)
+    locks.acquire(UID2, KIND_SERIAL, _local_holder(PID_A))
+    srv = make_server()
+
+    resp, _ = _dispatch(srv, {"op": "rescan"})
+
+    assert resp["ok"] is True
+    assert resp["removed"]["devices"] == []
+    assert resp["skipped_locked"] == [UID2]
+    assert store.get(UID2) is not None
+
+
+def test_rescan_does_not_raise_when_windows_pipe_server_has_no_eventbus(make_server, store):
+    """Codebase-alignment finding from sprint.md's architecture review:
+    `WindowsPipeAPIServer` never sets `self._eventbus` (eventbus support
+    was deliberately scoped out of the Windows pipe transport). `_op_rescan`
+    is shared code (`_api_base.BaseAPIServer`) that also runs for
+    `api.RegistryAPIServer`, which *does* have one -- this asserts the
+    Windows transport's own real absence of the attribute doesn't crash
+    a real (non-dry-run, event-producing) rescan.
+    """
+    assert not hasattr(api_windows.WindowsPipeAPIServer, "_eventbus")
+    store.mark_disconnected(UID2)
+    srv = make_server()
+    assert not hasattr(srv, "_eventbus")
+
+    resp, _ = _dispatch(srv, {"op": "rescan"})
+
+    assert resp["ok"] is True
+    assert resp["removed"]["devices"] == [UID2]
+
+
+def test_rescan_calls_poll_and_peer_resync_callbacks_once(make_server, store):
+    store.mark_disconnected(UID2)
+    poll_calls = []
+    resync_calls = []
+    srv = make_server(
+        poll_callback=lambda: poll_calls.append(1),
+        peer_resync_callback=lambda: resync_calls.append(1),
+    )
+
+    resp, _ = _dispatch(srv, {"op": "rescan"})
+
+    assert resp["ok"] is True
+    assert len(poll_calls) == 1
+    assert len(resync_calls) == 1
+
+
+def test_rescan_dry_run_never_calls_poll_or_peer_resync_callbacks(make_server, store):
+    store.mark_disconnected(UID2)
+    poll_calls = []
+    resync_calls = []
+    srv = make_server(
+        poll_callback=lambda: poll_calls.append(1),
+        peer_resync_callback=lambda: resync_calls.append(1),
+    )
+
+    resp, _ = _dispatch(srv, {"op": "rescan", "dry_run": True})
+
+    assert resp["ok"] is True
+    assert poll_calls == []
+    assert resync_calls == []
 
 
 def test_holder_for_connection_uses_injected_peer_pid_fn_not_a_client_value(make_server):
