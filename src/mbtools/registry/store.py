@@ -51,6 +51,28 @@ up). :meth:`Store.find` gains an optional ``name@host`` suffix and a new
 :class:`AmbiguousNameError` for a bare name that collides across hosts,
 per the stakeholder's explicit ``name@host`` disambiguation requirement
 (SUC-002).
+
+**Sprint 010 addition — ``rescan``'s purge primitives, the one explicit
+exception to "never delete."** :meth:`Store.candidates_for_purge` and
+:meth:`Store.purge` are the *only* place in this module -- and, by
+extension, the only place in the codebase, since no other module reaches
+into the SQLite file directly -- allowed to ``DELETE`` a ``device`` or
+``peer`` row. Every write method above this paragraph, and every one
+added after it that isn't one of these two, still follows the
+never-delete precedent unchanged: a vanished device goes to
+:data:`STATE_DISCONNECTED`, a vanished peer's ``reachable`` goes false,
+and both rows stay forever unless an operator explicitly runs
+``mbregistry rescan``. ``rescan`` exists precisely because that
+precedent, while correct for every automatic path, leaves a
+long-running daemon's ``gone``/``peer unreachable`` rows to accumulate
+without bound; these two methods are the bounded, operator-invoked,
+race-safe way to clear exactly the rows that are demonstrably stale and
+nothing else (see each method's own docstring, and sprint 010's sprint.md
+Architecture, for the precise criteria). ``store`` still does not know
+about locks -- deciding which candidate uids are currently locked and
+must be skipped is one layer up, the caller's job (sprint 010 ticket
+002), using :meth:`Store.purge`'s own "only delete a uid I tell you to"
+contract to exclude them before calling it.
 """
 
 from __future__ import annotations
@@ -59,6 +81,7 @@ import logging
 import sqlite3
 import threading
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable
@@ -74,6 +97,8 @@ __all__ = [
     "DeviceRecord",
     "Entry",
     "PeerRecord",
+    "PurgeCandidates",
+    "PurgeResult",
     "Store",
     "STATE_ATTACHED_NO_ANNOUNCE",
     "STATE_ATTACHED_UNPROBED",
@@ -323,7 +348,12 @@ class PeerRecord:
     listener. ``reachable`` is ``False`` for a peer whose live link has
     dropped (Decision 5: marked unreachable, never deleted -- a
     reconnect's next :meth:`Store.record_peer_seen` naturally supersedes
-    the stale flag).
+    the stale flag). Sprint 010: an operator-invoked ``mbregistry rescan``
+    is the one explicit exception to Decision 5 -- :meth:`Store.purge`
+    may delete an unreachable peer's row outright (and the device rows it
+    owns), but only that one deliberate, narrow codepath; every other
+    write in this module still follows Decision 5's never-delete rule
+    unchanged.
     """
 
     host: str
@@ -339,6 +369,69 @@ def _row_to_peer_record(row: sqlite3.Row) -> PeerRecord:
         last_seen=row["last_seen"],
         reachable=bool(row["reachable"]),
     )
+
+
+@dataclass(frozen=True)
+class PurgeCandidates:
+    """The rows :meth:`Store.purge` would remove right now -- a read-only
+    snapshot computed by :meth:`Store.candidates_for_purge`, per sprint
+    010's ``rescan`` command (see module docstring's "one explicit
+    exception" paragraph).
+
+    Grouped by *why* a row is stale, not flattened, so a caller can both
+    act on it (:attr:`device_uids`/:attr:`unreachable_peers` feed
+    straight into :meth:`Store.purge`) and render it directly for
+    ``rescan --dry-run``, which needs to say *which* reason applied to
+    each row:
+
+    - ``local_disconnected``: this host's own device rows
+      (``host IS NULL``) in :data:`STATE_DISCONNECTED` -- "gone" boards.
+    - ``unreachable_peer_owned``: every device row owned by a peer whose
+      own ``peer.reachable`` is currently false, *regardless of that
+      device row's own ``state``* -- an unreachable peer's whole view is
+      stale, not just its disconnected rows.
+    - ``reachable_peer_stale_disconnected``: a *reachable* peer's device
+      rows that are nonetheless in :data:`STATE_DISCONNECTED` -- stale
+      since sprint 005 ticket 011, which stopped a reachable peer from
+      ever advertising a disconnected row in its snapshot, so a row like
+      this can only be a leftover from before that fix (or from the peer
+      briefly going unreachable and back without this host noticing in
+      between).
+    - ``unreachable_peers``: the ``peer.host`` values themselves whose
+      ``reachable`` is false -- the peer-row half of the same purge.
+
+    The three device tuples are disjoint (a given uid can only match one
+    reason at a time, since a device's ``host`` is either ``NULL``, an
+    unreachable peer, or a reachable peer -- never more than one).
+    """
+
+    local_disconnected: tuple[str, ...]
+    unreachable_peer_owned: tuple[str, ...]
+    reachable_peer_stale_disconnected: tuple[str, ...]
+    unreachable_peers: tuple[str, ...]
+
+    @property
+    def device_uids(self) -> tuple[str, ...]:
+        """Every candidate device uid, all three reasons combined -- the
+        flat shape :meth:`Store.purge` itself takes."""
+        return (
+            self.local_disconnected
+            + self.unreachable_peer_owned
+            + self.reachable_peer_stale_disconnected
+        )
+
+
+@dataclass(frozen=True)
+class PurgeResult:
+    """What :meth:`Store.purge` actually deleted -- distinct from what it
+    was asked to delete, since a uid that reattached (or a peer that
+    reconnected) between :meth:`Store.candidates_for_purge` and
+    :meth:`Store.purge` is left untouched rather than deleted, per
+    sprint 010's mid-reattach race handling.
+    """
+
+    removed_device_uids: tuple[str, ...]
+    removed_peer_hosts: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -401,7 +494,10 @@ class AmbiguousNameError(Exception):
 
 class Store:
     """The persistent device database -- one record per device, keyed by
-    ``uid``, never deleted.
+    ``uid``, never deleted -- except by :meth:`candidates_for_purge`/
+    :meth:`purge` (sprint 010), the one explicit, operator-invoked
+    exception to that rule; see the module docstring's "Sprint 010
+    addition" paragraph. No other method on this class deletes a row.
 
     ``db_path`` defaults to :data:`DEFAULT_DB_PATH`; every test overrides it
     to a ``tmp_path`` file. Parent directories are created if missing (mirrors
@@ -1076,6 +1172,133 @@ class Store:
                 "SELECT * FROM peer WHERE host = ?", (host,)
             ).fetchone()
             return _row_to_peer_record(row) if row is not None else None
+
+    # -- purge (sprint 010, ``mbregistry rescan``) --------------------------
+    #
+    # The one explicit exception to this module's "never delete, always
+    # update in place" precedent -- see the module docstring's "Sprint 010
+    # addition" paragraph. ``candidates_for_purge`` is a pure read (used
+    # directly for ``rescan --dry-run``); ``purge`` is the actual delete,
+    # race-safe against a uid reattaching or a peer reconnecting between the
+    # two calls. Neither method knows about locks -- skipping a locked
+    # candidate is the caller's job (sprint 010 ticket 002), done by simply
+    # not including that uid in the ``device_uids`` passed to ``purge``.
+
+    def candidates_for_purge(self) -> PurgeCandidates:
+        """Every device/peer row a non-dry-run :meth:`purge` would delete
+        right now, grouped by reason. Read-only -- mutates nothing.
+
+        See :class:`PurgeCandidates` for what each group means. The three
+        device ``SELECT``s mirror the three sprint.md-specified candidate
+        rules exactly:
+
+        - locally-owned (``host IS NULL``) and :data:`STATE_DISCONNECTED`;
+        - owned by a peer whose own ``peer.reachable`` is currently false,
+          regardless of the device row's own ``state``;
+        - owned by a *reachable* peer but still :data:`STATE_DISCONNECTED`
+          (stale since sprint 005 ticket 011).
+
+        A fourth ``SELECT`` gets the unreachable ``peer`` rows themselves.
+        """
+        with self._lock:
+            local_disconnected = tuple(
+                row["uid"]
+                for row in self._conn.execute(
+                    "SELECT uid FROM device WHERE host IS NULL AND state = ?",
+                    (STATE_DISCONNECTED,),
+                )
+            )
+            unreachable_peer_owned = tuple(
+                row["uid"]
+                for row in self._conn.execute(
+                    "SELECT uid FROM device WHERE host IS NOT NULL "
+                    "AND host IN (SELECT host FROM peer WHERE reachable = 0)"
+                )
+            )
+            reachable_peer_stale_disconnected = tuple(
+                row["uid"]
+                for row in self._conn.execute(
+                    "SELECT uid FROM device WHERE host IS NOT NULL AND state = ? "
+                    "AND host IN (SELECT host FROM peer WHERE reachable = 1)",
+                    (STATE_DISCONNECTED,),
+                )
+            )
+            unreachable_peers = tuple(
+                row["host"]
+                for row in self._conn.execute("SELECT host FROM peer WHERE reachable = 0")
+            )
+            return PurgeCandidates(
+                local_disconnected=local_disconnected,
+                unreachable_peer_owned=unreachable_peer_owned,
+                reachable_peer_stale_disconnected=reachable_peer_stale_disconnected,
+                unreachable_peers=unreachable_peers,
+            )
+
+    def purge(
+        self, device_uids: Iterable[str], peer_hosts: Iterable[str]
+    ) -> PurgeResult:
+        """Delete exactly the given device uids and peer hosts -- the only
+        method on this class (with :meth:`candidates_for_purge`, which
+        never deletes) allowed to ``DELETE`` a row.
+
+        Each uid/host is deleted under its own conditional ``DELETE``,
+        re-checked against the *current* table contents rather than
+        trusting the caller's collections to still be accurate -- a uid
+        that reattached (its ``state`` moved off :data:`STATE_DISCONNECTED`)
+        or a peer that reconnected (``reachable`` back to true) between an
+        earlier :meth:`candidates_for_purge` call and this one is left
+        untouched, not deleted; :attr:`PurgeResult.removed_device_uids`/
+        :attr:`PurgeResult.removed_peer_hosts` report what was *actually*
+        removed, which may be a subset of what was asked for.
+
+        A device row currently qualifies for deletion if its ``state`` is
+        :data:`STATE_DISCONNECTED` (covers both the local-disconnected and
+        reachable-peer-stale-disconnected candidate groups, whatever
+        ``host`` value it has) or its ``host`` is currently one of the
+        *unreachable* peers (covers the unreachable-peer-owned group,
+        whatever ``state`` it's currently in) -- the same criteria
+        :meth:`candidates_for_purge` computes, recomputed live inside the
+        one ``DELETE`` statement per uid so the unreachable-host join can
+        never be stale by the time it runs. A peer row currently qualifies
+        if it is still ``reachable = 0``. Deleting a peer row never
+        cascades onto its device rows (no foreign key; SQLite does no
+        cascading here) -- the two argument collections are independent,
+        and device rows are deleted first, before any peer row, so an
+        unreachable peer's own row still exists (and its devices still
+        match the ``host IN (...)`` join) while its devices are being
+        deleted.
+
+        A uid or host not present in the store at all is a no-op, not an
+        error -- ``DELETE`` on an absent key is already a no-op, mirroring
+        :meth:`clear`'s existing convention.
+
+        Never reads or writes ``name_registry``.
+        """
+        with self._lock:
+            removed_devices: list[str] = []
+            for uid in device_uids:
+                cursor = self._conn.execute(
+                    "DELETE FROM device WHERE uid = ? AND ("
+                    "state = ? OR host IN (SELECT host FROM peer WHERE reachable = 0)"
+                    ")",
+                    (uid, STATE_DISCONNECTED),
+                )
+                if cursor.rowcount > 0:
+                    removed_devices.append(uid)
+
+            removed_peers: list[str] = []
+            for host in peer_hosts:
+                cursor = self._conn.execute(
+                    "DELETE FROM peer WHERE host = ? AND reachable = 0", (host,)
+                )
+                if cursor.rowcount > 0:
+                    removed_peers.append(host)
+
+            self._conn.commit()
+            return PurgeResult(
+                removed_device_uids=tuple(removed_devices),
+                removed_peer_hosts=tuple(removed_peers),
+            )
 
     # -- name registry (sprint 004, ticket 001) ----------------------------
     #

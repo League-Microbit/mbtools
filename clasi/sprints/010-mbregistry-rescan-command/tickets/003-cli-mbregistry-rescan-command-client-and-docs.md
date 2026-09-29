@@ -1,0 +1,107 @@
+---
+id: '003'
+title: 'CLI: mbregistry rescan command, client, and docs'
+status: open
+use-cases: [SUC-001, SUC-002]
+depends-on: ['002']
+github-issue: ''
+issue: mbregistry-rescan-command.md
+completes_issue: true
+---
+<!-- CLASI: Before changing code or making plans, review the SE process in CLAUDE.md -->
+
+# CLI: mbregistry rescan command, client, and docs
+
+## Description
+
+Surface ticket 002's `rescan` op as `mbregistry rescan [--dry-run]
+[--json]`: a typed `RegistryClient.rescan()` method, the CLI
+subcommand (summary line(s) followed by a fresh `list` table), and the
+documentation updates (`docs/design/registry-api.md`, CLI
+`--help`/README) sprint.md's scope calls for.
+
+Follows `cmd_unlock`/`RegistryClient.force_unlock`'s existing
+local-socket-only CLI pattern (find the local api address, connect,
+call, handle `RegistryUnavailable`/`RegistryClientError` the same
+way) — no new error-handling convention.
+
+## Acceptance Criteria
+
+- [ ] `RegistryClient.rescan(dry_run=False)` sends `{"op": "rescan",
+      "dry_run": dry_run}` and returns the parsed response (removed
+      devices/peers, skipped-locked list, `dry_run` echo) — same
+      typed-method shape as `list`/`force_unlock`.
+- [ ] `mbregistry rescan` (no flags): connects, calls `rescan()`,
+      prints a short human summary matching the issue's own example
+      wording ("removed 3 gone devices, 1 unreachable peer (braeburn)
+      and its 2 devices; skipped 1 locked"), then calls `list()` and
+      prints the fresh table via the existing `render_table` — two
+      client calls composed in the CLI layer, not a combined server
+      response.
+- [ ] `mbregistry rescan --dry-run`: prints what *would* be
+      removed/skipped, does **not** print a fresh list table
+      (nothing changed, so the existing `list` output would be
+      identical noise) — the summary line makes clear this was a
+      preview (e.g. "would remove ..." vs "removed ...").
+- [ ] `mbregistry rescan --json` / `--dry-run --json`: prints the
+      server's structured response (removed/skipped/dry_run) as JSON,
+      no human sentence; when not `--dry-run`, includes the fresh
+      device list in the same JSON payload (one JSON object out, not
+      two separate JSON blobs on stdout) — add a small `render.py`
+      helper alongside `render_json`/`render_table` for this combined
+      shape rather than hand-rolling `json.dumps` in `cli.py`.
+- [ ] `mbregistry rescan --socket <path>` (and `$MBREGISTRY_SOCKET`)
+      resolves the local API address exactly like every other
+      subcommand — reuses `find_local_api_address`, no new resolution
+      logic.
+- [ ] Connection failure (`RegistryUnavailable`) prints the same
+      "is the daemon running?" guidance and `EXIT_NO_DAEMON` every
+      other subcommand already gives; a `RegistryClientError` (e.g.
+      the remote-plane rejection, exercised only if someone points
+      `--socket` at something that isn't this daemon — not expected in
+      normal use) prints `exc.message`/`exc.exit_code`.
+- [ ] `docs/design/registry-api.md` gains a `### rescan` section
+      (request/response shape, "local Unix socket / Windows pipe
+      only — never on the remote TCP control plane" callout, modeled
+      on the existing `force_unlock` section) and a line in the ops
+      table near the top.
+- [ ] CLI `--help` (the `rescan` subparser's own `help=`/description)
+      and any README/command-reference listing of `mbregistry`
+      subcommands documents the new command, its flags, and its
+      local-only scope.
+
+## Implementation Plan
+
+**Approach**: Add `rescan` to `client.py` next to `force_unlock`
+(same `_request`/typed-return pattern). Add `cmd_rescan` to `cli.py`
+next to `cmd_unlock`, and its `argparse` subparser next to
+`unlock_p`'s own registration — `--dry-run` (`store_true`) and
+`--json` (`store_true`, matching `list`'s own flag), plus the shared
+`--socket`. Add the render helper for the combined
+summary+list JSON shape to `render.py`.
+
+**Files to modify**:
+- `src/mbtools/registry/client.py` — `RegistryClient.rescan`.
+- `src/mbtools/registry/cli.py` — `cmd_rescan`, its subparser.
+- `src/mbtools/registry/render.py` — summary formatting (text +
+  JSON), reusing `render_table`/`render_json` for the list half.
+- `docs/design/registry-api.md` — new `### rescan` section + ops
+  table row.
+- Any CLI command-reference doc/README listing subcommands (check
+  `docs/design/` and top-level `README.md` for an existing
+  `mbregistry` command list to extend).
+
+**Testing plan**:
+- `tests/registry/client/`: `rescan(dry_run=...)` sends the right
+  request shape and parses the response.
+- `tests/registry/cli/`: `cmd_rescan` output for all four
+  combinations (`rescan`, `--dry-run`, `--json`,
+  `--dry-run --json`) against a fake/stub client, matching the
+  acceptance criteria above (dry-run never prints a fresh table;
+  `--json` is one combined object, not two blobs); `RegistryUnavailable`
+  prints the standard daemon-not-running guidance and
+  `EXIT_NO_DAEMON`.
+- **Existing tests to run**: `uv run pytest tests/registry/client/
+  tests/registry/cli/`.
+- **Verification command**: `uv run pytest tests/registry/client/
+  tests/registry/cli/`.
