@@ -528,6 +528,30 @@ class RegistryClient:
             return None
         return {"kind": resp["kind"], "holder": resp["holder"]}
 
+    def rescan(self, dry_run: bool = False) -> dict[str, Any]:
+        """Purge this host's demonstrably-stale device/peer rows -- gone
+        local devices, every row owned by a currently-unreachable peer,
+        and a reachable peer's stale ``disconnected`` mirror -- then (unless
+        ``dry_run``) force an immediate USB poll and peer resync so anything
+        actually still alive reappears right away (sprint 010, ticket 002's
+        ``rescan`` op; local Unix socket / Windows pipe only -- there is no
+        remote-TCP-port equivalent, same trust boundary
+        :meth:`force_unlock` already established).
+
+        Returns the server's response, minus the wire-only ``"ok"`` key --
+        ``{"removed": {"devices": [uid, ...], "peers": [host, ...]},
+        "skipped_locked": [uid, ...], "dry_run": bool}``. ``removed`` is
+        what was actually deleted (or, under ``dry_run``, what *would* be);
+        ``skipped_locked`` is every candidate uid excluded because it is
+        currently locked -- never deleted, regardless of ``dry_run``.
+        """
+        resp = self._request({"op": "rescan", "dry_run": dry_run})
+        return {
+            "removed": dict(resp["removed"]),
+            "skipped_locked": list(resp.get("skipped_locked", [])),
+            "dry_run": bool(resp.get("dry_run", dry_run)),
+        }
+
     # -- name-registry ops (sprint 004, ticket 005) -----------------------
     #
     # Not device ops -- no uid, no lock -- see ``registry._api_base``'s

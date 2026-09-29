@@ -104,7 +104,12 @@ from mbtools.registry.peering import (
 )
 from mbtools.registry.remote_api import DEFAULT_REMOTE_PORT, RemoteAPIServer
 from mbtools.registry.paths import LINUX_SYSTEM_UNIT_PATH, LINUX_UDEV_RULE_PATH
-from mbtools.registry.render import render_json, render_table
+from mbtools.registry.render import (
+    render_json,
+    render_rescan_json,
+    render_rescan_summary,
+    render_table,
+)
 from mbtools.registry.service import (
     DryRunCommandRunner,
     LinuxUserPreflightError,
@@ -133,6 +138,7 @@ __all__ = [
     "build_parser",
     "cmd_list",
     "cmd_unlock",
+    "cmd_rescan",
     "cmd_run",
     "cmd_install_service",
     "cmd_service_install",
@@ -444,6 +450,65 @@ def cmd_unlock(args: argparse.Namespace) -> int:
     holder = released["holder"]
     suffix = format_lock_suffix(holder.get("label"), holder.get("since"), now=time.time())
     print(f"mbregistry: {args.uid}: released {released['kind']} lock{suffix}")
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# rescan -- local-socket-only, drop cruft (gone devices, unreachable peers)
+# ---------------------------------------------------------------------------
+
+
+def cmd_rescan(args: argparse.Namespace) -> int:
+    """``mbregistry rescan [--dry-run] [--json]`` (sprint 010, ticket 003):
+    connect to the local api and call the ``rescan`` op (ticket 002) --
+    purges gone local device rows, every row owned by a currently-
+    unreachable peer, and a reachable peer's stale ``disconnected``
+    mirror, then (unless ``--dry-run``) forces an immediate USB poll and
+    asks every reachable peer to resync. Same local-socket-only,
+    ``find_local_api_address``/``RegistryUnavailable``/
+    ``RegistryClientError`` handling as :func:`cmd_unlock` -- no new
+    error-handling convention (this ticket's own Description).
+
+    Composed as two client calls, not a combined server response: a
+    non-``--dry-run`` call fetches a fresh ``list()`` afterward so the
+    printed table (and, under ``--json``, the JSON payload's own
+    ``"devices"`` key) reflects what rescan actually just changed.
+    ``--dry-run`` never calls ``list()`` -- nothing changed, so the
+    existing table would be identical noise (SUC-002's own acceptance
+    criterion); the summary line alone (``"would remove ..."`` rather than
+    ``"removed ..."``) makes clear this was a preview.
+
+    ``--json``/``--dry-run --json`` print one combined JSON object (the
+    server's ``removed``/``skipped_locked``/``dry_run`` fields, plus the
+    fresh device list when not ``--dry-run``) via
+    :func:`~mbtools.registry.render.render_rescan_json` -- never the human
+    summary sentence and never two separate JSON blobs on stdout.
+    """
+    socket_path = find_local_api_address(args.socket, _SOCKET_ENV_VAR)
+
+    try:
+        with RegistryClient(socket_path) as client:
+            resp = client.rescan(dry_run=args.dry_run)
+            devices = None if args.dry_run else client.list()
+    except RegistryUnavailable as exc:
+        print(f"mbregistry: {exc}", file=sys.stderr)
+        print(
+            "mbregistry: is the daemon running? start it with 'mbregistry run'",
+            file=sys.stderr,
+        )
+        return EXIT_NO_DAEMON
+    except RegistryClientError as exc:
+        print(f"mbregistry: {exc.message}", file=sys.stderr)
+        return exc.exit_code
+
+    if args.json:
+        print(json.dumps(render_rescan_json(resp, devices), indent=2))
+        return EXIT_OK
+
+    print(render_rescan_summary(resp))
+    if devices is not None:
+        print()
+        print(render_table(devices))
     return EXIT_OK
 
 
@@ -1751,6 +1816,27 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"api socket path (default {DEFAULT_SOCKET_PATH}, or ${_SOCKET_ENV_VAR})",
     )
     unlock_p.set_defaults(func=cmd_unlock)
+
+    rescan_p = sub.add_parser(
+        "rescan",
+        help=(
+            "drop gone devices and unreachable peers, then force an "
+            "immediate rescan (local socket only)"
+        ),
+    )
+    rescan_p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="show what would be removed/skipped without removing anything",
+    )
+    rescan_p.add_argument(
+        "--json", action="store_true", help="emit machine-readable JSON"
+    )
+    rescan_p.add_argument(
+        "--socket",
+        help=f"api socket path (default {DEFAULT_SOCKET_PATH}, or ${_SOCKET_ENV_VAR})",
+    )
+    rescan_p.set_defaults(func=cmd_rescan)
 
     #: `service run`'s flags live on a shared parent parser so the hidden,
     #: deprecated top-level `run` alias (below) accepts exactly the same

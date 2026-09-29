@@ -39,7 +39,7 @@ from mbtools.registry.client import (
 )
 from mbtools.registry.flash import FlashOp
 from mbtools.registry.identity import ProbeResult
-from mbtools.registry.locks import KIND_FLASH, KIND_SERIAL, LockManager
+from mbtools.registry.locks import KIND_FLASH, KIND_SERIAL, HolderRef, LockManager
 from mbtools.registry.store import Store
 
 VID_PID = "0d28:0204"
@@ -257,6 +257,56 @@ def test_mark_flashed_unknown_uid_raises_device_not_found(server):
     with RegistryClient(server.socket_path) as client:
         with pytest.raises(DeviceNotFoundError):
             client.mark_flashed("does-not-exist")
+
+
+# ---------------------------------------------------------------------------
+# rescan (sprint 010, ticket 003)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.requires_af_unix
+def test_rescan_sends_dry_run_and_parses_the_response(server, store):
+    store.mark_disconnected(UID2)
+
+    with RegistryClient(server.socket_path) as client:
+        resp = client.rescan(dry_run=True)
+
+    assert resp == {
+        "removed": {"devices": [UID2], "peers": []},
+        "skipped_locked": [],
+        "dry_run": True,
+    }
+    # Nothing actually removed -- a dry run.
+    assert store.get(UID2) is not None
+
+
+@pytest.mark.requires_af_unix
+def test_rescan_defaults_to_a_real_non_dry_run_purge(server, store):
+    store.mark_disconnected(UID2)
+
+    with RegistryClient(server.socket_path) as client:
+        resp = client.rescan()
+
+    assert resp["dry_run"] is False
+    assert resp["removed"]["devices"] == [UID2]
+    assert store.get(UID2) is None
+
+
+@pytest.mark.requires_af_unix
+def test_rescan_reports_skipped_locked_uids(server, store, locks):
+    # Locked via the shared LockManager directly (not client.lock(), which
+    # requires the device be attached -- a "gone" row can't be locked that
+    # way, but a lock acquired before the row went stale can still be held
+    # against it).
+    store.mark_disconnected(UID2)
+    locks.acquire(UID2, KIND_SERIAL, HolderRef(origin="local", ref="4821", pid=4821))
+
+    with RegistryClient(server.socket_path) as client:
+        resp = client.rescan()
+
+    assert resp["removed"]["devices"] == []
+    assert resp["skipped_locked"] == [UID2]
+    assert store.get(UID2) is not None
 
 
 # ---------------------------------------------------------------------------
