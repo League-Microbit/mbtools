@@ -1,7 +1,7 @@
 ---
 id: '010'
 title: mbregistry rescan command
-status: executing
+status: done
 branch: sprint/010-mbregistry-rescan-command
 use-cases: []
 issues:
