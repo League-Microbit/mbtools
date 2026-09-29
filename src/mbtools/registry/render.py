@@ -23,6 +23,7 @@ import re
 import time
 from typing import Any
 
+from mbtools.registry.identity import short_uid
 from mbtools.registry.store import (
     STATE_ATTACHED_NO_ANNOUNCE,
     STATE_ATTACHED_UNPROBED,
@@ -35,6 +36,8 @@ __all__ = [
     "TABLE_HEADERS",
     "render_table",
     "render_json",
+    "render_rescan_summary",
+    "render_rescan_json",
 ]
 
 #: Column order for :func:`render_table` -- UC-004's STATE/NAME/UID/
@@ -315,3 +318,100 @@ def render_json(
     per-device detail as a structured field" requirement.
     """
     return {"devices": _sort_devices(devices, sort_by)}
+
+
+# ---------------------------------------------------------------------------
+# rescan -- sprint 010, ticket 003
+# ---------------------------------------------------------------------------
+
+
+def _short_uid_display(uid: str) -> str:
+    """The same ``short_uid`` slice :func:`render_table`'s own UID column
+    shows for this uid (``mbtools.registry.identity.short_uid`` -- the
+    DAPLink UID's actually-distinguishing middle field, computed
+    server-side into every device dict's ``short_uid`` key). A rescan
+    response only ever carries bare uid strings (``client.RegistryClient
+    .rescan``'s ``removed.devices``/``skipped_locked``), never a device
+    dict with that field already folded in, so this recomputes it
+    directly -- the pure function is cheap and deterministic, and doing
+    so is what keeps a uid named in the summary line recognizable as the
+    same row a caller sees in the table below (or in an earlier ``list``),
+    rather than a second, differently-truncated identifier for the same
+    device.
+    """
+    return short_uid(uid)
+
+
+def render_rescan_summary(resp: dict[str, Any]) -> str:
+    """The short, one-line-per-category operator summary
+    :func:`mbtools.registry.cli.cmd_rescan` prints ahead of the fresh
+    ``list`` table -- one line for devices removed, one for peers removed,
+    one for locked candidates skipped, each only when that category is
+    non-empty; ``"nothing to remove"`` alone when all three are empty.
+
+    ``resp`` is :meth:`~mbtools.registry.client.RegistryClient.rescan`'s
+    own return shape. ``resp["dry_run"]`` switches every verb from past
+    tense ("removed"/"skipped") to conditional ("would remove"/"would
+    skip") -- SUC-002's own "the summary line makes clear this was a
+    preview" acceptance criterion -- without changing which categories are
+    reported or how they're counted.
+
+    This function only renders the summary text; it never prints anything
+    itself and never calls ``list()`` -- see :func:`render_rescan_json` and
+    ``cmd_rescan`` for how the fresh device list (non-``dry_run`` only) is
+    composed alongside it.
+    """
+    dry_run = bool(resp.get("dry_run", False))
+    remove_verb = "would remove" if dry_run else "removed"
+    skip_verb = "would skip" if dry_run else "skipped"
+
+    devices = resp["removed"]["devices"]
+    peers = resp["removed"]["peers"]
+    skipped = resp["skipped_locked"]
+
+    lines = []
+    if devices:
+        lines.append(
+            f"{remove_verb} {len(devices)} device"
+            f"{'s' if len(devices) != 1 else ''}: "
+            + ", ".join(_short_uid_display(uid) for uid in devices)
+        )
+    if peers:
+        lines.append(
+            f"{remove_verb} {len(peers)} unreachable peer"
+            f"{'s' if len(peers) != 1 else ''}: " + ", ".join(peers)
+        )
+    if skipped:
+        lines.append(
+            f"{skip_verb} {len(skipped)} locked: "
+            + ", ".join(_short_uid_display(uid) for uid in skipped)
+        )
+    if not lines:
+        return "nothing to remove"
+    return "\n".join(lines)
+
+
+def render_rescan_json(
+    resp: dict[str, Any],
+    devices: list[dict[str, Any]] | None = None,
+    *,
+    sort_by: str | None = None,
+) -> dict[str, Any]:
+    """The combined ``mbregistry rescan --json`` payload -- one JSON object,
+    not two blobs on stdout (this ticket's own acceptance criterion): the
+    server's own ``removed``/``skipped_locked``/``dry_run`` fields, plus
+    (only when ``devices`` is given -- ``cmd_rescan`` passes it for a real
+    rescan, never for ``--dry-run``, since nothing changed) the fresh
+    ``list`` output folded in under the same ``"devices"`` key
+    :func:`render_json` already uses, so a script consuming
+    ``mbregistry list --json`` and ``mbregistry rescan --json`` sees the
+    identical device shape either way.
+    """
+    payload: dict[str, Any] = {
+        "removed": resp["removed"],
+        "skipped_locked": resp["skipped_locked"],
+        "dry_run": resp["dry_run"],
+    }
+    if devices is not None:
+        payload.update(render_json(devices, sort_by=sort_by))
+    return payload

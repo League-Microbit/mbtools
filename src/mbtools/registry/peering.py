@@ -1018,6 +1018,50 @@ class _PeerLink:
         )
         self._resync_thread.start()
 
+    def force_resync(self) -> None:
+        """Sprint 010, ticket 002: unconditionally re-fetch this peer's
+        snapshot right now, on its own thread -- ``rescan``'s "ask every
+        reachable peer for a fresh snapshot" step
+        (:meth:`PeerDiscovery.resync_reachable_peers`, this method's only
+        caller).
+
+        Unlike :meth:`resync`/:meth:`start_resync`, does not require
+        :attr:`_link_dropped` to be set first -- this is not peer-vanish
+        recovery, just an on-demand refresh of an already-live link, so a
+        reachable peer's own snapshot is simply re-applied
+        (:meth:`_fetch_snapshot` re-marks it reachable exactly as it
+        always does on success; nothing here mutates :attr:`_link_dropped`
+        itself). A no-op if this link was never started
+        (:attr:`_started` still ``False``) or has already been stopped --
+        mirroring ``resync_reachable_peers``'s own "connected or not, a
+        link's own force_resync no-ops if the link isn't started" note.
+
+        Safe to race an in-flight, drop-triggered :meth:`resync` for the
+        same link: both share the one non-blocking
+        :attr:`_resync_guard` acquire, so whichever gets there first
+        does the one real fetch and the other is a harmless no-op, never
+        a double fetch.
+        """
+        if not self._started or self._stop_event.is_set():
+            return
+        thread = threading.Thread(
+            target=self._run_force_resync, name=f"peer-force-resync-{self._host}", daemon=True
+        )
+        thread.start()
+
+    def _run_force_resync(self) -> None:
+        """Body of :meth:`force_resync`'s own thread -- see that method's
+        docstring for the shared-``_resync_guard`` race-safety note."""
+        if not self._resync_guard.acquire(blocking=False):
+            return  # an in-flight resync()/force_resync() already covers this
+        try:
+            try:
+                self._fetch_snapshot()
+            except self._zmq.error.ZMQError:
+                pass  # context torn down by stop()
+        finally:
+            self._resync_guard.release()
+
     def start(self) -> None:
         """Connect+subscribe the SUB socket synchronously, then hand the
         snapshot fetch off to its own thread (ticket 010) -- see the
@@ -1896,6 +1940,28 @@ class PeerDiscovery:
         with self._peer_links_lock:
             self._peer_links[host] = link
         link.start()
+
+    def resync_reachable_peers(self) -> None:
+        """Sprint 010, ticket 002: ``rescan``'s "ask every reachable peer
+        for a fresh snapshot" step -- triggers a fresh, unconditional
+        snapshot fetch for every currently-tracked peer link
+        (:attr:`_peer_links`, connected or not), each on its own thread
+        (:meth:`_PeerLink.force_resync`), so this call itself never
+        blocks its own caller (an API request thread, per
+        ``_api_base.BaseAPIServer._op_rescan``'s own
+        ``peer_resync_callback``) for any one peer's round trip.
+
+        "Every entry in :attr:`_peer_links`" deliberately includes a link
+        whose own :attr:`_PeerLink.link_dropped` is currently set -- a
+        link a rescan-triggered purge just removed an unreachable peer's
+        stale rows for is exactly the case this exists to double-check;
+        :meth:`_PeerLink.force_resync` itself is the one that no-ops for
+        a link that was never started, not this method.
+        """
+        with self._peer_links_lock:
+            links = list(self._peer_links.values())
+        for link in links:
+            link.force_resync()
 
     def _on_peer_unreachable(self, host: str) -> None:
         try:

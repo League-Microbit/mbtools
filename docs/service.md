@@ -28,6 +28,7 @@ and the code disagree, the code wins. Run `<program> --help` or
 | `mbregistry service run` | The daemon. One per host. Watches USB, identifies micro:bits, keeps the device database, grants locks, peers with other hosts. | It *is* the daemon. |
 | `mbregistry list` | Client | yes |
 | `mbregistry unlock --force` | Client (local socket only) | yes |
+| `mbregistry rescan` | Client (local socket only) | yes |
 | `mbdeploy deploy / list / debug` | Client | yes |
 | `mbdeploy build` | Local build helper | no |
 | `mbserial` | Client | yes |
@@ -375,6 +376,43 @@ $ mbregistry unlock 9d2f... --force
 mbregistry: 9d2f...: released flash lock (alice-laptop, 12m)
 $ mbregistry unlock 9d2f... --force
 mbregistry: 9d2f...: not locked
+```
+
+### `mbregistry rescan` (sprint 010)
+
+```text
+mbregistry rescan [--dry-run] [--json] [--socket PATH]
+```
+
+Drops cruft from this host's own view of the registry: local device rows
+showing `gone`, every row owned by a peer currently showing `peer
+unreachable`, and a *reachable* peer's own stale `gone` mirror — then
+forces an immediate USB poll and asks every reachable peer for a fresh
+snapshot, so anything actually still alive reappears right away rather
+than waiting for the next poll interval. Any row with an active lock is
+left alone and reported as skipped; `name_registry` (names/channels) is
+never touched. Local Unix socket / named pipe only — same trust boundary
+as `unlock --force`, no remote-TCP-port equivalent.
+
+`--dry-run` reports what would be removed/skipped without removing
+anything, and prints no fresh `list` table (nothing changed). `--json`
+prints one combined JSON object — the removal summary plus, for a real
+(non-`--dry-run`) rescan, the fresh device list — never a human sentence.
+
+```text
+$ mbregistry rescan
+removed 3 devices: 11112222, 33334444, 55556666
+removed 1 unreachable peer: braeburn
+skipped 1 locked: 77778888
+
+STATE  LOCKED  NAME   UID       FIRMWARE  HOST   PORT
+-----  ------  ----   ---       --------  ----   ----
+free   -       alpha  9d2f8820  robot     local  /dev/ttyACM0
+
+$ mbregistry rescan --dry-run
+would remove 3 devices: 11112222, 33334444, 55556666
+would remove 1 unreachable peer: braeburn
+would skip 1 locked: 77778888
 ```
 
 ### `mbregistry service install` / `uninstall` / `start` / `stop` / `restart` / `status`

@@ -138,7 +138,7 @@ try:  # pyserial is a declared dependency, but keep this importable without
 except Exception:  # pragma: no cover
     _pyserial = None  # type: ignore
 
-__all__ = ["BaseAPIServer"]
+__all__ = ["BaseAPIServer", "EVENT_DEVICE_REMOVED", "EVENT_PEER_REMOVED"]
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +150,19 @@ logger = logging.getLogger(__name__)
 #: Relocated here from ``remote_api.py`` (ticket 004) so both concrete
 #: subclasses share the one sentinel instead of each minting its own.
 _WATCH = object()
+
+#: Sprint 010 ticket 002's own two new local-``EventBus`` event types,
+#: fired by :meth:`BaseAPIServer._op_rescan` for every row
+#: :meth:`~mbtools.registry.store.Store.purge` actually removes.
+#: Deliberately distinct from ``registry.peering``'s ``EVENT_*``
+#: constants (``EVENT_ATTACH``/``EVENT_DETACH``/...): those are wire
+#: events a ``PeerDiscovery`` PUB socket may also replicate to other
+#: hosts, while these two are published only on this host's own local
+#: ``self._eventbus`` -- never over that cross-host PUB channel (see
+#: sprint.md's Design Rationale, "purge-removal events are published
+#: only on the local EventBus").
+EVENT_DEVICE_REMOVED = "device_removed"
+EVENT_PEER_REMOVED = "peer_removed"
 
 #: How often an open stream re-checks that its board is still attached on
 #: the same port (:meth:`BaseAPIServer._stream_still_valid`).
@@ -244,6 +257,24 @@ class BaseAPIServer:
     #: ``Store`` owning one itself).
     _name_set_callback: "Callable[[Entry], None] | None" = None
     _name_clear_callback: "Callable[[str], None] | None" = None
+
+    #: Sprint 010, ticket 002: :meth:`_op_rescan`'s own two optional
+    #: trigger hooks -- "force an immediate poll" / "ask every reachable
+    #: peer to resync", fired once purge/event-publish complete. Mirrors
+    #: :attr:`_name_set_callback`/:attr:`_name_clear_callback`'s exact
+    #: "assembly module wires two otherwise-decoupled modules together"
+    #: convention (sprint.md's Design Rationale) rather than a new import
+    #: from this module into ``daemon.py``/``peering.py``. ``None`` by
+    #: default (every pre-ticket-010-002 subclass, and any subclass that
+    #: never opts in, is unaffected) -- a concrete subclass that wants
+    #: rescan to actually trigger a poll/peer-resync sets these
+    #: per-instance in its own ``__init__`` (``api.RegistryAPIServer``'s/
+    #: ``api_windows.WindowsPipeAPIServer``'s own ``poll_callback``/
+    #: ``peer_resync_callback`` constructor parameters; ``cli.
+    #: assemble_registry`` wires ``daemon.run_once``/``peer_discovery.
+    #: resync_reachable_peers``).
+    _poll_callback: "Callable[[], None] | None" = None
+    _peer_resync_callback: "Callable[[], None] | None" = None
 
     #: Sprint 008 ticket 001: the always-present event fan-out ``watch``
     #: subscribes to (see :meth:`_op_watch`/:meth:`_handle_watch`). Every
@@ -544,6 +575,114 @@ class BaseAPIServer:
                 )
             self._store.increment_flash_count(uid)
             return {"ok": True}
+
+    def _op_rescan(self, req: dict[str, Any]) -> dict[str, Any]:
+        """``rescan([dry_run])`` (sprint 010, ticket 002): the local-only
+        purge of demonstrably-stale device/peer rows -- gone local
+        devices, every row owned by a currently-unreachable peer, and a
+        reachable peer's stale ``disconnected`` mirror -- followed by an
+        immediate re-scan so anything actually still alive reappears
+        right away. See sprint.md's Architecture (Steps 3-6) for the
+        full design this method implements; not dispatched by
+        ``remote_api.RemoteAPIServer`` (that class's own ``_dispatch_line``
+        simply never adds the branch, the same precedent ``force_unlock``
+        already sets for a local-socket-only op -- see this module's own
+        docstring).
+
+        Candidates come from :meth:`~mbtools.registry.store.Store.
+        candidates_for_purge` (read-only). ``store`` itself has no notion
+        of locks (see that module's own docstring), so excluding a
+        currently-locked candidate uid is this op's own job, done before
+        :meth:`~mbtools.registry.store.Store.purge` is ever called -- an
+        excluded uid is never passed to ``purge`` and is reported back in
+        the response's ``skipped_locked`` list instead.
+
+        ``dry_run`` (default ``False``) reports the same candidate/skip
+        sets a real call would act on, without calling ``purge``,
+        publishing any event, or firing either trigger callback below.
+
+        A real (non-``dry_run``) call: purges the locked-filtered uid/host
+        sets, then publishes one ``device_removed``/``peer_removed`` event
+        per row :meth:`~mbtools.registry.store.Store.purge` actually
+        removed (a uid/host asked for but left alone by ``purge``'s own
+        mid-reattach/reconnect race check is never published, since
+        nothing actually changed for it) on :attr:`_eventbus` -- looked up
+        via ``getattr(self, "_eventbus", None)`` rather than a direct
+        attribute read, since ``WindowsPipeAPIServer`` never sets one
+        (eventbus support was deliberately scoped out of the Windows pipe
+        transport -- see ``api_windows``'s own module docstring); a
+        subclass without one simply never publishes, rather than raising
+        ``AttributeError``. Every event's payload follows
+        ``daemon_event_payload``'s existing "uid + whatever changed"
+        shape: ``{"uid": ..., "host": ...}`` for a device (the device's
+        own ``host`` -- ``None`` for a locally-owned row, the owning
+        peer's hostname otherwise -- captured *before* ``purge`` deletes
+        the row, since there is nothing left to look up afterwards), and
+        ``{"host": ...}`` for a peer. Published only on this local bus,
+        never over ``PeerDiscovery``'s cross-host PUB socket -- see this
+        module's own ``EVENT_DEVICE_REMOVED``/``EVENT_PEER_REMOVED``
+        comment and sprint.md's Design Rationale.
+
+        Finally, unless ``dry_run``, :attr:`_poll_callback` and
+        :attr:`_peer_resync_callback` are each called exactly once, if not
+        ``None`` -- both fired outside ``self._lock``, mirroring
+        :meth:`_op_names_set`'s own "the shared lock only guards the short
+        bookkeeping" note: a full poll cycle/peer-resync dispatch is not
+        sqlite bookkeeping and must not hold up every other connection's
+        ``list``/``lock``/... while it runs.
+        """
+        dry_run = bool(req.get("dry_run", False))
+        with self._lock:
+            candidates = self._store.candidates_for_purge()
+            locked_uids = sorted(
+                uid for uid in candidates.device_uids if self._locks.status(uid) is not None
+            )
+            locked = set(locked_uids)
+            device_uids = [uid for uid in candidates.device_uids if uid not in locked]
+            peer_hosts = list(candidates.unreachable_peers)
+
+            if dry_run:
+                return {
+                    "ok": True,
+                    "removed": {"devices": device_uids, "peers": peer_hosts},
+                    "skipped_locked": locked_uids,
+                    "dry_run": True,
+                }
+
+            # Captured before purge() deletes these rows -- there is
+            # nothing left to look up afterwards (see this method's own
+            # docstring).
+            host_by_uid: dict[str, str | None] = {}
+            for uid in device_uids:
+                record = self._store.get(uid)
+                if record is not None:
+                    host_by_uid[uid] = record.host
+
+            result = self._store.purge(device_uids, peer_hosts)
+
+        eventbus = getattr(self, "_eventbus", None)
+        if eventbus is not None:
+            for uid in result.removed_device_uids:
+                eventbus.publish(
+                    {"type": EVENT_DEVICE_REMOVED, "uid": uid, "host": host_by_uid.get(uid)}
+                )
+            for host in result.removed_peer_hosts:
+                eventbus.publish({"type": EVENT_PEER_REMOVED, "host": host})
+
+        if self._poll_callback is not None:
+            self._poll_callback()
+        if self._peer_resync_callback is not None:
+            self._peer_resync_callback()
+
+        return {
+            "ok": True,
+            "removed": {
+                "devices": list(result.removed_device_uids),
+                "peers": list(result.removed_peer_hosts),
+            },
+            "skipped_locked": locked_uids,
+            "dry_run": False,
+        }
 
     # -- name-registry ops (sprint 004, ticket 005) -----------------------
     #

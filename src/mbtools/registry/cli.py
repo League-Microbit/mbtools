@@ -104,7 +104,12 @@ from mbtools.registry.peering import (
 )
 from mbtools.registry.remote_api import DEFAULT_REMOTE_PORT, RemoteAPIServer
 from mbtools.registry.paths import LINUX_SYSTEM_UNIT_PATH, LINUX_UDEV_RULE_PATH
-from mbtools.registry.render import render_json, render_table
+from mbtools.registry.render import (
+    render_json,
+    render_rescan_json,
+    render_rescan_summary,
+    render_table,
+)
 from mbtools.registry.service import (
     DryRunCommandRunner,
     LinuxUserPreflightError,
@@ -133,6 +138,7 @@ __all__ = [
     "build_parser",
     "cmd_list",
     "cmd_unlock",
+    "cmd_rescan",
     "cmd_run",
     "cmd_install_service",
     "cmd_service_install",
@@ -448,6 +454,65 @@ def cmd_unlock(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# rescan -- local-socket-only, drop cruft (gone devices, unreachable peers)
+# ---------------------------------------------------------------------------
+
+
+def cmd_rescan(args: argparse.Namespace) -> int:
+    """``mbregistry rescan [--dry-run] [--json]`` (sprint 010, ticket 003):
+    connect to the local api and call the ``rescan`` op (ticket 002) --
+    purges gone local device rows, every row owned by a currently-
+    unreachable peer, and a reachable peer's stale ``disconnected``
+    mirror, then (unless ``--dry-run``) forces an immediate USB poll and
+    asks every reachable peer to resync. Same local-socket-only,
+    ``find_local_api_address``/``RegistryUnavailable``/
+    ``RegistryClientError`` handling as :func:`cmd_unlock` -- no new
+    error-handling convention (this ticket's own Description).
+
+    Composed as two client calls, not a combined server response: a
+    non-``--dry-run`` call fetches a fresh ``list()`` afterward so the
+    printed table (and, under ``--json``, the JSON payload's own
+    ``"devices"`` key) reflects what rescan actually just changed.
+    ``--dry-run`` never calls ``list()`` -- nothing changed, so the
+    existing table would be identical noise (SUC-002's own acceptance
+    criterion); the summary line alone (``"would remove ..."`` rather than
+    ``"removed ..."``) makes clear this was a preview.
+
+    ``--json``/``--dry-run --json`` print one combined JSON object (the
+    server's ``removed``/``skipped_locked``/``dry_run`` fields, plus the
+    fresh device list when not ``--dry-run``) via
+    :func:`~mbtools.registry.render.render_rescan_json` -- never the human
+    summary sentence and never two separate JSON blobs on stdout.
+    """
+    socket_path = find_local_api_address(args.socket, _SOCKET_ENV_VAR)
+
+    try:
+        with RegistryClient(socket_path) as client:
+            resp = client.rescan(dry_run=args.dry_run)
+            devices = None if args.dry_run else client.list()
+    except RegistryUnavailable as exc:
+        print(f"mbregistry: {exc}", file=sys.stderr)
+        print(
+            "mbregistry: is the daemon running? start it with 'mbregistry run'",
+            file=sys.stderr,
+        )
+        return EXIT_NO_DAEMON
+    except RegistryClientError as exc:
+        print(f"mbregistry: {exc.message}", file=sys.stderr)
+        return exc.exit_code
+
+    if args.json:
+        print(json.dumps(render_rescan_json(resp, devices), indent=2))
+        return EXIT_OK
+
+    print(render_rescan_summary(resp))
+    if devices is not None:
+        print()
+        print(render_table(devices))
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
 # run -- construct and run the daemon + api, in the foreground
 # ---------------------------------------------------------------------------
 
@@ -471,6 +536,8 @@ def assemble_daemon_and_api(
     chip_identity_session_factory: Any = None,
     pipe_name: str | None = None,
     eventbus: EventBus | None = None,
+    poll_callback: Any = None,
+    peer_resync_callback: Any = None,
 ) -> tuple[Daemon, RegistryAPIServer | WindowsPipeAPIServer]:
     """Build one :class:`Daemon` and one local-API server that share a
     single ``threading.RLock`` -- ticket 009's fix for the cross-module
@@ -576,6 +643,23 @@ def assemble_daemon_and_api(
     pre-ticket-008-001 caller/test that omits it. :func:`assemble_registry`
     always passes the one ``EventBus`` it constructs for the whole
     daemon pipeline.
+
+    ``poll_callback``/``peer_resync_callback`` (sprint 010, ticket 002)
+    are forwarded verbatim to whichever API server this function
+    constructs (its own ``poll_callback``/``peer_resync_callback``
+    constructor parameters -- see ``_api_base.BaseAPIServer``'s own
+    docstring for what they wire into ``rescan``). Both default to
+    ``None`` here too, exactly like ``event_callback``/
+    ``lock_display_callback`` above -- a bare call (every pre-ticket-
+    010-002 caller/test) leaves rescan's forced poll/peer-resync
+    unwired, not a new failure mode, just the same "no-op unless
+    someone wires it" convention every other optional callback here
+    already follows. :func:`assemble_registry` is the one caller that
+    wires them for real, to ``daemon.run_once``/``peer_discovery.
+    resync_reachable_peers`` -- see that function's own docstring for
+    why it can't simply pass ``daemon.run_once`` as a keyword argument
+    to *this* call (the ``daemon`` it wants to reference is one this
+    very call is about to construct).
     """
     shared_lock = lock if lock is not None else threading.RLock()
     daemon = Daemon(
@@ -600,6 +684,8 @@ def assemble_daemon_and_api(
             lock=shared_lock,
             name_set_callback=name_set_callback,
             name_clear_callback=name_clear_callback,
+            poll_callback=poll_callback,
+            peer_resync_callback=peer_resync_callback,
         )
     else:
         flash_op = FlashOp(locks=daemon.locks, store=store, runner=flash_runner)
@@ -613,6 +699,8 @@ def assemble_daemon_and_api(
             eventbus=eventbus,
             name_set_callback=name_set_callback,
             name_clear_callback=name_clear_callback,
+            poll_callback=poll_callback,
+            peer_resync_callback=peer_resync_callback,
         )
     return daemon, api
 
@@ -858,6 +946,24 @@ def assemble_registry(
         if peer_discovery is not None:
             peer_discovery.publish_name_clear(name)
 
+    # Sprint 010, ticket 002: rescan's own two trigger hooks. `_poll_callback`
+    # is a closure, not a direct `daemon.run_once` reference, because
+    # `daemon` does not exist yet at this point -- it is *this very call*
+    # (`assemble_daemon_and_api` below) that constructs it and hands it
+    # back. Ordinary Python closure late-binding makes this safe: by the
+    # time `_poll_callback` is ever actually invoked (a real `rescan`
+    # request, well after this function has returned), `daemon` has long
+    # since been assigned in this enclosing scope. `peer_resync_callback`
+    # has no such ordering problem -- `peer_discovery` (or `None`, under
+    # `--no-peering`) already exists above, constructed before this call
+    # for the same reason `event_callback`/`lock_display_callback` need
+    # it -- so it is passed directly, mirroring every `publish_*` wiring
+    # above: `None` here leaves `_op_rescan`'s own `peer_resync_callback`
+    # unset, the same pre-existing safe default `--no-peering` already
+    # gives every other peering-dependent hook, not a new failure mode.
+    def _poll_callback() -> None:
+        daemon.run_once()
+
     daemon, api = assemble_daemon_and_api(
         store=store,
         usbwatch=usbwatch,
@@ -876,6 +982,10 @@ def assemble_registry(
         chip_identity_session_factory=chip_identity_session_factory,
         pipe_name=pipe_name,
         eventbus=eventbus,
+        poll_callback=_poll_callback,
+        peer_resync_callback=(
+            peer_discovery.resync_reachable_peers if peer_discovery is not None else None
+        ),
     )
     remote_api = RemoteAPIServer(
         host=remote_host,
@@ -1706,6 +1816,27 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"api socket path (default {DEFAULT_SOCKET_PATH}, or ${_SOCKET_ENV_VAR})",
     )
     unlock_p.set_defaults(func=cmd_unlock)
+
+    rescan_p = sub.add_parser(
+        "rescan",
+        help=(
+            "drop gone devices and unreachable peers, then force an "
+            "immediate rescan (local socket only)"
+        ),
+    )
+    rescan_p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="show what would be removed/skipped without removing anything",
+    )
+    rescan_p.add_argument(
+        "--json", action="store_true", help="emit machine-readable JSON"
+    )
+    rescan_p.add_argument(
+        "--socket",
+        help=f"api socket path (default {DEFAULT_SOCKET_PATH}, or ${_SOCKET_ENV_VAR})",
+    )
+    rescan_p.set_defaults(func=cmd_rescan)
 
     #: `service run`'s flags live on a shared parent parser so the hidden,
     #: deprecated top-level `run` alias (below) accepts exactly the same

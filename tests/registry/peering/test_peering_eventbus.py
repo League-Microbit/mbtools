@@ -887,6 +887,153 @@ def test_resync_keeps_link_dropped_when_the_peer_is_still_down(store, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# sprint 010, ticket 002: force_resync()/resync_reachable_peers() -- the
+# "ask every reachable peer for a fresh snapshot" half of rescan.
+# ---------------------------------------------------------------------------
+
+
+class _RecordingLink:
+    """A ``force_resync``-only double for ``PeerDiscovery._peer_links``,
+    standing in for a real ``_PeerLink`` -- ``resync_reachable_peers``'s
+    own job is just "call ``force_resync`` on every tracked link", proven
+    here without any real socket at all; the real link's own
+    ``force_resync`` mechanics are proven separately below, against real
+    ``_PeerLink`` instances.
+    """
+
+    def __init__(self) -> None:
+        self.force_resync_calls = 0
+
+    def force_resync(self) -> None:
+        self.force_resync_calls += 1
+
+
+def test_resync_reachable_peers_calls_force_resync_on_every_tracked_link(store):
+    peering = _make_peering(store, host="alpha", pub_port=17902, snapshot_port=17903)
+    link_a = _RecordingLink()
+    link_b = _RecordingLink()
+    peering._peer_links["beta"] = link_a
+    peering._peer_links["gamma"] = link_b
+
+    peering.resync_reachable_peers()
+
+    assert link_a.force_resync_calls == 1
+    assert link_b.force_resync_calls == 1
+
+
+def test_force_resync_no_ops_for_a_link_that_was_never_started(store, tmp_path):
+    store_b = Store(tmp_path / "beta.db")
+    peering_b = _make_peering(store_b, host="beta", pub_port=17912, snapshot_port=17913)
+    try:
+        peering_b.start()
+        link = peering_mod._PeerLink(
+            host="alpha",
+            store=store_b,
+            zmq_module=peering_mod._real_zmq,
+            context=peering_b._zmq_ctx,
+            pub_address="tcp://127.0.0.1:17914",
+            snapshot_address="tcp://127.0.0.1:17915",
+            on_unreachable=None,
+            on_reachable=None,
+            snapshot_timeout_ms=200,
+        )
+        fetch_calls: list[int] = []
+        link._fetch_snapshot = lambda: fetch_calls.append(1) or True  # type: ignore[method-assign]
+
+        # link.start() was never called -- self._started stays False.
+        link.force_resync()
+        time.sleep(0.2)
+
+        assert fetch_calls == []
+    finally:
+        peering_b.stop()
+        store_b.close()
+
+
+def test_force_resync_is_a_safe_no_op_racing_an_in_flight_resync(store, tmp_path):
+    """The shared, non-blocking ``_resync_guard`` acquire is what stops a
+    ``force_resync()`` racing an in-flight, drop-triggered ``resync()``
+    for the same link from double-fetching -- simulated here by holding
+    the guard ourselves (standing in for the in-flight ``resync()``) and
+    asserting ``force_resync()`` never fetches while it's held.
+    """
+    store_b = Store(tmp_path / "beta.db")
+    peering_b = _make_peering(store_b, host="beta", pub_port=17922, snapshot_port=17923)
+    try:
+        peering_b.start()
+        link = peering_mod._PeerLink(
+            host="alpha",
+            store=store_b,
+            zmq_module=peering_mod._real_zmq,
+            context=peering_b._zmq_ctx,
+            pub_address="tcp://127.0.0.1:17924",
+            snapshot_address="tcp://127.0.0.1:17925",  # nothing listening
+            on_unreachable=None,
+            on_reachable=None,
+            snapshot_timeout_ms=200,
+        )
+        link._started = True  # simulate an already-live link
+        fetch_calls: list[int] = []
+        link._fetch_snapshot = lambda: fetch_calls.append(1) or False  # type: ignore[method-assign]
+
+        assert link._resync_guard.acquire(blocking=False)  # stand in for resync()
+        try:
+            link.force_resync()
+            time.sleep(0.2)
+            assert fetch_calls == []
+        finally:
+            link._resync_guard.release()
+    finally:
+        peering_b.stop()
+        store_b.close()
+
+
+def test_resync_reachable_peers_end_to_end_refreshes_a_live_never_dropped_link(store, tmp_path):
+    """A live link that was never dropped is not otherwise re-synced by
+    anything -- ``store.mark_disconnected`` alone publishes no PUB event
+    (no ``Daemon``/``event_callback`` is wired to either side here), so
+    the only way beta's mirror of alpha's device picks up the change is
+    ``resync_reachable_peers()`` -> ``force_resync()`` -> a real
+    ``_fetch_snapshot()`` round trip -- proven end to end, real sockets,
+    mirroring this module's other real-loopback integration tests.
+    """
+    store_b = Store(tmp_path / "beta.db")
+    store.upsert_attached(UID, "/dev/ttyACM0", "0d28:0204")
+
+    peering_a = _make_peering(store, host="alpha", pub_port=17932, snapshot_port=17933)
+    peering_b = _make_peering(store_b, host="beta", pub_port=17942, snapshot_port=17943)
+    try:
+        peering_a.start()
+        peering_b.start()
+        store_b.record_peer_seen("alpha", f"127.0.0.1:{_remote_port(17932)}")
+        peering_b.connect_peer("alpha", "127.0.0.1", 17932, 17933)
+        assert _wait_until(
+            lambda: store_b.get_peer("alpha") is not None
+            and store_b.get_peer("alpha").reachable is True
+        )
+        assert _wait_until(
+            lambda: store_b.get(UID) is not None and store_b.get(UID).state != STATE_DISCONNECTED
+        )
+
+        store.mark_disconnected(UID)
+        peering_b.resync_reachable_peers()
+
+        assert _wait_until(
+            lambda: store_b.get(UID) is not None and store_b.get(UID).state == STATE_DISCONNECTED,
+            timeout=5.0,
+        )
+        # The link was never dropped -- this is a refresh, not a
+        # peer-vanish recovery.
+        with peering_b._peer_links_lock:
+            assert peering_b._peer_links["alpha"].link_dropped is False
+    finally:
+        peering_a.stop()
+        peering_b.stop()
+        store.close()
+        store_b.close()
+
+
+# ---------------------------------------------------------------------------
 # ticket 002 (sprint 004): name_registry replication -- real loopback
 # sockets, mirroring this module's existing device-row integration tests
 # above (snapshot-then-stream convergence, peer vanish).

@@ -554,6 +554,23 @@ def test_force_unlock_is_not_dispatched_on_the_remote_tcp_port(remote_server):
     client.close()
 
 
+def test_rescan_is_not_dispatched_on_the_remote_tcp_port(remote_server):
+    """Sprint 010, ticket 002: `rescan` is local-only (Unix socket /
+    Windows pipe) -- `_op_rescan` lives in the shared `_api_base.py` so
+    both those transports get it for free, but this class's own
+    `_dispatch_line` never adds the branch, the same precedent
+    `force_unlock` already sets above. Falls through to the same
+    "unknown op" response any other unrecognized op gets."""
+    srv = remote_server()
+    client = _Client(srv.bound_port)
+
+    resp = client.request({"op": "rescan"})
+
+    assert resp["ok"] is False
+    assert resp["code"] == CODE_INVALID_REQUEST
+    client.close()
+
+
 def test_flash_without_a_staged_hex_path_is_invalid_request(remote_server):
     """`flash`'s own territory (ticket 008) is covered in
     test_remote_flash.py -- this only re-proves `flash` is no longer an

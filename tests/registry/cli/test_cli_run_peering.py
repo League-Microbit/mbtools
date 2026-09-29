@@ -296,6 +296,107 @@ def test_assemble_registry_lock_display_callback_reaches_peering(tmp_path, socke
 
 
 # ---------------------------------------------------------------------------
+# sprint 010, ticket 002: assemble_registry wires rescan's own two
+# trigger hooks (poll_callback/peer_resync_callback) to daemon.run_once /
+# peer_discovery.resync_reachable_peers. Driven straight at
+# api._op_rescan() (no socket, no threads needed) -- the wire-level
+# dispatch itself is already covered by tests/registry/api/test_api.py.
+# ---------------------------------------------------------------------------
+
+
+def test_assemble_registry_wires_poll_callback_to_daemon_run_once(tmp_path, socket_dir):
+    """Proves the late-binding closure ``assemble_registry`` builds for
+    ``poll_callback`` (necessarily a closure, not a direct ``daemon.
+    run_once`` reference -- ``daemon`` doesn't exist yet at the point
+    this wiring is constructed; see that function's own docstring)
+    really does end up calling the ``daemon`` instance ``assemble_registry``
+    itself returns, not some other/stale one.
+    """
+    store = Store(tmp_path / "devices.db")
+    usbwatch = FakeUSBSource([[]])
+
+    daemon, api, remote_api, peering = assemble_registry(
+        store=store,
+        usbwatch=usbwatch,
+        socket_path=f"{socket_dir}/api.sock",
+        remote_port=0,
+        peer_pub_port=17902,
+        peer_snapshot_port=17903,
+        zeroconf=_FakeZeroconfNamespace(),
+    )
+    calls = []
+    daemon.run_once = lambda: calls.append(1)
+    try:
+        resp = api._op_rescan({})
+        assert resp["ok"] is True
+        assert calls == [1]
+    finally:
+        store.close()
+
+
+def test_assemble_registry_wires_peer_resync_callback_to_peer_discovery(tmp_path, socket_dir):
+    """``api._peer_resync_callback`` is the real, already-bound
+    ``peer_discovery.resync_reachable_peers`` method -- unlike
+    ``poll_callback``, this one is passed directly (not a closure),
+    since ``peer_discovery`` already exists by the time
+    ``assemble_daemon_and_api`` is called (see that function's own
+    docstring for why ``daemon`` can't be handled the same way). Bound
+    methods compare equal when they share both ``__self__`` and
+    ``__func__``, so this asserts identity rather than monkeypatching
+    ``peering`` after the fact (a post-hoc ``peering.
+    resync_reachable_peers = ...`` would shadow the instance attribute
+    for *future* lookups, but not retroactively change the bound-method
+    object ``assemble_registry`` already captured and handed to
+    ``api``).
+    """
+    store = Store(tmp_path / "devices.db")
+    usbwatch = FakeUSBSource([[]])
+
+    daemon, api, remote_api, peering = assemble_registry(
+        store=store,
+        usbwatch=usbwatch,
+        socket_path=f"{socket_dir}/api.sock",
+        remote_port=0,
+        peer_pub_port=17904,
+        peer_snapshot_port=17905,
+        zeroconf=_FakeZeroconfNamespace(),
+    )
+    try:
+        assert peering is not None
+        assert api._peer_resync_callback == peering.resync_reachable_peers
+        # Calling it through the API's own hook must not raise, even with
+        # no peer links connected (peering.start() was never called here).
+        resp = api._op_rescan({})
+        assert resp["ok"] is True
+    finally:
+        store.close()
+
+
+def test_assemble_registry_no_peering_leaves_peer_resync_callback_none(tmp_path, socket_dir):
+    """``--no-peering`` (``no_peering=True``) leaves
+    ``peer_resync_callback`` ``None`` -- the same pre-existing safe
+    default every other peering-dependent hook already gets under
+    ``--no-peering``, not a new failure mode. ``rescan`` itself still
+    works (``poll_callback`` is unaffected by ``no_peering``)."""
+    store = Store(tmp_path / "devices.db")
+    usbwatch = FakeUSBSource([[]])
+
+    daemon, api, remote_api, peering = assemble_registry(
+        store=store,
+        usbwatch=usbwatch,
+        socket_path=f"{socket_dir}/api.sock",
+        no_peering=True,
+    )
+    try:
+        assert peering is None
+        assert api._peer_resync_callback is None
+        resp = api._op_rescan({"dry_run": True})
+        assert resp["ok"] is True
+    finally:
+        store.close()
+
+
+# ---------------------------------------------------------------------------
 # end-to-end: two in-process mbregistry pipelines, connected the same way
 # cmd_run's own --peer handling connects them, converge to a shared view.
 # This is ticket 009's own "mbregistry run --peer HOST:PORT ... converges

@@ -14,7 +14,11 @@ control — see "`stream`" below. Local-socket-only as of sprint 004
 ticket 005, four name-registry ops (`names_get`/`names_set`/
 `names_clear`/`names_list` — see "Name-registry ops" below) that are not
 device ops at all; also local-socket-only, sprint 008 ticket 003's
-`force_unlock`. Since sprint 005 ticket 003,
+`force_unlock` and sprint 010 ticket 002's `rescan` (see "`rescan`"
+below) — unlike `force_unlock`, `rescan` *is* shared in
+`_api_base.BaseAPIServer` (so both the Unix socket and the Windows named
+pipe get it), it just isn't dispatched by `remote_api.RemoteAPIServer`.
+Since sprint 005 ticket 003,
 `mbtools.registry.api_windows.WindowsPipeAPIServer` is a third server
 sharing that same dispatch implementation, over a Windows named pipe
 instead of a Unix socket — the local-socket transport's Windows
@@ -56,6 +60,7 @@ Every request is a JSON object with an `"op"` field:
 | `lock` | `uid`, `kind` | acquire an exclusive lock of `kind` (`serial`/`relay`/`flash`/`debug`) on the device, tied to this connection's peer PID |
 | `unlock` | `uid` | release this connection's own lock on the device (a no-op, not an error, if this connection doesn't hold it) |
 | `force_unlock` | `uid` | sprint 008, ticket 003: **local Unix socket only** (never dispatched on the remote TCP port) — drop the device's lock regardless of who holds it, and close the holder's own connection so its blocked read observes EOF; see "`force_unlock`" below |
+| `rescan` | `dry_run` (optional, default `false`) | sprint 010, ticket 002: **local Unix socket / Windows pipe only** (never dispatched on the remote TCP port) — purge gone/unreachable-peer cruft, then force an immediate USB poll and peer resync; see "`rescan`" below |
 | `flash` | `uid`, `hex_path` | flash `hex_path` to the device — requires a `flash`-kind lock already held by this same connection (call `lock` first) |
 | `mark_flashed` | `uid` | bookkeeping only: record that `uid` was flashed *outside* this op (sprint 002's `mbdeploy`, which flashes locally by running pyocd directly rather than through `flash`) — same `flash`-kind-lock-held-by-this-connection precondition as `flash`, no pyocd invocation |
 | `names_get` | `name` | sprint 004, ticket 005: the name registry's row for `name`, or `entry: null` (not an error) if it has none yet — the non-creating lookup |
@@ -258,6 +263,26 @@ also appear in `list`'s per-device dict and in a `lock_state` `watch` event
 Drops `uid`'s lock via `LockManager.force_release` — which skips the holder-equality check `unlock`/`release()` enforces, releasing it regardless of who holds it — then, if this server is tracking a connection for that uid (`RegistryAPIServer`'s own per-uid `{uid: connection}` map, populated on a successful `lock` and cleared on release via any path: `unlock`, connection close, the periodic sweep, or this op itself), shuts that connection down from the server side (`socket.shutdown(SHUT_RDWR)`, not a hard close — the holder's own connection-handler thread still runs its normal close/cleanup). The holder's blocked read (an ordinary JSON-lines loop, or a `stream` session's frame reader, ticket 004) then unblocks with an error/EOF and unwinds through its own existing `finally`-block cleanup — a harmless no-op release there, since the lock is already gone. `force_release` funnels through the same shared release mechanics `release`/`sweep` use (flash-release callback, then the lock-display callback), so a forced release fires a `lock_state` `watch` event and updates a peer's replicated display exactly as an ordinary release would.
 
 `"holder"` is the same wire shape `lock`'s own `locked` response carries (including `label`/`since`), so a caller can report what it broke — `mbregistry unlock --force`'s own CLI output does exactly this.
+
+### `rescan` (sprint 010, ticket 002)
+
+**Local Unix socket / Windows pipe only** — never on the remote TCP control plane. Unlike `force_unlock` (implemented directly in `api.py`, Unix-socket-only), `_op_rescan` is shared in `_api_base.BaseAPIServer` so both `mbtools.registry.api.RegistryAPIServer` and `mbtools.registry.api_windows.WindowsPipeAPIServer` dispatch it; `remote_api.RemoteAPIServer`'s own `_dispatch_line` simply never adds the branch, the same precedent `force_unlock` already sets for a local-socket-only op — an attempt on the remote TCP port gets the same `{"ok": false, "code": "invalid_request"}` any unrecognized op gets. A manual, operator-invoked purge of demonstrably-stale rows: `mbregistry rescan [--dry-run] [--json]` is its one intended caller.
+
+```jsonc
+// request
+{"op": "rescan", "dry_run": false}   // "dry_run" optional, defaults to false
+// response
+{"ok": true,
+ "removed": {"devices": ["<uid>", ...], "peers": ["<host>", ...]},
+ "skipped_locked": ["<uid>", ...],
+ "dry_run": false}
+```
+
+Deletes (per `store.Store.purge`, fed by the read-only `store.Store.candidates_for_purge`): local device rows in `STATE_DISCONNECTED` ("gone"); every device row owned by a currently-unreachable peer, regardless of that row's own state; a *reachable* peer's device rows that are nonetheless `STATE_DISCONNECTED` (stale since sprint 005 ticket 011); and `peer` rows with `reachable = false`. Never touches `name_registry`. A candidate uid currently locked is excluded before `purge` is ever called and reported in `"skipped_locked"` instead — `store` itself has no notion of locks (see its own module docstring), so this exclusion is this op's own job, not `store`'s. Deletion re-checks each row's state at delete time, so a uid that reattaches (or a peer that reconnects) between candidate computation and the actual delete survives untouched — `"removed"` reflects what was *actually* deleted, which can be a subset of what a preceding `--dry-run` reported as a candidate.
+
+`dry_run: true` computes and returns the same candidate/skip sets a real call would act on, without deleting anything, publishing any event, or triggering either callback below — store state, and everything downstream of it, is left byte-for-byte unchanged.
+
+A real (non-`dry_run`) call, after purging: publishes one `device_removed` (`{"type": "device_removed", "uid": "...", "host": "<owning peer, or null for a local row>"}`) or `peer_removed` (`{"type": "peer_removed", "host": "..."}`) event per row actually removed, on this host's own local event bus only (`watch` clients and — via the local bus, not `PeerDiscovery`'s cross-host PUB socket — nothing further; see sprint.md's Design Rationale for why this never replicates to other hosts); then, unless a subclass left them unwired, calls the injected `poll_callback` (`mbtools.registry.daemon.Daemon.run_once`, forcing an immediate USB scan-diff-probe cycle rather than waiting for the next `--interval` tick) and `peer_resync_callback` (`mbtools.registry.peering.PeerDiscovery.resync_reachable_peers`, asking every currently-connected peer link to re-fetch its snapshot right now) — both outside the shared lock, so a full poll/resync cycle never holds up any other connection's `list`/`lock`/... while it runs.
 
 ### `flash`
 
