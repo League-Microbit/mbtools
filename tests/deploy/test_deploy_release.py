@@ -4,7 +4,7 @@ Every test scripts the module's single ``fetch(url, headers) -> bytes``
 seam (:class:`_ScriptedFetch` below) instead of touching the network --
 see release.py's own module docstring ("HTTP seam"). Response bodies are
 modeled on the real release pages named in the sprint-002 ticket:
-League-Microbit/nezha-robot-template (``MICROBIT.hex``,
+League-Robotics/pxt-nezbot (``MICROBIT.hex``,
 ``MICROBIT.hex.txt``, and a versioned ``.hex`` on the same release --
 ``MICROBIT.hex`` must still win) and League-Robotics/microbit-radio-relay
 (a moving tag literally named ``latest`` that is *not* GitHub's own
@@ -75,16 +75,16 @@ def _release_json(tag_name: str, asset_names: tuple[str, ...]) -> bytes:
 
 class TestParseRepoRef:
     def test_no_tag(self):
-        assert release_mod.parse_repo_ref("League-Microbit/nezha-robot-template") == (
-            "League-Microbit",
-            "nezha-robot-template",
+        assert release_mod.parse_repo_ref("League-Robotics/pxt-nezbot") == (
+            "League-Robotics",
+            "pxt-nezbot",
             None,
         )
 
     def test_with_tag(self):
         assert release_mod.parse_repo_ref(
-            "League-Microbit/nezha-robot-template@v0.20260919.7"
-        ) == ("League-Microbit", "nezha-robot-template", "v0.20260919.7")
+            "League-Robotics/pxt-nezbot@v0.20260919.7"
+        ) == ("League-Robotics", "pxt-nezbot", "v0.20260919.7")
 
     @pytest.mark.parametrize("bad", ["no-slash", "/repo", "owner/", "", "@tag"])
     def test_invalid_raises_value_error(self, bad):
@@ -101,14 +101,14 @@ class TestEndpointSelection:
     def test_no_tag_resolves_via_releases_latest(self, tmp_path):
         fetch = _ScriptedFetch(
             {
-                "/repos/League-Microbit/nezha-robot-template/releases/latest": _release_json(
+                "/repos/League-Robotics/pxt-nezbot/releases/latest": _release_json(
                     "v0.20260919.7", ("MICROBIT.hex",)
                 ),
                 "/MICROBIT.hex": b"HEXBYTES",
             }
         )
         result = release_mod.resolve_hex(
-            "League-Microbit/nezha-robot-template",
+            "League-Robotics/pxt-nezbot",
             cache_dir=tmp_path,
             fetch=fetch,
         )
@@ -151,14 +151,14 @@ class TestEndpointSelection:
     def test_explicit_tag_resolves_via_releases_tags(self, tmp_path):
         fetch = _ScriptedFetch(
             {
-                "/repos/League-Microbit/nezha-robot-template/releases/tags/v0.20260919.7": _release_json(
+                "/repos/League-Robotics/pxt-nezbot/releases/tags/v0.20260919.7": _release_json(
                     "v0.20260919.7", ("MICROBIT.hex",)
                 ),
                 "/MICROBIT.hex": b"PINNED-BYTES",
             }
         )
         result = release_mod.resolve_hex(
-            "League-Microbit/nezha-robot-template@v0.20260919.7",
+            "League-Robotics/pxt-nezbot@v0.20260919.7",
             cache_dir=tmp_path,
             fetch=fetch,
         )
@@ -174,7 +174,7 @@ class TestEndpointSelection:
 
 class TestAssetSelection:
     def test_prefers_microbit_hex(self, tmp_path):
-        """nezha-robot-template's real release shape: MICROBIT.hex,
+        """pxt-nezbot's real release shape: MICROBIT.hex,
         MICROBIT.hex.txt, and a versioned .hex all on the same release --
         MICROBIT.hex must win over both.
         """
@@ -185,14 +185,14 @@ class TestAssetSelection:
                     (
                         "MICROBIT.hex",
                         "MICROBIT.hex.txt",
-                        "nezha-robot-template-v1.hex",
+                        "pxt-nezbot-v1.hex",
                     ),
                 ),
                 "/MICROBIT.hex": b"PREFERRED",
             }
         )
         result = release_mod.resolve_hex(
-            "League-Microbit/nezha-robot-template", cache_dir=tmp_path, fetch=fetch
+            "League-Robotics/pxt-nezbot", cache_dir=tmp_path, fetch=fetch
         )
         assert result.asset_name == "MICROBIT.hex"
         assert result.hex_bytes == b"PREFERRED"
@@ -247,18 +247,18 @@ class TestAssetSelection:
         fetch = _ScriptedFetch(
             {
                 "/releases/latest": _release_json(
-                    "v1", ("MICROBIT.hex", "nezha-robot-template-v1.hex")
+                    "v1", ("MICROBIT.hex", "pxt-nezbot-v1.hex")
                 ),
-                "/nezha-robot-template-v1.hex": b"OVERRIDE-BYTES",
+                "/pxt-nezbot-v1.hex": b"OVERRIDE-BYTES",
             }
         )
         result = release_mod.resolve_hex(
-            "League-Microbit/nezha-robot-template",
-            asset_override="nezha-robot-template-v1.hex",
+            "League-Robotics/pxt-nezbot",
+            asset_override="pxt-nezbot-v1.hex",
             cache_dir=tmp_path,
             fetch=fetch,
         )
-        assert result.asset_name == "nezha-robot-template-v1.hex"
+        assert result.asset_name == "pxt-nezbot-v1.hex"
         assert result.hex_bytes == b"OVERRIDE-BYTES"
 
     def test_asset_override_not_found_on_release_errors(self, tmp_path):
@@ -267,7 +267,7 @@ class TestAssetSelection:
         )
         with pytest.raises(release_mod.GithubReleaseError):
             release_mod.resolve_hex(
-                "League-Microbit/nezha-robot-template",
+                "League-Robotics/pxt-nezbot",
                 asset_override="nope.hex",
                 cache_dir=tmp_path,
                 fetch=fetch,
@@ -288,13 +288,13 @@ class TestCache:
             }
         )
         first = release_mod.resolve_hex(
-            "League-Microbit/nezha-robot-template@v1", cache_dir=tmp_path, fetch=fetch
+            "League-Robotics/pxt-nezbot@v1", cache_dir=tmp_path, fetch=fetch
         )
         assert first.from_cache is False
         assert len(fetch.calls) == 2  # release lookup + asset download
 
         second = release_mod.resolve_hex(
-            "League-Microbit/nezha-robot-template@v1", cache_dir=tmp_path, fetch=fetch
+            "League-Robotics/pxt-nezbot@v1", cache_dir=tmp_path, fetch=fetch
         )
         assert second.from_cache is True
         assert second.hex_bytes == b"CACHE-ME"
@@ -309,12 +309,12 @@ class TestCache:
             }
         )
         result = release_mod.resolve_hex(
-            "League-Microbit/nezha-robot-template@v1", cache_dir=tmp_path, fetch=fetch
+            "League-Robotics/pxt-nezbot@v1", cache_dir=tmp_path, fetch=fetch
         )
         expected = (
             tmp_path
-            / "League-Microbit"
-            / "nezha-robot-template"
+            / "League-Robotics"
+            / "pxt-nezbot"
             / "v1"
             / "MICROBIT.hex"
         )
@@ -331,14 +331,14 @@ class TestCache:
             }
         )
         release_mod.resolve_hex(
-            "League-Microbit/nezha-robot-template", cache_dir=tmp_path, fetch=fetch
+            "League-Robotics/pxt-nezbot", cache_dir=tmp_path, fetch=fetch
         )
         calls_after_first = len(fetch.calls)
 
         # A later, explicitly pinned call to the tag "latest" resolved to
         # reuses the cache with zero network calls.
         second = release_mod.resolve_hex(
-            "League-Microbit/nezha-robot-template@v9",
+            "League-Robotics/pxt-nezbot@v9",
             cache_dir=tmp_path,
             fetch=fetch,
         )
@@ -363,7 +363,7 @@ class TestErrorFlows:
         )
         with pytest.raises(release_mod.ReleaseNotFoundError):
             release_mod.resolve_hex(
-                "League-Microbit/nezha-robot-template@vNOPE",
+                "League-Robotics/pxt-nezbot@vNOPE",
                 cache_dir=tmp_path,
                 fetch=fetch,
             )
@@ -374,7 +374,7 @@ class TestErrorFlows:
         )
         with pytest.raises(release_mod.GithubRateLimitedError):
             release_mod.resolve_hex(
-                "League-Microbit/nezha-robot-template",
+                "League-Robotics/pxt-nezbot",
                 cache_dir=tmp_path,
                 fetch=fetch,
             )
@@ -439,7 +439,7 @@ class TestGithubToken:
             }
         )
         release_mod.resolve_hex(
-            "League-Microbit/nezha-robot-template", cache_dir=tmp_path, fetch=fetch
+            "League-Robotics/pxt-nezbot", cache_dir=tmp_path, fetch=fetch
         )
         for _url, headers in fetch.calls:
             assert headers["Authorization"] == "Bearer sekrit-token"
@@ -453,7 +453,7 @@ class TestGithubToken:
             }
         )
         result = release_mod.resolve_hex(
-            "League-Microbit/nezha-robot-template", cache_dir=tmp_path, fetch=fetch
+            "League-Robotics/pxt-nezbot", cache_dir=tmp_path, fetch=fetch
         )
         assert result.hex_bytes == b"X"
         for _url, headers in fetch.calls:
@@ -468,7 +468,7 @@ class TestGithubToken:
             }
         )
         release_mod.resolve_hex(
-            "League-Microbit/nezha-robot-template",
+            "League-Robotics/pxt-nezbot",
             cache_dir=tmp_path,
             fetch=fetch,
             token="explicit-token",
@@ -505,7 +505,7 @@ def test_resolve_hex_uses_default_fetch_when_none_injected(tmp_path, monkeypatch
     monkeypatch.setattr(release_mod.urllib.request, "urlopen", fake_urlopen)
 
     result = release_mod.resolve_hex(
-        "League-Microbit/nezha-robot-template", cache_dir=tmp_path
+        "League-Robotics/pxt-nezbot", cache_dir=tmp_path
     )
     assert result.hex_bytes == b"REAL-DEFAULT-FETCH-BYTES"
     assert any(u.endswith("/releases/latest") for u in calls)
@@ -519,7 +519,7 @@ def test_resolve_hex_uses_default_fetch_when_none_injected(tmp_path, monkeypatch
 @pytest.mark.skip(
     reason=(
         "network smoke test -- hits the real GitHub API against "
-        "League-Microbit/nezha-robot-template and "
+        "League-Robotics/pxt-nezbot and "
         "League-Robotics/microbit-radio-relay. Run manually (remove this "
         "skip, or run with `pytest --no-skip` if configured) when "
         "sanity-checking against the real release pages; never part of "
@@ -528,7 +528,7 @@ def test_resolve_hex_uses_default_fetch_when_none_injected(tmp_path, monkeypatch
 )
 def test_live_nezha_and_radio_relay_asset_selection(tmp_path):
     nezha = release_mod.resolve_hex(
-        "League-Microbit/nezha-robot-template", cache_dir=tmp_path
+        "League-Robotics/pxt-nezbot", cache_dir=tmp_path
     )
     assert nezha.asset_name == "MICROBIT.hex"
 

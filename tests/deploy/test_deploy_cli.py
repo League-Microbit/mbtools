@@ -568,8 +568,8 @@ def test_deploy_repo_end_to_end_reports_new_announcement(tmp_path, daemon_socket
         tmp_path, daemon_socket_dir, [ANNOUNCEMENT, ANNOUNCEMENT]
     )
     release = ReleaseResult(
-        owner="League-Microbit",
-        repo="nezha-robot-template",
+        owner="League-Robotics",
+        repo="pxt-nezbot",
         tag="v0.20260919.7",
         asset_name="MICROBIT.hex",
         hex_path=Path("/fake/cache/MICROBIT.hex"),
@@ -588,7 +588,7 @@ def test_deploy_repo_end_to_end_reports_new_announcement(tmp_path, daemon_socket
                     "deploy",
                     "tovez",
                     "--repo",
-                    "League-Microbit/nezha-robot-template@v0.20260919.7",
+                    "League-Robotics/pxt-nezbot@v0.20260919.7",
                     "--socket",
                     socket_path,
                     "--reprobe-timeout",
@@ -599,7 +599,7 @@ def test_deploy_repo_end_to_end_reports_new_announcement(tmp_path, daemon_socket
 
         assert len(fake_resolve.calls) == 1
         assert fake_resolve.calls[0]["repo_ref"] == (
-            "League-Microbit/nezha-robot-template@v0.20260919.7"
+            "League-Robotics/pxt-nezbot@v0.20260919.7"
         )
         assert fake_resolve.calls[0]["asset_override"] is None
 

@@ -77,7 +77,7 @@ _GITHUB_API = "https://api.github.com"
 
 #: The one asset name every nezha-family firmware repo is expected to
 #: publish, and the one this module prefers whenever present -- see
-#: League-Microbit/nezha-robot-template's own release assets
+#: League-Robotics/pxt-nezbot's own release assets
 #: (``MICROBIT.hex``, ``MICROBIT.hex.txt``, a versioned ``.hex`` too) for
 #: the concrete shape this preference exists to resolve unambiguously.
 _PREFERRED_ASSET_NAME = "MICROBIT.hex"

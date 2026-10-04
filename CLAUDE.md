@@ -236,7 +236,7 @@ restart`. See `docs/service.md` §7.3.
 | Firmware | Repo | Announces as |
 |---|---|---|
 | Radio relay | `League-Robotics/microbit-radio-relay` (ignore the moving `latest` tag; use the newest versioned release) | `DEVICE:RADIOBRIDGE:relay:<name>:<serial>` |
-| Nezha robot | `League-Microbit/nezha-robot-template` | `device NEZHA2 robot <name> ...` |
+| Nezha robot | `League-Robotics/pxt-nezbot` | `device NEZHA2 robot <name> ...` |
 | Remote joystick | `League-Microbit/Remote-Joystick-Student` | `DEVICE:JOYSTICK:joystick:<name>:<serial>` |
 
 `gh release download -R <repo> -p MICROBIT.hex` fetches the newest one.
