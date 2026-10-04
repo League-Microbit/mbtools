@@ -426,3 +426,35 @@ class TestRunStreamedWithWatchdog:
         # "6.0" instead of "60.0") turning the production default into
         # something that would false-positive on a real flash.
         assert DEFAULT_NO_PROGRESS_TIMEOUT_S >= 30.0
+
+
+# ---------------------------------------------------------------------------
+# Production path: no injected runner
+# ---------------------------------------------------------------------------
+
+
+def test_without_an_injected_runner_the_flash_uses_the_recovering_logic(store, locks, tmp_path, monkeypatch):
+    """A locked board failed from robot-console with "pyocd flash failed
+    (exit 1)" while `mbdeploy` recovered it: only `mbdeploy` went through
+    `flashlogic`. The registry's own flash op must take the same path."""
+    import mbtools.registry.flashlogic as flashlogic
+
+    calls: list[tuple] = []
+
+    def fake_flash_hex(uid, hex_path, target_mcu, log, board_name, port, no_progress_timeout):
+        calls.append((uid, hex_path, board_name))
+        log("mass erase, then flash")
+        return 0
+
+    monkeypatch.setattr(flashlogic, "_flash_hex", fake_flash_hex)
+    locks.acquire(UID, KIND_FLASH, HOLDER)
+    op = FlashOp(locks=locks, store=store)
+    hex_path = _valid_hex_path(tmp_path)
+    seen: list[str] = []
+
+    result = op.flash_hex(UID, hex_path, log=seen.append)
+
+    assert result == FlashResult(success=True, exit_code=0)
+    assert [call[:2] for call in calls] == [(UID, hex_path)]
+    assert seen == ["mass erase, then flash"]
+    assert store.get(UID).flash_count == 1

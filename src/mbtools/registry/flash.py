@@ -432,6 +432,10 @@ class FlashOp:
     ) -> None:
         self._locks = locks
         self._store = store
+        # No injected runner means production: flash with the same
+        # retry and locked-device recovery `mbdeploy` uses.
+        self._recover = runner is None
+        self._no_progress_timeout = no_progress_timeout
         self._runner = (
             runner
             if runner is not None
@@ -519,7 +523,22 @@ class FlashOp:
 
         cmd = [*_PYOCD, "flash", "-t", self._target_mcu, "--uid", uid, hex_path]
         try:
-            exit_code = self._runner(cmd, log)
+            if self._recover:
+                # Imported here: flashlogic itself imports this module.
+                from mbtools.registry.flashlogic import _flash_hex
+
+                board_name = (record.device_name if record is not None else None) or uid
+                exit_code = _flash_hex(
+                    uid,
+                    hex_path,
+                    self._target_mcu,
+                    log,
+                    board_name,
+                    port,
+                    self._no_progress_timeout,
+                )
+            else:
+                exit_code = self._runner(cmd, log)
         except Exception as exc:  # the injected runner raised
             self._store.increment_flash_count(uid)
             return FlashResult(success=False, exit_code=None, error=str(exc))
