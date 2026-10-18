@@ -257,3 +257,20 @@ def test_list_sort_flags_are_mutually_exclusive(flags):
     with pytest.raises(SystemExit) as excinfo:
         main(["list", *flags])
     assert excinfo.value.code == 2
+
+
+# ---------------------------------------------------------------------------
+# --all: hide devices owned by an unreachable peer by default.
+# ---------------------------------------------------------------------------
+
+
+def test_unreachable_peer_row_predicate():
+    """Only a peer-owned row whose peer is currently unreachable is hidden
+    -- a local row (no host) or a reachable peer's row stays visible,
+    matching render._state_cell's 'peer unreachable' condition."""
+    from mbtools.registry.cli import _is_unreachable_peer_row
+
+    assert _is_unreachable_peer_row({"host": "graham", "peer_reachable": False})
+    assert not _is_unreachable_peer_row({"host": "graham", "peer_reachable": True})
+    assert not _is_unreachable_peer_row({"host": None})  # local device
+    assert not _is_unreachable_peer_row({})  # local device, no host key

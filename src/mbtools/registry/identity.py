@@ -36,6 +36,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -213,14 +214,79 @@ def read_device_id(
     flash), or the target refuses the connection (locked part) on both
     attempts -- never raises.
 
+    In production (no ``session_factory``) the pyOCD read runs in a
+    short-lived **subprocess** (``python -m mbtools.registry.identity
+    --read-device-id <uid>``), not in this process. pyOCD's own
+    ``Session.close()`` does not reliably release the probe's USB
+    interface in-process on macOS: a CMSIS-DAP interface opened for an
+    attach that then fails (exactly what a blank/locked board does) stays
+    claimed by this process until it exits. A daemon that re-probes a
+    firmware-less board every cycle therefore accumulates stale interface
+    claims (observed: a dozen within minutes) that make every later
+    ``pyocd flash`` of that board die with "Unable to claim interface",
+    even for the daemon's own flash. Running the read in a subprocess
+    makes the OS reclaim the interface the instant that subprocess exits,
+    so at most one brief claim exists while a read is actually in flight
+    -- never a persistent pile-up. This mirrors how flashing already runs
+    pyOCD out-of-process.
+
     ``session_factory`` is a test-only escape hatch (mirroring
     :func:`probe`'s own ``serial_factory``): a callable matching
     ``ConnectHelper.session_with_chosen_probe``'s call signature (keyword
     arguments ``unique_id``, ``target_override``, ``connect_mode``,
     ``blocking``, ``auto_unlock``) and return shape (a context manager
-    yielding an object with ``.target.read32(addr)``). Production code
-    leaves it unset, using pyOCD's real ``ConnectHelper`` when installed.
+    yielding an object with ``.target.read32(addr)``). When given, the
+    read runs in-process against it (no subprocess) so tests never shell
+    out or touch real hardware.
     """
+    if session_factory is not None:
+        return _read_device_id_inproc(uid, target_mcu, session_factory=session_factory)
+    if _ConnectHelper is None:  # pragma: no cover - pyocd is a declared dependency
+        return None
+    return _read_device_id_subprocess(uid, target_mcu)
+
+
+#: How long the isolated pyOCD read subprocess may run before it is given
+#: up on (two attach attempts on a slow/absent probe, plus startup). A
+#: failed read is a ``None``, never a hang that stalls the daemon loop.
+_READ_DEVICE_ID_TIMEOUT_S = 30.0
+
+
+def _read_device_id_subprocess(uid: str, target_mcu: str) -> int | None:
+    """Run :func:`_read_device_id_inproc` in a short-lived subprocess and
+    return its result, so the probe's USB interface is released on exit
+    (see :func:`read_device_id`'s own docstring). Returns ``None`` on any
+    failure -- a non-zero exit, a timeout, empty/garbled output, or the
+    subprocess machinery itself failing -- never raises."""
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "mbtools.registry.identity",
+             "--read-device-id", uid, "--target", target_mcu],
+            capture_output=True,
+            text=True,
+            timeout=_READ_DEVICE_ID_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    out = proc.stdout.strip()
+    if not out:
+        return None
+    try:
+        return int(out)
+    except ValueError:
+        return None
+
+
+def _read_device_id_inproc(
+    uid: str,
+    target_mcu: str,
+    *,
+    session_factory: Callable[..., Any] | None,
+) -> int | None:
+    """The actual pyOCD read (``read_device_id``'s original body). Runs in
+    whatever process calls it -- the isolated subprocess in production
+    (via :func:`_read_device_id_subprocess`), or the test process directly
+    when a ``session_factory`` is injected."""
     factory = session_factory
     if factory is None:
         if _ConnectHelper is None:  # pragma: no cover - pyocd is a declared dependency
@@ -509,3 +575,28 @@ def probe(
     finally:
         if ser is not None and getattr(ser, "is_open", False):
             ser.close()
+
+
+def _main(argv: list[str] | None = None) -> int:
+    """``python -m mbtools.registry.identity --read-device-id <uid>``: the
+    isolated worker :func:`_read_device_id_subprocess` spawns. Prints the
+    decimal ``FICR.DEVICEID[1]`` on success and exits 0; prints nothing
+    and exits 1 when the read fails. Kept deliberately tiny -- it exists
+    only so the probe's USB interface is released when this process exits
+    (see :func:`read_device_id`)."""
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="mbtools.registry.identity", add_help=True)
+    parser.add_argument("--read-device-id", dest="uid", required=True)
+    parser.add_argument("--target", dest="target", default=DEFAULT_TARGET_MCU)
+    args = parser.parse_args(argv)
+
+    device_id = _read_device_id_inproc(args.uid, args.target, session_factory=None)
+    if device_id is None:
+        return 1
+    print(device_id)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

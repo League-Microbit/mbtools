@@ -639,3 +639,84 @@ def test_probe_without_a_real_fileno_does_not_raise():
         settle_s=0,
     )
     assert result is not None
+
+
+# ---------------------------------------------------------------------------
+# read_device_id() production path: the real read is isolated in a
+# subprocess so the probe's USB interface is released on exit (the fix for
+# a daemon piling up stale CMSIS-DAP interface claims on a firmware-less
+# board until every later flash fails "Unable to claim interface").
+# ---------------------------------------------------------------------------
+
+
+def test_read_device_id_isolates_the_real_read_in_a_subprocess(monkeypatch):
+    """With no session_factory and pyocd importable, read_device_id shells
+    out to ``python -m mbtools.registry.identity --read-device-id`` instead
+    of opening a pyocd session in this process, and parses the child's
+    stdout."""
+    monkeypatch.setattr(identity, "_ConnectHelper", object())  # just "pyocd present"
+    calls: list[list[str]] = []
+
+    class _Proc:
+        stdout = "2314287040\n"
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        assert "--read-device-id" in cmd and _UID in cmd
+        assert kwargs.get("capture_output") and kwargs.get("text")
+        assert kwargs.get("timeout")  # never allowed to hang the daemon loop
+        return _Proc()
+
+    monkeypatch.setattr(identity.subprocess, "run", fake_run)
+    assert identity.read_device_id(_UID) == 2314287040
+    assert len(calls) == 1
+    assert calls[0][0] == identity.sys.executable
+
+
+def test_read_device_id_with_a_session_factory_never_spawns_a_subprocess(monkeypatch):
+    """The test seam stays in-process -- a provided session_factory must
+    never shell out (tests and hardware-free CI depend on that)."""
+    def explode(*a, **k):  # pragma: no cover - must not be called
+        raise AssertionError("subprocess.run must not be called with a session_factory")
+
+    monkeypatch.setattr(identity.subprocess, "run", explode)
+    factory = fake_chip_identity_session_factory(2314287040)
+    assert identity.read_device_id(_UID, session_factory=factory) == 2314287040
+
+
+@pytest.mark.parametrize(
+    "stdout, expected",
+    [("2314287040\n", 2314287040), ("", None), ("  \n", None), ("not-an-int", None)],
+)
+def test_read_device_id_subprocess_parses_child_stdout(monkeypatch, stdout, expected):
+    class _Proc:
+        pass
+
+    proc = _Proc()
+    proc.stdout = stdout
+    monkeypatch.setattr(identity.subprocess, "run", lambda *a, **k: proc)
+    assert identity._read_device_id_subprocess(_UID, "nrf52833") == expected
+
+
+def test_read_device_id_subprocess_swallows_spawn_failures(monkeypatch):
+    def boom(*a, **k):
+        raise identity.subprocess.TimeoutExpired(cmd="x", timeout=1)
+
+    monkeypatch.setattr(identity.subprocess, "run", boom)
+    assert identity._read_device_id_subprocess(_UID, "nrf52833") is None
+
+
+def test_identity_worker_main_prints_device_id(monkeypatch, capsys):
+    """The ``--read-device-id`` worker prints the decimal id and exits 0 on
+    success, and exits 1 (no output) when the read fails."""
+    monkeypatch.setattr(
+        identity, "_read_device_id_inproc", lambda uid, target, *, session_factory: 2314287040
+    )
+    assert identity._main(["--read-device-id", _UID]) == 0
+    assert capsys.readouterr().out.strip() == "2314287040"
+
+    monkeypatch.setattr(
+        identity, "_read_device_id_inproc", lambda uid, target, *, session_factory: None
+    )
+    assert identity._main(["--read-device-id", _UID]) == 1
+    assert capsys.readouterr().out.strip() == ""

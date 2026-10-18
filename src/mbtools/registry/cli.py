@@ -398,12 +398,28 @@ def cmd_list(args: argparse.Namespace) -> int:
         print(f"mbregistry: {exc.message}", file=sys.stderr)
         return exc.exit_code
 
+    # Hide rows you can't act on -- a device owned by a peer that is
+    # currently unreachable -- unless --all is given. Same "peer-owned +
+    # not peer_reachable" test render._state_cell uses for its "peer
+    # unreachable" label, so --all is exactly the set that would show
+    # that state.
+    if not getattr(args, "show_all", False):
+        devices = [d for d in devices if not _is_unreachable_peer_row(d)]
+
     if args.json:
         print(json.dumps(render_json(devices, sort_by=args.sort_by), indent=2))
         return EXIT_OK
 
     print(render_table(devices, sort_by=args.sort_by))
     return EXIT_OK
+
+
+def _is_unreachable_peer_row(device: dict[str, Any]) -> bool:
+    """True for a row owned by a peer that is currently unreachable -- the
+    rows ``mbregistry list`` hides unless ``--all`` is given, matching
+    :func:`mbtools.registry.render._state_cell`'s "peer unreachable"
+    condition exactly (a ``host`` set, ``peer_reachable`` false)."""
+    return device.get("host") is not None and not device.get("peer_reachable", True)
 
 
 # ---------------------------------------------------------------------------
@@ -1781,6 +1797,15 @@ def build_parser() -> argparse.ArgumentParser:
     list_p = sub.add_parser("list", help="list devices known to the registry")
     list_p.add_argument(
         "--json", action="store_true", help="emit machine-readable JSON"
+    )
+    list_p.add_argument(
+        "--all",
+        action="store_true",
+        dest="show_all",
+        help=(
+            "also show devices owned by an unreachable peer (hidden by "
+            "default -- you can't act on a board you can't reach)"
+        ),
     )
     list_p.add_argument(
         "--socket",

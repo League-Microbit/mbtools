@@ -33,6 +33,8 @@ the nRF52833 constant lives there.
 
 from __future__ import annotations
 
+import re
+import subprocess
 import sys
 from typing import Callable
 
@@ -119,6 +121,13 @@ _TRANSIENT_SIGNATURES = (
     "transfer fault",
     "transfer error",
     "dapaccess",
+    # The registry's own identity read briefly opens this same CMSIS-DAP
+    # interface (mbtools.registry.identity, now isolated in a subprocess
+    # so it releases on exit). If a flash lands in that narrow window the
+    # interface is momentarily busy; one blind retry clears it. A
+    # genuinely persistent holder (another registry, a browser's WebUSB
+    # tab) simply fails the retry too and is reported as-is.
+    "unable to claim interface",
 )
 
 
@@ -156,6 +165,73 @@ def _looks_locked(output: str) -> bool:
     erase."""
     lowered = output.lower()
     return any(sig in lowered for sig in _LOCKED_SIGNATURES)
+
+
+#: pyocd's wording when another program already owns the probe's USB
+#: interface -- it enumerates fine (so the board is clearly present) but
+#: cannot be opened for flashing. The overwhelmingly common cause on a
+#: workstation is a WebUSB browser tab (MakeCode / python.microbit.org),
+#: which claims the CMSIS-DAP interface exclusively.
+_CLAIM_BLOCKED_SIGNATURE = "unable to claim interface"
+
+
+def _looks_claim_blocked(output: str) -> bool:
+    return _CLAIM_BLOCKED_SIGNATURE in output.lower()
+
+
+#: Substrings (case-insensitive) that mark a USB-interface holder as a
+#: web browser -- the actionable "close your editor tab" case.
+_BROWSER_HINTS = (
+    "chrome", "chromium", "safari", "firefox", "edge", "brave", "opera", "arc",
+)
+
+
+def usb_interface_blocker(uid: str) -> str | None:
+    """Best-effort (macOS only): name the program currently holding
+    ``uid``'s probe USB interface, so a "could not claim the probe"
+    failure can say *who* has it rather than surfacing a bare pyocd error.
+    A browser almost always means a WebUSB editor tab (MakeCode /
+    python.microbit.org) that owns the CMSIS-DAP interface exclusively.
+
+    Returns ``None`` off macOS, on any ``ioreg`` failure, or when only
+    this toolchain's own short-lived Python probe processes hold it (those
+    are the registry's own identity reads -- transient and ours, never the
+    thing to tell an operator to go close)."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        out = subprocess.run(
+            ["ioreg", "-w0", "-l", "-r", "-c", "IOUSBHostInterface"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    holders: list[str] = []
+    on_board = False
+    for line in out.splitlines():
+        if '"USB Serial Number"' in line:
+            on_board = uid in line
+        elif on_board and "IOUserClientCreator" in line:
+            match = re.search(r'pid \d+, (.+?)"', line)
+            if match:
+                holders.append(match.group(1).strip())
+
+    if any(hint in h.lower() for h in holders for hint in _BROWSER_HINTS):
+        return (
+            "could not claim the probe -- a browser tab has this board open over "
+            "WebUSB, almost certainly the MakeCode or micro:bit Python editor. "
+            "Close that browser tab, then flash again."
+        )
+    others = sorted({h for h in holders if "python" not in h.lower()})
+    if others:
+        return (
+            "could not claim the probe -- another program has this board's USB "
+            f"interface open ({', '.join(others[:3])}). Close it, then flash again."
+        )
+    return None
 
 
 def _run_streamed(
@@ -361,6 +437,23 @@ def _flash_hex(
                 "not run until it is successfully reflashed.",
             )
             return rc
+    elif rc != 0 and _looks_claim_blocked(output):
+        # The probe enumerates but its USB interface is already owned by
+        # another program (the one retry above didn't clear it, so it is
+        # not the registry's own brief identity read). Name the holder --
+        # on a workstation this is nearly always a WebUSB browser tab
+        # (MakeCode) -- instead of surfacing a bare "exit 1". Never
+        # mass-erase: nothing is wrong with the board's flash.
+        blocker = usb_interface_blocker(uid)
+        _log(
+            log,
+            f"Error: {blocker}"
+            if blocker is not None
+            else "Error: could not claim the probe -- another program (often a "
+            "WebUSB browser tab such as MakeCode) has this board open. Close it, "
+            "then flash again.",
+        )
+        return rc
     elif rc != 0:
         # No recognized signature -- neither transient (already retried
         # above) nor locked. Fail as-is, without ever mass-erasing: see
