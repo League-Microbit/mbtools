@@ -158,6 +158,7 @@ from typing import Any, Callable
 from mbtools.common import PortInfo
 from mbtools.registry import identity
 from mbtools.registry.locks import LockManager
+from mbtools.registry.virtual import is_virtual, is_virtual_uid
 from mbtools.registry.store import (
     STATE_DISCONNECTED,
     DeviceRecord,
@@ -329,6 +330,10 @@ class Daemon:
         only happens once the device is actually seen attached again, in
         :meth:`run_once`.
         """
+        if is_virtual_uid(uid):
+            # A registered virtual board never re-enumerates on USB, so a
+            # pending re-probe would expire and mark it known-blank.
+            return
         deadline = self._now() + self._flash_reprobe_timeout_s
         self._flash_pending[uid] = deadline
         logger.info(
@@ -426,7 +431,13 @@ class Daemon:
             previously_attached = {
                 record.uid
                 for record in self._store.list_devices()
-                if record.host is None and record.state != STATE_DISCONNECTED
+                if record.host is None
+                and record.state != STATE_DISCONNECTED
+                # Registered virtual boards (nezsim sprint 015 ticket
+                # 001) are never on a USB port: a scan can neither see
+                # nor "lose" them, so they stay out of the diff or the
+                # next cycle would mark every simulator disconnected.
+                and not is_virtual(record)
             }
             # Every uid this instance may call _maybe_probe on below: a
             # uid already locally owned and still attached, plus whatever

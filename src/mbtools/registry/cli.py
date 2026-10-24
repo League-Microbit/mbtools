@@ -717,6 +717,7 @@ def assemble_daemon_and_api(
             name_clear_callback=name_clear_callback,
             poll_callback=poll_callback,
             peer_resync_callback=peer_resync_callback,
+            event_callback=event_callback,
         )
     return daemon, api
 

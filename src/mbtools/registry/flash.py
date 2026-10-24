@@ -445,6 +445,19 @@ class FlashOp:
         )
         self._target_mcu = target_mcu
 
+    def validate_hex(self, hex_path: str) -> None:
+        """The pre-flight hex checks :meth:`flash_hex` makes (Universal
+        Hex reduction for this target, then an ``intelhex`` parse),
+        without touching any board. Raises :class:`HexValidationError`.
+        Used to vet a hex before forwarding it to a registered virtual
+        board's endpoint (nezsim sprint 015 ticket 001).
+        """
+        try:
+            with normalized_hex(hex_path, self._target_mcu) as flash_path:
+                _validate_hex(flash_path)
+        except UniversalHexError as exc:
+            raise HexValidationError(hex_path, str(exc)) from exc
+
     def flash_hex(self, uid: str, hex_path: str, log: Callable[[str], None]) -> FlashResult:
         """Flash ``hex_path`` to the board behind ``uid`` over SWD.
 

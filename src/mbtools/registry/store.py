@@ -88,6 +88,7 @@ from typing import Callable
 
 from mbtools.registry.identity import ProbeResult, short_uid
 from mbtools.registry.paths import default_db_path
+from mbtools.registry.virtual import VIRTUAL_PORT_PREFIX, VIRTUAL_VID_PID, is_virtual
 from mbtools.relay import naming
 
 logger = logging.getLogger(__name__)
@@ -877,6 +878,73 @@ class Store:
             assert record is not None
             return record
 
+    def upsert_virtual(
+        self, uid: str, name: str, role: str, serial: str
+    ) -> DeviceRecord:
+        """Insert (replacing any stale row for ``uid``) the row of a
+        *registered virtual board* (nezsim sprint 015 ticket 001): an
+        ordinary locally-owned ``connected`` device row with
+        ``port="virtual:<name>"``, ``vid_pid="virtual"``, ``common_name
+        ="robot"`` and the announcement-derived fields set from the
+        registration, so ``list``/``find``/``lock``/``watch`` need no
+        special casing. ``short_uid`` is the full uid (a ``short_uid``
+        slice of ``sim-<name>`` could collide with another token).
+        ``last_probe`` is set so nothing ever tries to probe the row.
+        """
+        with self._lock:
+            now = self._now()
+            self._conn.execute("DELETE FROM device WHERE uid = ?", (uid,))
+            self._conn.execute(
+                """
+                INSERT INTO device (
+                    uid, short_uid, port, vid_pid, role, common_name,
+                    device_name, serial_payload, state, host,
+                    flash_count, first_seen, last_seen, last_probe
+                ) VALUES (?, ?, ?, ?, ?, 'robot', ?, ?, ?, NULL, 0, ?, ?, ?)
+                """,
+                (
+                    uid,
+                    uid,
+                    VIRTUAL_PORT_PREFIX + name,
+                    VIRTUAL_VID_PID,
+                    role,
+                    name,
+                    serial,
+                    STATE_CONNECTED,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            self._conn.commit()
+            record = self.get(uid)
+            assert record is not None
+            return record
+
+    def remove_virtual(self, uid: str) -> DeviceRecord | None:
+        """Delete a registered virtual board's row (a detach removes the
+        row outright: unlike hardware there is no port to be "gone
+        from"). Refuses to touch a non-virtual row. Returns the removed
+        record, or ``None`` if there was nothing to remove."""
+        with self._lock:
+            record = self.get(uid)
+            if record is None or not is_virtual(record):
+                return None
+            self._conn.execute("DELETE FROM device WHERE uid = ?", (uid,))
+            self._conn.commit()
+            return record
+
+    def sweep_virtual(self) -> list[str]:
+        """Delete every virtual row (registry startup: no registration
+        survives a restart, since the registering connections are gone).
+        Returns the removed uids."""
+        with self._lock:
+            uids = [r.uid for r in self.list_devices() if is_virtual(r)]
+            for uid in uids:
+                self._conn.execute("DELETE FROM device WHERE uid = ?", (uid,))
+            self._conn.commit()
+            return uids
+
     def increment_flash_count(self, uid: str) -> DeviceRecord:
         """Bump ``flash_count`` by one -- called by ticket 007's flash op
         on completion.
@@ -1156,7 +1224,10 @@ class Store:
                 "SELECT * FROM device WHERE host IS NULL AND state != ?",
                 (STATE_DISCONNECTED,),
             ).fetchall()
-            return [_row_to_record(row) for row in rows]
+            # Registered virtual boards are never advertised to peers
+            # (nezsim sprint 015 ticket 001): a simulator registered here
+            # exists on this registry only.
+            return [r for r in map(_row_to_record, rows) if not is_virtual(r)]
 
     def list_peers(self) -> list[PeerRecord]:
         """Every known peer, reachable or not."""

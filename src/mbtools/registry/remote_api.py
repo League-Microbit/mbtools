@@ -182,6 +182,7 @@ from mbtools.registry._api_base import _WATCH, BaseAPIServer, _error
 from mbtools.registry.eventbus import EventBus
 from mbtools.registry.flashlogic import flash_hex
 from mbtools.registry.locks import KIND_FLASH, HolderRef, LockManager
+from mbtools.registry.virtual import is_virtual
 from mbtools.registry.store import DeviceRecord, Store
 from mbtools.serial.connect import BAUD_RATE, BREAK_DURATION, OPEN_SETTLE
 
@@ -841,5 +842,9 @@ class RemoteAPIServer(BaseAPIServer):
         way :meth:`_list_visible_devices` scopes ``list`` -- a
         remote-owned row (this registry's cached view of some *other*
         peer's device) is ``not_found`` here, exactly as if it didn't
-        exist (Decision 8: this API never forwards to a third host)."""
-        return record.host is None
+        exist (Decision 8: this API never forwards to a third host).
+
+        A registered virtual board (nezsim sprint 015 ticket 001) is
+        also ``not_found`` here: simulators are visible on the local
+        socket only, never the remote TCP port."""
+        return record.host is None and not is_virtual(record)

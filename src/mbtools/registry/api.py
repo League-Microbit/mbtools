@@ -115,6 +115,7 @@ sprint-1 trade-off it replaces.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -125,8 +126,32 @@ import threading
 from pathlib import Path
 from typing import Any, Callable
 
-from mbtools.common import CODE_INVALID_REQUEST, CODE_NOT_FOUND, CODE_NOT_LOCKED
-from mbtools.registry._api_base import _WATCH, BaseAPIServer, _error, _holder_wire_dict
+import base64
+
+from mbtools.common import (
+    CODE_INTERNAL_ERROR,
+    CODE_INVALID_REQUEST,
+    CODE_NAME_IN_USE,
+    CODE_NAME_RESERVED,
+    CODE_NOT_FOUND,
+    CODE_NOT_LOCKED,
+)
+from mbtools.registry._api_base import (
+    _ENDPOINT_FLASH_READ_TIMEOUT_S,
+    _WATCH,
+    BaseAPIServer,
+    _EndpointConn,
+    _EndpointError,
+    _error,
+    _holder_wire_dict,
+)
+from mbtools.registry.virtual import (
+    VirtualBoards,
+    VirtualRegistration,
+    is_reserved_name,
+    is_virtual,
+    validate_registration,
+)
 from mbtools.registry.eventbus import EventBus
 from mbtools.registry.flash import FlashOp, HexValidationError
 from mbtools.registry.locks import KIND_FLASH, HolderRef, LockManager
@@ -349,8 +374,18 @@ class RegistryAPIServer(BaseAPIServer):
         break_duration_s: float | None = None,
         poll_callback: Callable[[], None] | None = None,
         peer_resync_callback: Callable[[], None] | None = None,
+        event_callback: Callable[[str, DeviceRecord], None] | None = None,
     ) -> None:
         self.socket_path = Path(socket_path)
+        # nezsim sprint 015 ticket 001: registered virtual boards. The
+        # event callback is the same one the Daemon fires for hardware
+        # (``cli.assemble_registry``'s bus + peering fan-out); it is
+        # called with ``"attach"``/``"identity"`` on registration and
+        # ``"detach"`` when the registering connection ends. ``None``
+        # (the default) just means no events are published.
+        self._event_callback = event_callback
+        self._virtual = VirtualBoards()
+        self._virtual_streams = {}
         self._store = store
         self._locks = locks
         self._flash_op = flash_op
@@ -444,6 +479,11 @@ class RegistryAPIServer(BaseAPIServer):
         connect, only which pid holds which lock -- so world-writable
         matches its actual security model rather than narrowing it.
         """
+        # Startup sweep (nezsim sprint 015 ticket 001): no registered
+        # virtual board survives a restart -- its registering connection
+        # died with the previous process -- so drop any stale rows.
+        with self._lock:
+            self._store.sweep_virtual()
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
         if self.socket_path.exists():
             self.socket_path.unlink()
@@ -612,6 +652,7 @@ class RegistryAPIServer(BaseAPIServer):
         wfile = conn.makefile("w", encoding="utf-8", newline="\n")
         try:
             stream_record: DeviceRecord | None = None
+            registration: VirtualRegistration | None = None
             watch_requested = False
             for raw_line in rfile:
                 line = raw_line.strip()
@@ -626,6 +667,11 @@ class RegistryAPIServer(BaseAPIServer):
                     # handoff).
                     watch_requested = True
                     break
+                if isinstance(result, VirtualRegistration):
+                    # ``register_board`` was accepted and acked: this
+                    # connection is now the board's lifetime handle.
+                    registration = result
+                    break
                 if result is not None:
                     stream_record = result
                     # Sprint 008 ticket 004: ``stream`` was accepted --
@@ -635,7 +681,9 @@ class RegistryAPIServer(BaseAPIServer):
                     # goes back to reading JSON request lines from
                     # `rfile` after this, ever, on any exit path.
                     break
-            if watch_requested:
+            if registration is not None:
+                self._hold_registration(conn, registration)
+            elif watch_requested:
                 self._handle_watch(wfile)
             elif stream_record is not None:
                 self._handle_stream(conn, holder, acquired_uids, stream_record)
@@ -752,6 +800,10 @@ class RegistryAPIServer(BaseAPIServer):
             resp = self._op_watch()
             self._write(wfile, resp)
             return _WATCH
+        elif op == "register_board":
+            resp, reg = self._op_register_board(req, conn)
+            self._write(wfile, resp)
+            return reg
         else:
             resp = _error(CODE_INVALID_REQUEST, f"unknown op {op!r}")
         self._write(wfile, resp)
@@ -765,6 +817,160 @@ class RegistryAPIServer(BaseAPIServer):
     # remote-flash territory) and `force_unlock` (sprint 008 ticket 003,
     # local-socket only -- never shared into `_api_base.py`/dispatched by
     # `remote_api.py`) stay here.
+
+    # -- registered virtual boards (nezsim sprint 015 ticket 001) -----------
+
+    def _op_register_board(
+        self, req: dict[str, Any], conn: socket.socket
+    ) -> tuple[dict[str, Any], VirtualRegistration | None]:
+        """``register_board``: register a simulated board under its own
+        name, served from an endpoint the registrant provides. Local
+        socket only (``remote_api`` never dispatches it).
+
+        Returns ``(response, registration)``; ``registration`` is non-
+        ``None`` only on success, after which the caller acks and hands
+        the connection to :meth:`_hold_registration` -- the connection is
+        the board's lifetime handle.
+        """
+        try:
+            reg = validate_registration(req)
+        except ValueError as exc:
+            return _error(CODE_INVALID_REQUEST, str(exc)), None
+        if is_reserved_name(reg.name):
+            return (
+                _error(
+                    CODE_NAME_RESERVED,
+                    f"{reg.name!r} looks like a real robot name; "
+                    "pick a name that is not five letters of consonant-vowel pattern",
+                ),
+                None,
+            )
+        reg.conn = conn
+        with self._lock:
+            if self._virtual is None or self._virtual.name_in_use(reg.name):
+                return (
+                    _error(CODE_NAME_IN_USE, f"a board named {reg.name!r} is already registered"),
+                    None,
+                )
+            self._virtual.add(reg)
+            record = self._store.upsert_virtual(reg.uid, reg.name, reg.role, reg.serial)
+            device = self._device_dict(record)
+        # Events outside the shared lock (a callback may do network I/O).
+        self._fire_virtual_events(("attach", "identity"), record)
+        return {"ok": True, "uid": reg.uid, "device": device}, reg
+
+    def _fire_virtual_events(
+        self, event_types: tuple[str, ...], record: DeviceRecord
+    ) -> None:
+        if self._event_callback is None:
+            return
+        for event_type in event_types:
+            try:
+                self._event_callback(event_type, record)
+            except Exception:  # a broken subscriber must not break registration
+                logger.exception("api: event callback failed for %s", event_type)
+
+    def _hold_registration(self, conn: socket.socket, reg: VirtualRegistration) -> None:
+        """Read and discard until the registering connection ends, then
+        detach the board."""
+        try:
+            while conn.recv(4096):
+                pass
+        except OSError:
+            pass
+        finally:
+            self._detach_virtual(reg)
+
+    def _detach_virtual(self, reg: VirtualRegistration) -> None:
+        """Remove a registered board: release any lock on it (closing the
+        holder's connection, so a spliced stream ends), drop the row, and
+        publish ``detach``."""
+        holder_conn: socket.socket | None = None
+        with self._lock:
+            if self._virtual is None or not self._virtual.remove(reg):
+                return
+            status = self._locks.status(reg.uid)
+            if status is not None:
+                self._locks.release(reg.uid, status.holder)
+            holder_conn = self._uid_connections.pop(reg.uid, None)
+            record = self._store.remove_virtual(reg.uid)
+        if holder_conn is not None:
+            with contextlib.suppress(OSError):
+                holder_conn.shutdown(socket.SHUT_RDWR)
+        if record is not None:
+            self._fire_virtual_events(("detach",), record)
+
+    def _flash_virtual(
+        self,
+        record: DeviceRecord,
+        hex_path: str,
+        log: Callable[[str], None],
+    ) -> dict[str, Any]:
+        """Flash a registered board: validate the hex as hardware does,
+        then forward ``lock``/``send_hex``/``flash`` to its endpoint,
+        relaying ``log`` lines and the terminal ``result`` verbatim.
+        Returns the terminal result message (the caller releases the
+        flash lock). ``flash_count`` is bumped once the endpoint's
+        ``flash`` ran, whatever it reported.
+        """
+        def fail(code: str, message: str, **extra: Any) -> dict[str, Any]:
+            payload = _error(code, message, **extra)
+            payload.update({"type": "result", "success": False, "exit_code": None})
+            return payload
+
+        try:
+            self._flash_op.validate_hex(hex_path)
+            data = Path(hex_path).read_bytes()
+        except HexValidationError as exc:
+            return fail(CODE_INVALID_REQUEST, str(exc))
+        except OSError as exc:
+            return fail(CODE_INVALID_REQUEST, f"cannot read hex file {hex_path!r}: {exc}")
+        endpoint = self._virtual_endpoint(record)
+        if endpoint is None:
+            return fail(CODE_NOT_FOUND, f"{record.uid} is not registered any more")
+        ep: _EndpointConn | None = None
+        try:
+            ep = _EndpointConn.dial(endpoint)
+            ack = ep.call({"op": "lock", "uid": record.uid, "kind": "flash"})
+            if not ack.get("ok"):
+                return self._endpoint_failure(ack)
+            ack = ep.call(
+                {"op": "send_hex", "data": base64.b64encode(data).decode("ascii")}
+            )
+            if not ack.get("ok") or not ack.get("hex_path"):
+                return self._endpoint_failure(ack)
+            ep.sock.settimeout(_ENDPOINT_FLASH_READ_TIMEOUT_S)
+            ep.send({"op": "flash", "uid": record.uid, "hex_path": ack["hex_path"]})
+            try:
+                while True:
+                    msg = ep.read()
+                    if msg.get("type") == "log":
+                        self._write_log(log, msg)
+                        continue
+                    return msg  # the terminal result, verbatim
+            finally:
+                with self._lock:
+                    if self._store.get(record.uid) is not None:
+                        self._store.increment_flash_count(record.uid)
+        except _EndpointError as exc:
+            return fail(CODE_INTERNAL_ERROR, str(exc))
+        finally:
+            if ep is not None:
+                ep.close()
+
+    @staticmethod
+    def _write_log(log: Callable[[str], None], msg: dict[str, Any]) -> None:
+        line = msg.get("line")
+        log(line if isinstance(line, str) else str(line))
+
+    @staticmethod
+    def _endpoint_failure(ack: dict[str, Any]) -> dict[str, Any]:
+        """Turn an endpoint's ``{"ok": false, ...}`` pre-flash refusal into
+        a terminal ``flash`` result (relayed code/error preserved)."""
+        out = dict(ack)
+        out["ok"] = False
+        out.update({"type": "result", "success": False, "exit_code": None})
+        return out
 
     def _op_force_unlock(self, req: dict[str, Any]) -> dict[str, Any]:
         """``force_unlock(uid)`` (sprint 008, ticket 003): drop ``uid``'s
@@ -886,6 +1092,19 @@ class RegistryAPIServer(BaseAPIServer):
             detached = self._detached_error(record)
             if detached is not None:
                 return _flash_error(detached["code"], detached["error"])
+
+        if is_virtual(record):
+            # Registered virtual board: forward to its endpoint instead
+            # of running pyocd. The flash lock is released afterwards,
+            # exactly as for hardware.
+            try:
+                terminal = self._flash_virtual(record, str(hex_path), log)
+            finally:
+                with self._lock:
+                    self._locks.release(uid, _local_holder(pid))
+                    acquired_uids.discard(uid)
+                    self._uid_connections.pop(uid, None)
+            return terminal
 
         # The run itself: deliberately outside the shared lock (see the
         # module docstring and this method's own docstring). ``uid``'s

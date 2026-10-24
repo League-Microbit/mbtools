@@ -92,6 +92,7 @@ from typing import Any, Callable
 
 from mbtools.common import (
     CODE_AMBIGUOUS_NAME,
+    CODE_INTERNAL_ERROR,
     CODE_INVALID_REQUEST,
     CODE_LOCKED,
     CODE_NOT_FOUND,
@@ -115,6 +116,7 @@ from mbtools.registry.store import (
     Entry,
     Store,
 )
+from mbtools.registry.virtual import VirtualBoards, is_virtual
 from mbtools.registry.stream_frame import (
     FRAME_BREAK,
     FRAME_CLOSE,
@@ -167,6 +169,77 @@ EVENT_PEER_REMOVED = "peer_removed"
 #: How often an open stream re-checks that its board is still attached on
 #: the same port (:meth:`BaseAPIServer._stream_still_valid`).
 _STREAM_ATTACH_CHECK_S = 1.0
+
+
+#: Seconds allowed to connect to, and handshake with, a registered
+#: board's endpoint (``lock``/``stream``/``send_hex`` acks).
+_ENDPOINT_HANDSHAKE_TIMEOUT_S = 10.0
+#: Seconds one read of a registered board's ``flash`` output may block.
+_ENDPOINT_FLASH_READ_TIMEOUT_S = 600.0
+
+
+class _EndpointError(Exception):
+    """A registered board's endpoint was unreachable, hung up, or spoke
+    nonsense (as opposed to answering ``{"ok": false, ...}``, which is
+    relayed verbatim)."""
+
+
+class _EndpointConn:
+    """One JSON-lines connection to a registered board's endpoint.
+
+    ``buf`` holds any bytes read past the last newline -- after a
+    ``stream`` ack those are already raw stream bytes and must be
+    forwarded to the client, never dropped.
+    """
+
+    def __init__(self, sock: socket.socket) -> None:
+        self.sock = sock
+        self.buf = b""
+
+    @classmethod
+    def dial(cls, endpoint: tuple[str, int]) -> "_EndpointConn":
+        try:
+            sock = socket.create_connection(
+                endpoint, timeout=_ENDPOINT_HANDSHAKE_TIMEOUT_S
+            )
+        except OSError as exc:
+            raise _EndpointError(
+                f"cannot reach the board's endpoint {endpoint[0]}:{endpoint[1]}: {exc}"
+            ) from exc
+        return cls(sock)
+
+    def send(self, req: dict[str, Any]) -> None:
+        try:
+            self.sock.sendall((json.dumps(req) + "\n").encode("utf-8"))
+        except OSError as exc:
+            raise _EndpointError(f"board endpoint write failed: {exc}") from exc
+
+    def read(self) -> dict[str, Any]:
+        """Read one JSON line (blocking per the socket's timeout)."""
+        while b"\n" not in self.buf:
+            try:
+                chunk = self.sock.recv(65536)
+            except OSError as exc:
+                raise _EndpointError(f"board endpoint read failed: {exc}") from exc
+            if not chunk:
+                raise _EndpointError("board endpoint closed the connection")
+            self.buf += chunk
+        line, _, self.buf = self.buf.partition(b"\n")
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise _EndpointError("board endpoint sent a malformed line") from exc
+        if not isinstance(msg, dict):
+            raise _EndpointError("board endpoint sent a non-object line")
+        return msg
+
+    def call(self, req: dict[str, Any]) -> dict[str, Any]:
+        self.send(req)
+        return self.read()
+
+    def close(self) -> None:
+        with contextlib.suppress(OSError):
+            self.sock.close()
 
 
 def _entry_dict(entry: Entry) -> dict[str, Any]:
@@ -308,6 +381,16 @@ class BaseAPIServer:
     #: circular-import reason) whenever a caller omits the corresponding
     #: parameter.
     _serial_factory: "Callable[..., Any] | None" = None
+
+    #: Registered virtual boards (nezsim sprint 015 ticket 001): the live
+    #: registration table, set only by the local socket server
+    #: (``api.RegistryAPIServer``); ``None`` on the remote TCP server,
+    #: which never sees a virtual row (``_device_visible``).
+    _virtual: "VirtualBoards | None" = None
+    #: thread id -> the endpoint connection :meth:`_op_stream_precheck`
+    #: opened for a virtual-board ``stream``, picked up by
+    #: :meth:`_handle_stream` on the same connection-handler thread.
+    _virtual_streams: "dict[int, _EndpointConn]"
     _stream_baud: int
     _stream_settle: float
     _break_duration: float
@@ -395,6 +478,9 @@ class BaseAPIServer:
             peer = self._store.get_peer(record.host)
             d["endpoint"] = peer.endpoint if peer is not None else None
             d["peer_reachable"] = peer.reachable if peer is not None else False
+        # Additive (nezsim sprint 015 ticket 001): true only for a
+        # registered virtual board.
+        d["simulated"] = is_virtual(record)
         return d
 
     def _resolve_visible(
@@ -833,7 +919,107 @@ class BaseAPIServer:
             detached = self._detached_error(record)
             if detached is not None:
                 return detached, None
-            return {"ok": True}, record
+            lock_kind = status.kind
+        if is_virtual(record):
+            # Dial the board's endpoint before acking, so an endpoint
+            # refusal reaches the client as the response to ``stream``.
+            return self._virtual_stream_open(record, lock_kind)
+        return {"ok": True}, record
+
+    # -- registered virtual boards: routing (nezsim sprint 015 ticket 001) --
+
+    def _virtual_endpoint(self, record: DeviceRecord) -> tuple[str, int] | None:
+        """The endpoint a registered board is served from, or ``None`` if
+        the registration is gone."""
+        if self._virtual is None:
+            return None
+        reg = self._virtual.by_uid(record.uid)
+        return reg.endpoint if reg is not None else None
+
+    def _virtual_stream_open(
+        self, record: DeviceRecord, lock_kind: str
+    ) -> tuple[dict[str, Any], DeviceRecord | None]:
+        """Dial a virtual board's endpoint and perform ``lock`` then
+        ``stream`` there. On success the open connection is parked in
+        ``_virtual_streams`` (keyed by this thread) for
+        :meth:`_handle_stream`; an endpoint ``{"ok": false}`` ack is
+        returned to the client verbatim.
+        """
+        endpoint = self._virtual_endpoint(record)
+        if endpoint is None:
+            return (
+                _error(CODE_NOT_FOUND, f"{record.uid} is not registered any more"),
+                None,
+            )
+        ep: _EndpointConn | None = None
+        try:
+            ep = _EndpointConn.dial(endpoint)
+            ack = ep.call({"op": "lock", "uid": record.uid, "kind": lock_kind})
+            if not ack.get("ok"):
+                ep.close()
+                return ack, None
+            ack = ep.call({"op": "stream", "uid": record.uid})
+            if not ack.get("ok"):
+                ep.close()
+                return ack, None
+        except _EndpointError as exc:
+            if ep is not None:
+                ep.close()
+            return _error(CODE_INTERNAL_ERROR, str(exc)), None
+        ep.sock.settimeout(None)
+        self._virtual_streams[threading.get_ident()] = ep
+        return {"ok": True}, record
+
+    def _handle_virtual_stream(
+        self,
+        conn: socket.socket,
+        holder: HolderRef,
+        acquired_uids: set[str],
+        record: DeviceRecord,
+        ep: _EndpointConn,
+    ) -> None:
+        """Splice raw bytes between the client and a virtual board's
+        endpoint until either side closes. Frames are not parsed. Always
+        releases the stream lock afterwards, like the hardware path."""
+        uid = record.uid
+
+        def _pump_endpoint_to_client() -> None:
+            try:
+                if ep.buf:
+                    conn.sendall(ep.buf)
+                    ep.buf = b""
+                while True:
+                    data = ep.sock.recv(65536)
+                    if not data:
+                        break
+                    conn.sendall(data)
+            except OSError:
+                pass
+            finally:
+                # Unblock the client->endpoint loop below.
+                with contextlib.suppress(OSError):
+                    conn.shutdown(socket.SHUT_RDWR)
+
+        reader = threading.Thread(
+            target=_pump_endpoint_to_client, name=f"vstream-{uid}", daemon=True
+        )
+        reader.start()
+        try:
+            while True:
+                data = conn.recv(65536)
+                if not data:
+                    break
+                ep.sock.sendall(data)
+        except (ConnectionError, OSError):
+            pass
+        finally:
+            with contextlib.suppress(OSError):
+                ep.sock.shutdown(socket.SHUT_RDWR)
+            reader.join(timeout=2.0)
+            ep.close()
+            with self._lock:
+                self._locks.release(uid, holder)
+            acquired_uids.discard(uid)
 
     def _handle_stream(
         self,
@@ -876,6 +1062,16 @@ class BaseAPIServer:
         # module graph has long since finished loading, so this import
         # is a cheap sys.modules lookup, not a real re-import.
         from mbtools.serial.connect import ConnectError, open_no_reboot
+
+        if is_virtual(record):
+            ep = self._virtual_streams.pop(threading.get_ident(), None)
+            if ep is None:  # pragma: no cover - precheck always parks one
+                with self._lock:
+                    self._locks.release(record.uid, holder)
+                acquired_uids.discard(record.uid)
+                return
+            self._handle_virtual_stream(conn, holder, acquired_uids, record, ep)
+            return
 
         uid = record.uid
         port = record.port

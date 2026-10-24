@@ -67,6 +67,7 @@ Every request is a JSON object with an `"op"` field:
 | `names_set` | `name`, `channel`, `group` | explicit assignment, `source: "registry"` — overwrites any existing row |
 | `names_clear` | `name` | drop `name`'s row, if any (not an error if it has none) |
 | `names_list` | — | every `name_registry` row, each annotated with its own `conflict`/`channel_conflict` names |
+| `register_board` | `name`, `endpoint`, `role`, `serial`, `simulated` | nezsim sprint 015, ticket 001: **local Unix socket only** (never the remote TCP port, never the Windows pipe) — register a *simulated* board served from an endpoint you provide; the connection is the board's lifetime handle; see "`register_board`" below |
 | `watch` | — | sprint 008, ticket 001: no precondition — after `{"ok": true}`, the connection receives one JSON line per subsequent event (change-only, no snapshot) until it closes; see "`watch`" below |
 
 `uid` accepts any of uid / short_uid / device_name for every device op
@@ -95,6 +96,8 @@ Every non-streaming response is one of:
 | `invalid_request` | malformed JSON, missing/bad fields, or an unknown `op` |
 | `internal_error` | reserved for an unexpected server-side failure (not raised by normal dispatch paths as of this ticket) |
 | `ambiguous_name` | sprint 003, ticket 006: a bare device-name token (no `@host` suffix) matches devices on more than one host — `store.find`'s `AmbiguousNameError` (ticket 001), translated here since `list`/`find`/`lock`/`unlock`/`mark_flashed` (both the local Unix API and the remote TCP API — they share one dispatch implementation, `registry._api_base`) are `store.find`'s first real API-layer callers. The response also carries `"hosts": [...]` (`null` for the local/`NULL` host), for a client to build a `name@host` suggestion from. |
+| `name_in_use` | nezsim sprint 015, ticket 001, `register_board`: a live registered board already holds that name (case-insensitive) |
+| `name_reserved` | nezsim sprint 015, ticket 001, `register_board`: the name matches the real-robot pattern (`mbtools.relay.naming` CVCVC rule, case-insensitive after the firmware's trim/lowercase), so a simulator can never be mistaken for a physical robot |
 | `unauthorized` | sprint 003, ticket 006, remote TCP API only: `--auth-token`/`$MBREGISTRY_TOKEN` is configured and this connection's first message didn't carry a matching token |
 
 ### Lock holder wire shape
@@ -145,7 +148,8 @@ case for a resolved holder. Neither field ever participates in
    "chip_identity_name": "...", "chip_identity_serial": 0,
    "first_seen": 0.0, "last_seen": 0.0, "last_probe": 0.0,
    "lock_kind": "serial|relay|flash|debug|null", "lock_pid": 1234,
-   "lock_label": "alice-laptop|null", "lock_since": 1732400000.0}
+   "lock_label": "alice-laptop|null", "lock_since": 1732400000.0,
+   "simulated": false}
 ]}
 ```
 
@@ -1013,6 +1017,137 @@ and knows it happened in one op, unlike local `mbdeploy`'s two-call
 `flash` + `mark_flashed` pattern. The staged hex temp file is deleted
 afterwards regardless of outcome; a file staged but never flashed (the
 connection disconnected first) is deleted when that connection closes.
+
+## `register_board` — registered virtual boards (nezsim sprint 015, ticket 001)
+
+A *registered board* is a board that has no USB port: a simulator
+registers it over the local control socket under its own name and serves
+it from an endpoint it provides. To every client (robot-console,
+`mbdeploy`, `mbserial`, `mbregistry list`) it looks like one more local
+robot; the registry routes `stream` and `flash` to the endpoint.
+
+**Availability.** Local Unix socket only. `register_board` is *not*
+dispatched on the remote TCP port (it gets `invalid_request` `unknown op`,
+as on any registry that predates this op — clients gate on that) and not on
+the Windows named pipe (which has no `watch`/`stream`/`flash` either).
+
+### Request / response
+
+```jsonc
+// request (one JSON line)
+{"op": "register_board", "name": "tinybot", "endpoint": "127.0.0.1:41234",
+ "role": "NEZHA2", "serial": "1198504156", "simulated": true}
+
+// success
+{"ok": true, "uid": "sim-tinybot",
+ "device": { /* the same shape as a `list` entry, e.g. */
+   "uid": "sim-tinybot", "short_uid": "sim-tinybot", "host": null,
+   "port": "virtual:tinybot", "vid_pid": "virtual", "state": "connected",
+   "role": "NEZHA2", "common_name": "robot", "device_name": "tinybot",
+   "serial_payload": "1198504156", "endpoint": null, "simulated": true,
+   "lock_kind": null, "flash_count": 0, "...": "..." }}
+```
+
+Field rules (violations are `invalid_request`, nothing registered):
+`name` 2-32 chars, a letter then letters/digits/`-`; `endpoint`
+`host:port` (`[v6]:port` accepted, port 1-65535); `role` a short
+identifier (default `NEZHA2` if omitted); `serial` a decimal string
+(an integer is accepted and stringified); `simulated` must be `true`.
+
+Other errors: `name_reserved` (the name is a real-robot name: try `tovez`,
+`TOVEZ`, `gopiv`, `zeguz`), `name_in_use` (a live registered board has that
+name; names compare case-insensitively; reusable once it detaches).
+
+### Lifetime
+
+After the ack the connection stays open as the board's **lifetime
+handle**. The server reads and discards whatever the registrant sends
+(it should send nothing) until EOF or an error; either one — a clean
+close or the process dying — **detaches** the board: any lock on it is
+released (the holder's connection is closed, ending a spliced stream), its
+row is deleted, and a `detach` event is published. There are no
+heartbeats. Nothing else may be sent on that connection. A registry
+restart drops every registration (the connections died with it) and its
+start-up sweep removes any stale virtual rows from the db; the registrant
+must reconnect and re-register.
+
+### Row and list shaping
+
+An ordinary local `device` row: `host` NULL, `uid = "sim-<name>"`
+(`short_uid` = the full uid), `port = "virtual:<name>"`,
+`vid_pid = "virtual"`, `state = "connected"`, `role`, `common_name =
+"robot"`, `device_name = <name>`, `serial_payload = <serial>`, never
+probed. `list`/`get`/`find` gain an additive `simulated` boolean on every
+entry: `true` for these rows, `false` for hardware and peer rows.
+`endpoint` stays `null`, so clients route through the registry. `lock`,
+`unlock`, `mark_flashed`, `watch`, `rescan` and name lookup work as for
+hardware.
+
+### Events (`watch`)
+
+On registration, in order: `attach`
+(`{"type":"attach","host":...,"uid":"sim-tinybot","port":"virtual:tinybot",
+"vid_pid":"virtual","simulated":true}`) then `identity`
+(`{"type":"identity","uid":...,"state":"connected","role":"NEZHA2",
+"common_name":"robot","device_name":"tinybot","serial_payload":"...",
+"raw_announcement":null,"simulated":true}`). On detach: `detach`
+(`{"type":"detach","uid":...,"simulated":true}`). `lock_state` events for
+the board are published as for hardware. Hardware events are unchanged
+(no `simulated` key). None of these events, and no `lock_state` for the
+board, are ever sent to peers.
+
+### Routing
+
+* **`stream`**: after the usual `serial`/`relay` lock check, the registry
+  dials the endpoint, sends `{"op":"lock","uid":"sim-<name>","kind":
+  "<the client's lock kind>"}` then `{"op":"stream","uid":"sim-<name>"}`
+  there, and only then answers the client. If the endpoint refuses either
+  (`{"ok":false,...}`) or is unreachable, the client's response to `stream`
+  is that refusal verbatim (or `internal_error` for unreachable) and the
+  connection stays in JSON mode, still holding its lock. On success the
+  client gets `{"ok": true}` and the connection becomes a **raw byte
+  splice** both ways — frames are *not* parsed by the registry — until
+  either side closes; the stream lock is then released. Bytes the
+  endpoint sends right after its `stream` ack are forwarded, never dropped,
+  and may arrive in the same read as the client's ack line. A client that
+  speaks the framed protocol (`stream_frame`) simply tunnels it through:
+  the endpoint is expected to speak it.
+* **`flash`**: requires a `flash` lock held by this connection, as for
+  hardware. The file at `hex_path` is validated as for hardware (Intel or
+  Universal Hex parses; failure is a `flash` `result` with
+  `invalid_request`, and the endpoint is never contacted), then its
+  **unmodified bytes** are sent to the endpoint:
+  `{"op":"lock","uid":...,"kind":"flash"}` → `{"op":"send_hex","data":
+  "<base64>"}` → `{"ok":true,"hex_path":"<endpoint path>"}` →
+  `{"op":"flash","uid":...,"hex_path":...}`. The endpoint's `{"type":"log",
+  "line":...}` lines are relayed as the client's `log` lines, and its
+  terminal `{"type":"result",...}` is returned verbatim. A pre-flash
+  refusal (`lock`/`send_hex` `{"ok":false,...}`) is returned as a `result`
+  carrying the endpoint's `code`/`error` and `ok:false`; an unreachable or
+  broken endpoint is `result` with `internal_error`. The flash lock is
+  released afterwards in every case, and `flash_count` is incremented once
+  the endpoint's `flash` ran (not for pre-flash refusals).
+  `mark_flashed` works as for hardware.
+
+The endpoint is therefore a one-board mirror of the remote TCP API's
+`lock`/`send_hex`/`flash` ops plus `stream`; it needs no `list`/`watch`
+and must accept the uid `sim-<name>` (the uid it is told) for every op.
+
+### Where virtual rows are excluded
+
+Each is pinned by a test in `tests/registry/virtual/`:
+
+1. **`Daemon.run_once`** — the previously-attached diff skips virtual rows
+   (a USB scan that sees no board would otherwise mark every simulator
+   `disconnected`), and the flash-release hook ignores virtual uids (a
+   pending USB re-probe would expire and mark the board known-blank).
+2. **Peering** — `snapshot_local_devices` omits virtual rows, and
+   `PeerDiscovery.publish_daemon_event`/`publish_lock_event` drop them, so
+   peers never advertise or see a simulator.
+3. **Remote TCP API** — `_device_visible` hides them: `list` omits them and
+   `find`/`lock`/`stream`/`flash` answer `not_found`.
+4. **Start-up sweep** — `RegistryAPIServer.start()` deletes every stale
+   virtual row.
 
 ## Windows named-pipe transport (sprint 005, ticket 003)
 

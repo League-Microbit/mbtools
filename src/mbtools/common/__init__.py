@@ -90,6 +90,17 @@ CODE_AMBIGUOUS_NAME = "ambiguous_name"
 #: socket, which has no auth concept (sprint 1's trust model, unchanged).
 CODE_UNAUTHORIZED = "unauthorized"
 
+# -- registered virtual boards (nezsim sprint 015 ticket 001) ---------------
+
+#: ``register_board`` refused: a live registered board already holds that
+#: name (names compare case-insensitively).
+CODE_NAME_IN_USE = "name_in_use"
+
+#: ``register_board`` refused: the name matches the real-robot pattern
+#: (``mbtools.relay.naming`` CVCVC rule, case-insensitive), so a simulated
+#: board can never be mistaken for, or collide with, a physical robot.
+CODE_NAME_RESERVED = "name_reserved"
+
 
 # -- sprint 003 additions (ticket 012, shared by ticket 013) ----------------
 

@@ -237,6 +237,7 @@ from mbtools.registry.eventbus import EventBus
 from mbtools.registry.locks import format_lock_suffix
 from mbtools.registry.netaddr import local_ip, local_ipv4s, pick_reachable
 from mbtools.registry.identity import ProbeResult
+from mbtools.registry.virtual import is_virtual, is_virtual_uid
 from mbtools.registry.store import (
     STATE_ATTACHED_NO_ANNOUNCE,
     STATE_CONNECTED,
@@ -1359,10 +1360,15 @@ def daemon_event_payload(event_type: str, record: DeviceRecord) -> dict[str, Any
     """
     if event_type in (EVENT_ATTACH, EVENT_IDENTITY) and record.state == STATE_DISCONNECTED:
         return None
+    # Registered virtual boards (nezsim sprint 015 ticket 001) carry an
+    # additive ``simulated: true`` on every event; hardware events are
+    # byte-for-byte unchanged. (Peers never receive these: see
+    # ``PeerDiscovery.publish_daemon_event``.)
+    extra: dict[str, Any] = {"simulated": True} if is_virtual(record) else {}
     if event_type == EVENT_ATTACH:
-        return {"uid": record.uid, "port": record.port, "vid_pid": record.vid_pid}
+        return {"uid": record.uid, "port": record.port, "vid_pid": record.vid_pid, **extra}
     if event_type == EVENT_DETACH:
-        return {"uid": record.uid}
+        return {"uid": record.uid, **extra}
     return {
         "uid": record.uid,
         "state": record.state,
@@ -1371,6 +1377,7 @@ def daemon_event_payload(event_type: str, record: DeviceRecord) -> dict[str, Any
         "device_name": record.device_name,
         "serial_payload": record.serial_payload,
         "raw_announcement": record.raw_announcement,
+        **extra,
     }
 
 
@@ -2016,6 +2023,8 @@ class PeerDiscovery:
         result means the disconnected-state suppression below fired, and
         nothing is published.
         """
+        if is_virtual(record):
+            return  # registered virtual boards are local-only
         payload = daemon_event_payload(event_type, record)
         if payload is None:
             return
@@ -2049,6 +2058,8 @@ class PeerDiscovery:
         reusing this identical event shape -- harmless extra keys a peer
         receiver never reads back out.
         """
+        if is_virtual_uid(uid):
+            return  # registered virtual boards are local-only
         suffix = format_lock_suffix(label, since, now=time.time())
         wire_display = f"{display}{suffix}" if display is not None else display
         self.publish_event(
