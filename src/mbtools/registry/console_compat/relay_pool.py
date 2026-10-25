@@ -167,12 +167,13 @@ def _is_relay_role(role: "str | None") -> bool:
     return "RELAY" in upper or "BRIDGE" in upper
 
 
-def _local_ip() -> str:
-    """This host's most-preferred LAN IPv4 address (wired before Wi-Fi) --
-    see :func:`mbtools.registry.netaddr.local_ipv4s`. robot-console's
-    browser connects to whichever advertised address it sees first, so
-    this advertises only the one it should use."""
-    return local_ipv4s()[0]
+def _local_ips() -> list[str]:
+    """Every LAN IPv4 address on this host, most-preferred first -- see
+    :func:`mbtools.registry.netaddr.local_ipv4s`. All of them are
+    advertised: a host on two networks is reachable from each only at
+    its address on that network, and robot-console picks the address on
+    its own subnet."""
+    return local_ipv4s()
 
 
 def _short_hostname() -> str:
@@ -252,8 +253,8 @@ class RelayPool:
         self._port = port
         self._names_api_port = names_api_port
         self._instance_host = instance_host if instance_host is not None else _short_hostname()
-        self._advertise_address = (
-            advertise_address if advertise_address is not None else _local_ip()
+        self._advertise_addresses = (
+            [advertise_address] if advertise_address is not None else _local_ips()
         )
         #: An explicit ``advertise_address`` is pinned; otherwise it is
         #: re-read every ``address_check_interval_s`` (:meth:`refresh_address`).
@@ -326,7 +327,7 @@ class RelayPool:
         return self._zc_module.ServiceInfo(
             SERVICE_TYPE,
             name,
-            addresses=[socket.inet_aton(self._advertise_address)],
+            addresses=[socket.inet_aton(a) for a in self._advertise_addresses],
             port=self._port,
             properties=_encode_txt(txt),
             server=f"{self._instance_host}.local.",
@@ -340,15 +341,15 @@ class RelayPool:
         Returns whether anything changed."""
         if self._address_pinned or self._zc is None or self._own_info is None:
             return False
-        new = _local_ip()
-        if not new or new.startswith("127.") or new == self._advertise_address:
+        new = [a for a in _local_ips() if a and not a.startswith("127.")]
+        if not new or new == self._advertise_addresses:
             return False
         logger.warning(
             "relay_pool: this host's address changed (%s -> %s); re-advertising",
-            self._advertise_address,
-            new,
+            ",".join(self._advertise_addresses),
+            ",".join(new),
         )
-        self._advertise_address = new
+        self._advertise_addresses = new
         info = self._build_own_info(self._own_info.name)
         self._zc.update_service(info)
         self._own_info = info

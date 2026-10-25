@@ -1164,6 +1164,10 @@ class _PeerLink:
                 self._host,
                 self._snapshot_address,
             )
+            # A peer that never answered never connected, so the link
+            # monitor will never see it drop: this is the only signal.
+            if self._on_unreachable is not None:
+                self._on_unreachable(self._host)
             return False
         finally:
             req.close(linger=0)

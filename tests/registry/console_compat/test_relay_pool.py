@@ -431,7 +431,7 @@ def test_start_stop_idempotent(store, locks):
 def test_refresh_address_re_advertises_after_a_dhcp_move(store, locks, monkeypatch):
     import mbtools.registry.console_compat.relay_pool as relay_pool_mod
 
-    monkeypatch.setattr(relay_pool_mod, "_local_ip", lambda: "192.168.1.195")
+    monkeypatch.setattr(relay_pool_mod, "_local_ips", lambda: ["192.168.1.195"])
     ns = _FakeZeroconfNamespace()
     pool = relay_pool_mod.RelayPool(
         store=store, locks=locks, host="127.0.0.1", port=0, zeroconf=ns,
@@ -439,12 +439,12 @@ def test_refresh_address_re_advertises_after_a_dhcp_move(store, locks, monkeypat
     )
     pool.start()
     try:
-        monkeypatch.setattr(relay_pool_mod, "_local_ip", lambda: "192.168.1.210")
+        monkeypatch.setattr(relay_pool_mod, "_local_ips", lambda: ["192.168.1.210", "192.168.5.172"])
         assert pool.refresh_address() is True
         info = ns.instance.updated[-1]
-        assert info.addresses == [socket.inet_aton("192.168.1.210")]
+        assert info.addresses == [socket.inet_aton("192.168.1.210"), socket.inet_aton("192.168.5.172")]
         assert pool.refresh_address() is False
-        monkeypatch.setattr(relay_pool_mod, "_local_ip", lambda: "127.0.1.1")
+        monkeypatch.setattr(relay_pool_mod, "_local_ips", lambda: ["127.0.1.1"])
         assert pool.refresh_address() is False
     finally:
         pool.stop()

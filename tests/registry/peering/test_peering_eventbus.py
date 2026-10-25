@@ -1464,3 +1464,23 @@ def test_snapshot_handshake_with_wrong_auth_token_is_rejected(store, tmp_path):
         store.close()
         store_b.close()
         store_b.close()
+
+
+def test_a_peer_that_never_answers_its_snapshot_is_marked_unreachable(store, tmp_path):
+    """nada/null on ferranti, 2026-10-24: a peer that was already gone
+    never connected, so the link never "dropped" and it stayed
+    reachable while every snapshot request timed out."""
+    peering_b = _make_peering(store, host="beta", pub_port=17672, snapshot_port=17673)
+
+    try:
+        peering_b.start()
+        peering_b.connect_peer("ghost", "127.0.0.1", 17674, 17675, remote_port=17676)
+        assert store.get_peer("ghost").reachable
+
+        deadline = time.monotonic() + 10.0
+        while store.get_peer("ghost").reachable and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert not store.get_peer("ghost").reachable
+    finally:
+        peering_b.stop()
+        store.close()
